@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- `Ownership checks`: An unverified ownership observation no longer stops a live transport on the first miss; consecutive misses are recorded with their count and stand down only after the bounded tolerance, so a concurrent shared-state replacement cannot silence polling.
+
 ## 0.52.2: Polling recovery, safe disconnect and Windows downloads
 
 - `Polling recovery`: Non-conflict poll/admission failures back off from 1 to 30 seconds and keep retrying, allowing recovery after prolonged outages without manual reconnect. Backoff resets only after durable admission succeeds; persistent competing-client conflicts retain their existing terminal stand-down.

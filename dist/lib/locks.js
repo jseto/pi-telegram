@@ -13,6 +13,8 @@ export const TELEGRAM_LOCK_KEY = "default";
 export const TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS = 8_000;
 export const TELEGRAM_OWNERSHIP_CHECK_MS = 1_000;
 export const TELEGRAM_OWNERSHIP_REFRESH_MS = 2_000;
+/** Consecutive unverified ownership checks tolerated before standing down; a concurrent shared-state replacement must not stop an owned transport. */
+export const TELEGRAM_OWNERSHIP_CHECK_FAILURE_TOLERANCE = 2;
 const TELEGRAM_LOCK_WRITE_RETRY_ATTEMPTS = 5;
 const TELEGRAM_LOCK_WRITE_RETRY_DELAY_MS = 25;
 const TELEGRAM_LOCK_TRANSACTION_ATTEMPTS = 80;
@@ -1184,6 +1186,7 @@ export function createTelegramLockedPollingRuntime(deps) {
     let ownershipRefreshInterval;
     let ownershipStop;
     let activeContext;
+    let ownershipCheckFailures = 0;
     let takeoverCandidate;
     let sessionAutoStartRun;
     let pollingGeneration = 0;
@@ -1245,13 +1248,29 @@ export function createTelegramLockedPollingRuntime(deps) {
     const startOwnershipWatcher = (ctx) => {
         const owner = snapshotLockContext(ctx);
         stopOwnershipWatcher();
+        ownershipCheckFailures = 0;
         ownershipCheckInterval = setInterval(() => {
+            let owned = false;
+            let failure;
             try {
-                if (deps.lock.owns(owner))
-                    return;
+                owned = deps.lock.owns(owner);
             }
             catch (error) {
-                deps.recordRuntimeEvent?.("lock", error, { phase: "check" });
+                failure = error;
+            }
+            if (owned) {
+                ownershipCheckFailures = 0;
+                return;
+            }
+            ownershipCheckFailures += 1;
+            deps.recordRuntimeEvent?.("lock", failure ??
+                new Error("Telegram bridge ownership could not be verified for this instance."), {
+                phase: "ownership-check-failed",
+                consecutiveFailures: ownershipCheckFailures,
+                tolerance: TELEGRAM_OWNERSHIP_CHECK_FAILURE_TOLERANCE,
+            });
+            if (ownershipCheckFailures <= TELEGRAM_OWNERSHIP_CHECK_FAILURE_TOLERANCE) {
+                return;
             }
             stopAfterOwnershipLoss();
         }, ownershipCheckMs);
