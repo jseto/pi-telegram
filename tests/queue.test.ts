@@ -3608,6 +3608,45 @@ test("Agent end records event when voice fallback text delivery also fails", asy
   assert.ok(events.some((e) => e.includes("voice-fallback-text")));
 });
 
+test("Agent end skips voice artifact delivery for a text-only reply plan", async () => {
+  const events: string[] = [];
+  const textDeliveries: string[] = [];
+  let artifactDeliveries = 0;
+  await handleTelegramAgentEndRuntime({
+    turn: createQueueTestPromptTurn(),
+    assistant: { text: "Plain text reply" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {},
+    updateStatus: () => {},
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async (_chatId, markdown) => {
+      textDeliveries.push(markdown);
+      return true;
+    },
+    sendMarkdownReply: async (_chatId, _replyToMessageId, markdown) => {
+      textDeliveries.push(markdown);
+    },
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {},
+    planOutboundReply: (markdown) => ({ markdown }),
+    sendOutboundReplyArtifacts: async () => {
+      artifactDeliveries += 1;
+    },
+    recordRuntimeEvent: (category, error, details) => {
+      events.push(
+        `error:${category}:${(error as Error).message}:${details?.phase ?? "none"}`,
+      );
+    },
+    dispatchNextQueuedTelegramTurn: () => {
+      events.push("dispatch");
+    },
+  });
+  assert.equal(artifactDeliveries, 0);
+  assert.deepEqual(textDeliveries, ["Plain text reply"]);
+  assert.deepEqual(events, ["dispatch"]);
+});
+
 test("Agent end does not intercept when rawFinalText is whitespace only", async () => {
   let voiceArtifactsCalled = false;
   const turn: PendingTelegramTurn = {

@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- `Voice artifacts`: A reply plan without voice content no longer reaches outbound voice artifact delivery, so plain text replies stop recording "every voice synthesis provider failed" delivery errors; explicit `telegram_voice` markup and genuine synthesis failures keep their existing fallback behavior.
+
 ## 0.52.2: Polling recovery, safe disconnect and Windows downloads
 
 - `Polling recovery`: Non-conflict poll/admission failures back off from 1 to 30 seconds and keep retrying, allowing recovery after prolonged outages without manual reconnect. Backoff resets only after durable admission succeeds; persistent competing-client conflicts retain their existing terminal stand-down.
