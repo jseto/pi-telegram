@@ -231,6 +231,8 @@ export interface TelegramBusFollowerHeartbeatRecoveryHandlerDeps<TContext> {
     promotionGraceMs?: number;
     /** Bus liveness proof for a live-PID leader that no longer answers; replaces the retired file heartbeat. */
     proveLeaderUnresponsive?: (owner: TelegramLockEntry) => Promise<boolean>;
+    /** Shared bot state says Threaded Mode is off: followers cannot exist, so recovery goes offline instead. */
+    isThreadModeDisabled?: () => boolean | Promise<boolean>;
     recordRuntimeEvent: (category: string, error: unknown, details?: Record<string, unknown>) => void;
 }
 export interface TelegramBusForwardedUpdateReceiverRuntimeDeps<TContext> {
@@ -419,7 +421,12 @@ export declare function createTelegramBusFollowerControlState(): TelegramBusFoll
 export declare function createTelegramBusFollowerRegistrationState(options?: {
     onAvailabilityChanged?: () => void;
 }): TelegramBusFollowerRegistrationState;
-export declare function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(deps: TelegramBusFollowerHeartbeatRecoveryHandlerDeps<TContext>): (error: unknown, ctx: TContext) => Promise<void>;
+/** Heartbeat-failure recovery that a deliberate local stop halts until the next deliberate registration. */
+export type TelegramBusFollowerHeartbeatRecoveryHandler<TContext> = ((error: unknown, ctx: TContext) => Promise<void>) & {
+    halt: () => void;
+    resume: () => void;
+};
+export declare function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(deps: TelegramBusFollowerHeartbeatRecoveryHandlerDeps<TContext>): TelegramBusFollowerHeartbeatRecoveryHandler<TContext>;
 export declare function createTelegramBusFollowerRegistrationRuntime<TContext extends {
     cwd?: string;
 }>(deps: TelegramBusFollowerRegistrationRuntimeDeps<TContext>): TelegramBusFollowerRegistrationRuntime<TContext>;

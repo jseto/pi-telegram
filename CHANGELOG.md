@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+## 0.54.1: Followers go offline when Threaded Mode is turned off
+
+- `Threaded Mode downgrade`: Turning Threaded Mode off in BotFather now takes followers offline instead of looping between `electing` and `disconnected` (and filling the log) against a leader that switched to classic polling; reconnect with `/telegram-connect` after turning it back on. `/telegram-disconnect` on a follower without a live leader now disconnects locally and reports the Thread as kept, and a pending recovery retry no longer re-registers a disconnected follower.
+- `Ownership reads`: A lock-free ownership check that races a concurrent `state.json` replacement is now retried and confirmed through the serialized path before the leader stops polling, so a transient read miss (seen on slow Windows runners) is no longer mistaken for lost ownership. The integration test for a revoked follower provisioning now waits for its asynchronous lease release.
+
 ## 0.54.0: No periodic disk writes while idle
 
 - `Journal serialization`: The update journal no longer borrows the `telegram.json` lock. Journal operations serialize on their own `tmp/pi-telegram/runtime/journals.transaction`, so receiving messages and repairing journals never touch the config file or its guard; only config writes and sender admission still take it. Bus protocol moves to v3 so 0.53.x peers, which serialize on the old lock, cannot register alongside 0.54 writers.
