@@ -1055,16 +1055,20 @@ export function createTelegramLockRuntime(options = {}) {
         if (!statePath)
             return readLocks(locksPath);
         // Read-only ownership queries fail closed (no owner); acquisition/publication still refuse malformed state.
-        try {
-            const transports = Object.fromEntries(Object.entries(readTelegramRuntimeState(statePath).profiles)
-                .filter(([, value]) => Object.hasOwn(value, "transport"))
-                .map(([profile, value]) => [profile, value.transport]));
-            assertTelegramStateTransport(transports[resolveEffectiveKey()]);
-            return transports;
+        // A strict read racing a concurrent atomic replace fails transiently, so retry before failing closed.
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+            try {
+                const transports = Object.fromEntries(Object.entries(readTelegramRuntimeState(statePath).profiles)
+                    .filter(([, value]) => Object.hasOwn(value, "transport"))
+                    .map(([profile, value]) => [profile, value.transport]));
+                assertTelegramStateTransport(transports[resolveEffectiveKey()]);
+                return transports;
+            }
+            catch {
+                // Retry; a persistent failure falls through to no owner.
+            }
         }
-        catch {
-            return {};
-        }
+        return {};
     };
     const transactOwners = (mutate) => {
         if (!statePath)
@@ -1440,7 +1444,8 @@ export function createTelegramLockedPollingRuntime(deps) {
         stopOwnershipWatcher();
         ownershipCheckInterval = setInterval(() => {
             try {
-                if (deps.lock.owns(owner))
+                // A lock-free miss can be a strict read racing an atomic replace; refresh confirms through the serialized path.
+                if (deps.lock.owns(owner) || deps.lock.refresh(owner))
                     return;
             }
             catch (error) {

@@ -3228,6 +3228,9 @@ for (const profile of [undefined, "work"] as const) for (const boundary of ["rev
         await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, ctx);
         await follower.handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "reload" }, followerCtx);
         followerStarted = false;
+        // The revoked leader-side provisioning unwinds asynchronously after the follower's connect returns.
+        await waitForCondition(() => (Locks.readTelegramRuntimeState(statePath).profiles[profile ?? "default"]!
+          .admission as { leases: unknown[] }).leases.length === 0, 8_000);
         const afterRace = Locks.readTelegramRuntimeState(statePath);
         assert.deepEqual(afterRace.profiles[profile ?? "default"]!.workspace, held.workspace,
           "Late creation ACK cannot publish an owner/binding under the revoked production leader");

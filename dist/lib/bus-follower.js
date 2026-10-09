@@ -190,7 +190,7 @@ export function createTelegramBusFollowerRuntimeAssembly(ports) {
         ...ports.recovery,
         registrationState: ports.registrationState,
         recordRuntimeEvent: ports.recordRuntimeEvent,
-        getRegistrationRuntime: () => registration,
+        getRegistrationRuntime: () => baseRegistration,
     });
     registration = createTelegramBusFollowerRegistrationRuntime({
         ...ports.registration,
@@ -203,6 +203,15 @@ export function createTelegramBusFollowerRuntimeAssembly(ports) {
     const baseRegistration = registration;
     registration = {
         ...baseRegistration,
+        // Public stop is deliberate (disconnect, suspension); recovery keeps the base stop for promotion.
+        stop() {
+            recovery.halt();
+            baseRegistration.stop();
+        },
+        registerWithLeader(ctx, leader, options) {
+            recovery.resume();
+            return baseRegistration.registerWithLeader(ctx, leader, options);
+        },
         async setContext(ctx) {
             const sessionGeneration = ports.registration.getSessionGeneration?.();
             if (ports.registration.isContextActive?.(ctx) === false)
@@ -1214,6 +1223,9 @@ export function createTelegramBusFollowerRegistrationState(options = {}) {
     };
 }
 export function createTelegramBusFollowerHeartbeatRecoveryHandler(deps) {
+    // Promotion stops registration internally and must keep retrying; only an operator stop or a confirmed
+    // switch to classic mode halts recovery, so it never re-registers behind a disconnect.
+    let halted = false;
     const promotionGraceMs = deps.promotionGraceMs ?? TELEGRAM_BUS_FOLLOWER_PROMOTION_GRACE_MS;
     const sleep = deps.sleep ??
         ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
@@ -1246,6 +1258,10 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler(deps) {
                 .registerWithLeader(ctx, leader, binding?.target ? { target: binding.target } : undefined);
             if (!restored)
                 return false;
+            if (halted) {
+                deps.getRegistrationRuntime().stop();
+                return false;
+            }
             deps.setLifecyclePhase(undefined);
             safeUpdateStatus(ctx);
             deps.recordRuntimeEvent("bus", "Telegram follower registration restored", {
@@ -1266,6 +1282,8 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler(deps) {
     });
     const scheduleRecovery = (reason, fallbackCtx, binding) => {
         const retry = () => {
+            if (halted)
+                return;
             const activeCtx = deps.getActiveContext
                 ? deps.getActiveContext()
                 : fallbackCtx;
@@ -1336,12 +1354,29 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler(deps) {
         });
     };
     const recover = async (error, ctx, carriedBinding) => {
-        if (promotionPending)
+        if (promotionPending || halted)
             return;
         promotionPending = true;
         deps.registrationState.beginRecovery();
         const initialBinding = carriedBinding ?? snapshotBinding();
         try {
+            let threadModeDisabled = false;
+            try {
+                threadModeDisabled = (await deps.isThreadModeDisabled?.()) === true;
+            }
+            catch (stateError) {
+                deps.recordRuntimeEvent("bus", stateError, {
+                    phase: "follower-thread-mode-read",
+                });
+            }
+            if (threadModeDisabled) {
+                halted = true;
+                deps.getRegistrationRuntime().stop();
+                deps.setLifecyclePhase(undefined);
+                safeUpdateStatus(ctx);
+                deps.recordRuntimeEvent("bus", "Telegram follower went offline: Threaded Mode is off. Run /telegram-connect after turning it back on.", { phase: "follower-thread-mode-disabled" });
+                return;
+            }
             const state = deps.getLeaderState();
             if (state.kind === "active-elsewhere") {
                 clearRegisteredState(ctx);
@@ -1397,7 +1432,14 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler(deps) {
             promotionPending = false;
         }
     };
-    return recover;
+    return Object.assign(recover, {
+        halt() {
+            halted = true;
+        },
+        resume() {
+            halted = false;
+        },
+    });
 }
 export function createTelegramBusFollowerRegistrationRuntime(deps) {
     const getNowMs = deps.getNowMs ?? Date.now;

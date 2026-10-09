@@ -572,6 +572,8 @@ export interface TelegramBusFollowerHeartbeatRecoveryHandlerDeps<TContext> {
   promotionGraceMs?: number;
   /** Bus liveness proof for a live-PID leader that no longer answers; replaces the retired file heartbeat. */
   proveLeaderUnresponsive?: (owner: TelegramLockEntry) => Promise<boolean>;
+  /** Shared bot state says Threaded Mode is off: followers cannot exist, so recovery goes offline instead. */
+  isThreadModeDisabled?: () => boolean | Promise<boolean>;
   recordRuntimeEvent: (
     category: string,
     error: unknown,
@@ -759,7 +761,7 @@ export function createTelegramBusFollowerRuntimeAssembly<
     ...ports.recovery,
     registrationState: ports.registrationState,
     recordRuntimeEvent: ports.recordRuntimeEvent,
-    getRegistrationRuntime: () => registration,
+    getRegistrationRuntime: () => baseRegistration,
   });
   registration = createTelegramBusFollowerRegistrationRuntime({
     ...ports.registration,
@@ -772,6 +774,15 @@ export function createTelegramBusFollowerRuntimeAssembly<
   const baseRegistration = registration;
   registration = {
     ...baseRegistration,
+    // Public stop is deliberate (disconnect, suspension); recovery keeps the base stop for promotion.
+    stop() {
+      recovery.halt();
+      baseRegistration.stop();
+    },
+    registerWithLeader(ctx, leader, options) {
+      recovery.resume();
+      return baseRegistration.registerWithLeader(ctx, leader, options);
+    },
     async setContext(ctx) {
       const sessionGeneration = ports.registration.getSessionGeneration?.();
       if (ports.registration.isContextActive?.(ctx) === false) return;
@@ -2206,9 +2217,18 @@ export function createTelegramBusFollowerRegistrationState(
   };
 }
 
+/** Heartbeat-failure recovery that a deliberate local stop halts until the next deliberate registration. */
+export type TelegramBusFollowerHeartbeatRecoveryHandler<TContext> = ((
+  error: unknown,
+  ctx: TContext,
+) => Promise<void>) & { halt: () => void; resume: () => void };
+
 export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
   deps: TelegramBusFollowerHeartbeatRecoveryHandlerDeps<TContext>,
-): (error: unknown, ctx: TContext) => Promise<void> {
+): TelegramBusFollowerHeartbeatRecoveryHandler<TContext> {
+  // Promotion stops registration internally and must keep retrying; only an operator stop or a confirmed
+  // switch to classic mode halts recovery, so it never re-registers behind a disconnect.
+  let halted = false;
   const promotionGraceMs =
     deps.promotionGraceMs ?? TELEGRAM_BUS_FOLLOWER_PROMOTION_GRACE_MS;
   const sleep =
@@ -2250,6 +2270,10 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
           binding?.target ? { target: binding.target } : undefined,
         );
       if (!restored) return false;
+      if (halted) {
+        deps.getRegistrationRuntime().stop();
+        return false;
+      }
       deps.setLifecyclePhase(undefined);
       safeUpdateStatus(ctx);
       deps.recordRuntimeEvent(
@@ -2277,6 +2301,7 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
     binding: TelegramBusFollowerPromotedBinding,
   ) => {
     const retry = () => {
+      if (halted) return;
       const activeCtx = deps.getActiveContext
         ? deps.getActiveContext()
         : fallbackCtx;
@@ -2376,11 +2401,31 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
     ctx: TContext,
     carriedBinding?: TelegramBusFollowerPromotedBinding,
   ): Promise<void> => {
-    if (promotionPending) return;
+    if (promotionPending || halted) return;
     promotionPending = true;
     deps.registrationState.beginRecovery();
     const initialBinding = carriedBinding ?? snapshotBinding();
     try {
+      let threadModeDisabled = false;
+      try {
+        threadModeDisabled = (await deps.isThreadModeDisabled?.()) === true;
+      } catch (stateError) {
+        deps.recordRuntimeEvent("bus", stateError, {
+          phase: "follower-thread-mode-read",
+        });
+      }
+      if (threadModeDisabled) {
+        halted = true;
+        deps.getRegistrationRuntime().stop();
+        deps.setLifecyclePhase(undefined);
+        safeUpdateStatus(ctx);
+        deps.recordRuntimeEvent(
+          "bus",
+          "Telegram follower went offline: Threaded Mode is off. Run /telegram-connect after turning it back on.",
+          { phase: "follower-thread-mode-disabled" },
+        );
+        return;
+      }
       const state = deps.getLeaderState();
       if (state.kind === "active-elsewhere") {
         clearRegisteredState(ctx);
@@ -2456,7 +2501,14 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
       promotionPending = false;
     }
   };
-  return recover;
+  return Object.assign(recover, {
+    halt() {
+      halted = true;
+    },
+    resume() {
+      halted = false;
+    },
+  });
 }
 
 export function createTelegramBusFollowerRegistrationRuntime<

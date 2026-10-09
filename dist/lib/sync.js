@@ -140,6 +140,7 @@ export function createTelegramManualThreadDisconnectHandler(deps) {
         assertCurrent();
         const currentRecord = deps.getCurrentThreadRecord();
         let cleanupPending = false;
+        let followerThreadKept = false;
         if (currentRecord?.target.threadId) {
             const isManualFollower = currentRecord.owner?.kind === "manual-follower";
             const leaderEpoch = deps.getCurrentLeaderEpoch?.();
@@ -150,9 +151,8 @@ export function createTelegramManualThreadDisconnectHandler(deps) {
                 if (deps.disconnectFollowerThread) {
                     const disconnected = await deps.disconnectFollowerThread();
                     assertCurrent();
-                    if (!disconnected) {
-                        throw new Error("Telegram follower thread deletion requires a live leader registration.");
-                    }
+                    // Without a live leader the Thread cannot be deleted; still stop locally and never claim deletion.
+                    followerThreadKept = !disconnected;
                 }
             }
             else {
@@ -223,6 +223,8 @@ export function createTelegramManualThreadDisconnectHandler(deps) {
         }
         assertCurrent();
         const stopped = await deps.stopPolling();
+        if (followerThreadKept)
+            return "Telegram bridge disconnected. Thread kept: no live leader could delete it.";
         return cleanupPending
             ? `${stopped} Telegram thread cleanup remains pending for the next leader.`
             : stopped;

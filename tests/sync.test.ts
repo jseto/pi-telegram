@@ -1971,6 +1971,49 @@ test("Manual follower disconnect delegates thread deletion to its live leader", 
   assert.equal(persisted, 0);
 });
 
+test("Manual follower disconnect without a live leader stops locally and keeps the Thread", async () => {
+  const calls: unknown[] = [];
+  let stops = 0;
+  let syncState = createUnknownTelegramSyncState();
+  const disconnect = createTelegramManualThreadDisconnectHandler({
+    instanceId: "follower-runtime:1",
+    getCurrentThreadRecord: () => ({
+      owner: { kind: "manual-follower" },
+      instanceId: "follower-runtime:1",
+      target: { chatId: 7, threadId: 42 },
+    }),
+    topicTargetStore: {
+      list: () => [],
+      markStaleByTarget: () => false,
+      upsertPendingCleanup: () => undefined,
+      removePendingCleanup: () => false,
+      persist: async () => undefined,
+    },
+    callApi: async <TResponse>(method: string, body: Record<string, unknown>) => {
+      calls.push({ method, body });
+      return { ok: true } as TResponse;
+    },
+    getLeaderTarget: () => undefined,
+    clearLeaderTarget: () => undefined,
+    disconnectFollowerThread: async () => false,
+    getSyncState: () => syncState,
+    setSyncState: (state) => {
+      syncState = state;
+    },
+    stopPolling: async () => {
+      stops += 1;
+      return "stopped";
+    },
+    recordRuntimeEvent: () => undefined,
+    runWorkspaceOperation,
+    getNowMs: () => 2000,
+  });
+
+  assert.equal(await disconnect(), "Telegram bridge disconnected. Thread kept: no live leader could delete it.");
+  assert.equal(stops, 1, "The operator can always stop a follower whose leader is gone or in classic mode");
+  assert.deepEqual(calls, [], "No direct Bot API deletion is attempted");
+});
+
 test("Confirmed leader disconnect and restart cleanup preserve pressure-reclaimable slots across restart", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-leader-cleanup-rotation-"));
   const path = join(dir, "state.json");

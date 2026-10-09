@@ -2009,6 +2009,64 @@ for (const proven of [false, true]) test(`Bus follower heartbeat recovery promot
   assert.deepEqual(elections, proven ? [{ expectedOwner: liveLeader.lock, unresponsive: true }] : []);
 });
 
+test("Bus follower recovery goes offline once Threaded Mode is off and stays halted until resumed", async () => {
+  const elections: unknown[] = [];
+  const registrations: unknown[] = [];
+  const retries: Array<() => void> = [];
+  const phases: Array<string | undefined> = [];
+  const events: unknown[] = [];
+  let stops = 0;
+  let threadModeDisabled = true;
+  const registrationState = createTelegramBusFollowerRegistrationState();
+  registrationState.setRegistered(true, { chatId: 42, threadId: 10 });
+  const handler = createTelegramBusFollowerHeartbeatRecoveryHandler({
+    registrationState,
+    getRegistrationRuntime: () => ({
+      registerWithLeader: async (...args: unknown[]) => {
+        registrations.push(args);
+        return false;
+      },
+      setContext: () => undefined,
+      stop: () => {
+        stops += 1;
+      },
+    }),
+    getLeaderState: () => ({ kind: "active-elsewhere" as const, lock: { pid: 99, instanceId: "leader", leaderEpoch: "epoch" } }),
+    setLifecyclePhase: (phase) => {
+      phases.push(phase);
+    },
+    updateStatus: () => undefined,
+    promoteToLeader: async (_ctx, _binding, election) => {
+      elections.push(election);
+      return true;
+    },
+    isThreadModeDisabled: () => threadModeDisabled,
+    scheduleRetry: (retry) => {
+      retries.push(retry);
+    },
+    sleep: async () => undefined,
+    promotionGraceMs: 0,
+    recordRuntimeEvent: (_category, _message, details) => {
+      events.push(details?.phase);
+    },
+  });
+
+  await handler(new Error("leader endpoint gone"), "ctx");
+  assert.equal(stops, 1);
+  assert.deepEqual(registrations, [], "No registration loop against a classic-mode leader");
+  assert.deepEqual(elections, []);
+  assert.deepEqual(retries, []);
+  assert.equal(phases.at(-1), undefined);
+  assert.ok(events.includes("follower-thread-mode-disabled"));
+
+  threadModeDisabled = false;
+  await handler(new Error("late heartbeat failure"), "ctx");
+  assert.deepEqual(registrations, [], "A halted follower stays offline until a deliberate connect");
+  handler.resume();
+  await handler(new Error("fresh failure after reconnect"), "ctx");
+  assert.equal(registrations.length > 0, true, "A deliberate registration resumes recovery");
+});
+
 test("Bus follower heartbeat recovery retries until a live lease becomes stale", async () => {
   let stateReadCount = 0;
   let scheduledRetry: (() => void) | undefined;

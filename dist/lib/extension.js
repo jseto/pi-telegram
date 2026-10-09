@@ -1560,6 +1560,10 @@ export default function (pi) {
         recovery: {
             getLeaderState: lockRuntime.getState,
             proveLeaderUnresponsive: proveTelegramLeaderUnresponsive,
+            async isThreadModeDisabled() {
+                await threadStore.refresh?.();
+                return threadStore.getBotState().threadMode === "disabled";
+            },
             setLifecyclePhase: telegramBusFollowerControlState.setLifecyclePhase,
             updateStatus,
             promoteToLeader: promoteTelegramBusFollowerToLeader,
