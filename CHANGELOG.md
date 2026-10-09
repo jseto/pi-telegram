@@ -4,7 +4,9 @@
 
 ## Unreleased
 
-- `Voice artifacts`: A reply plan without voice content no longer reaches outbound voice artifact delivery, so plain text replies stop recording "every voice synthesis provider failed" delivery errors; explicit `telegram_voice` markup and genuine synthesis failures keep their existing fallback behavior.
+## 0.53.1: Text replies without false voice errors
+
+- `Voice artifacts`: A reply plan without voice content no longer reaches outbound voice artifact delivery, so plain text replies stop recording "every voice synthesis provider failed" delivery errors; explicit `telegram_voice` markup and genuine synthesis failures keep their existing fallback behavior (#318).
 
 ## 0.53.0: Live Thread rebinding, routing tabs and Windows support
 
