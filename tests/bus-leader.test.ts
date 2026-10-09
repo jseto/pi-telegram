@@ -5500,7 +5500,8 @@ test("Leader startup defers display contraction until the follower roster settle
         }));
       } finally {
         if (!stopped) await runtime.stopPolling();
-        rmSync(dir, { recursive: true, force: true });
+        // A detached state write can land after stop; let rm retry ENOTEMPTY rather than fail teardown.
+        rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
       }
     });
   }
