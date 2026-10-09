@@ -3312,10 +3312,8 @@ test("Locked polling runtime stops after ownership loss without live context", a
     assert.equal(availabilityChanges, 2);
     assert.deepEqual(
       runtimeEvents.map((event) => event.phase),
-      Array.from(
-        { length: TELEGRAM_OWNERSHIP_CHECK_FAILURE_TOLERANCE + 1 },
-        () => "ownership-check-failed",
-      ),
+      ["ownership-lost"],
+      "A serialized not-owner answer is definitive: record it and stand down without tolerance",
     );
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
@@ -3340,16 +3338,17 @@ test("Locked polling runtime tolerates a transient unverified ownership check", 
     getStatusLabel: () => "active here",
     getOwnedLeaderEpoch: () => undefined,
     getJournalPath: () => undefined,
-    owns: () => {
-      if (!unverifiedNextCheck) return true;
-      unverifiedNextCheck = false;
-      return false;
-    },
+    owns: () => !unverifiedNextCheck,
     commitIfOwned: (commit: () => void) => {
       commit();
       return true;
     },
-    refresh: () => true,
+    // The serialized confirmation is also unavailable for exactly one tick.
+    refresh: () => {
+      if (!unverifiedNextCheck) return true;
+      unverifiedNextCheck = false;
+      throw new Error("Telegram runtime state identity changed before reading.");
+    },
   };
   const runtime = createTelegramLockedPollingRuntime({
     lock,
@@ -3386,7 +3385,7 @@ test("Locked polling runtime tolerates a transient unverified ownership check", 
   assert.deepEqual(events, ["start", "status", "stop"]);
 });
 
-test("Locked polling runtime records refresh write failures instead of throwing from watcher", async () => {
+for (const ownsReadable of [true, false]) test(`Locked polling runtime records refresh write failures instead of throwing from watcher (${ownsReadable ? "ownership verified" : "unverifiable"})`, async () => {
   const events: string[] = [];
   const runtimeEvents: {
     category: string;
@@ -3408,7 +3407,7 @@ test("Locked polling runtime records refresh write failures instead of throwing 
     getStatusLabel: () => "active here",
     getOwnedLeaderEpoch: () => undefined,
     getJournalPath: () => undefined,
-    owns: () => true,
+    owns: () => ownsReadable || refreshCalls < 2,
     commitIfOwned: (commit: () => void) => {
       commit();
       return true;
@@ -3442,10 +3441,19 @@ test("Locked polling runtime records refresh write failures instead of throwing 
     },
   });
   assert.equal((await runtime.start({ cwd: "/repo" })).ok, true);
-  await waitForCondition(() => events.includes("stop"));
-  assert.deepEqual(events, ["start", "status", "stop"]);
+  if (ownsReadable) {
+    // A failing write is not evidence of lost ownership while every check still verifies it.
+    await waitForCondition(() => runtimeEvents.length > 0);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(events, ["start", "status"]);
+    await runtime.stop();
+  } else {
+    await waitForCondition(() => events.includes("stop"));
+    assert.deepEqual(events, ["start", "status", "stop"]);
+    assert.equal(runtimeEvents.length, TELEGRAM_OWNERSHIP_CHECK_FAILURE_TOLERANCE + 1);
+  }
   assert.equal(runtimeEvents[0]?.category, "lock");
-  assert.equal(runtimeEvents[0]?.phase, "refresh");
+  assert.equal(runtimeEvents[0]?.phase, "ownership-check-failed");
   assert.match(runtimeEvents[0]?.message ?? "", /EPERM/);
 });
 

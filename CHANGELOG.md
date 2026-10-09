@@ -4,7 +4,7 @@
 
 ## Unreleased
 
-- `Ownership checks`: An unverified ownership observation no longer stops a live transport on the first miss; consecutive misses are recorded with their count and stand down only after the bounded tolerance, so a concurrent shared-state replacement cannot silence polling.
+- `Ownership checks`: An ownership check that cannot be verified no longer silently stops a live transport. Each such miss is recorded (`ownership-check-failed`) and polling stands down only after two consecutive tolerated misses; a confirmed loss is recorded as `ownership-lost` and stands down at once (#319).
 
 ## 0.54.1: Followers go offline when Threaded Mode is turned off
 
