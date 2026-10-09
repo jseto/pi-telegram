@@ -2886,6 +2886,7 @@ test("Live ancestor endpoints tolerate sibling churn while full inspection and s
     const original = fs.readSync;
     let changed = false;
     let reads = 0;
+    let serializedReads = 0;
     fs.readSync = ((...args: Parameters<typeof readSync>) => {
       const count = Reflect.apply(original, fs, args) as number;
       if (++reads === readNumber) { changed = true; mutate(); }
@@ -2896,12 +2897,26 @@ test("Live ancestor endpoints tolerate sibling churn while full inspection and s
       const read = () => {
         if (live !== "store") return live ? readTelegramUpdateJournalSource(input) : inspectTelegramUpdateJournalFamily(input);
         const result = createTelegramUpdateJournalStore({ path, botIdentity,
-          sourceAccess: { directory: root, limits: input.limits }, withSourceSerialization: config.withSourceSerialization }).read();
+          sourceAccess: { directory: root, limits: input.limits },
+          withSourceSerialization(operation) { serializedReads += 1; return config.withSourceSerialization(operation); } }).read();
         return { kind: result.exists ? "present" : "absent" };
       };
+      if (live === "store" && !accepted) {
+        // The unserialized store read refuses the unstable family, then retries once under
+        // serialization, which must agree with a fresh strict inspection of the settled family.
+        let outcome: string;
+        try { outcome = read().kind; } catch (error) { assert.ok(error instanceof TelegramUpdateJournalError); outcome = "refused"; }
+        assert.equal(changed, true);
+        let fresh: string;
+        try { fresh = readTelegramUpdateJournalSource(input).kind; } catch { fresh = "refused"; }
+        assert.equal(outcome, fresh);
+        assert.equal(serializedReads, 1);
+        return;
+      }
       if (accepted) assert.equal(read().kind, "present");
       else assert.throws(read, TelegramUpdateJournalError);
       assert.equal(changed, true);
+      if (live === "store") assert.equal(serializedReads, 0, "A stable family read takes no transaction");
     } finally { fs.readSync = original; syncBuiltinESMExports(); }
   };
   try {
@@ -4009,7 +4024,7 @@ test("Pending abandonment remains unavailable to exclusion-schema inputs", async
   });
 });
 
-for (const liveSource of [false, true]) test(`Source serialization gates every store operation once while retaining receipt authority (live=${liveSource})`, async () => {
+for (const liveSource of [false, true]) test(`Source serialization gates every store mutation once, never reads, while retaining receipt authority (live=${liveSource})`, async () => {
   await withJournalTempDir(async ({ dir, path }) => {
     const configPath = join(dir, "telegram.json");
     const config = createTelegramConfigStore({ agentDir: dir, configPath });
@@ -4048,7 +4063,16 @@ for (const liveSource of [false, true]) test(`Source serialization gates every s
         assert.equal(existsSync(`${path}.transaction`), false);
       }
     };
-    assert.equal(once(() => store.read()).version, 1);
+    // Reads observe atomic publication without entering serialization or creating guards.
+    const unserialized = <T>(operation: () => T): T => {
+      const before = acquisitions;
+      try { return operation(); } finally {
+        assert.equal(acquisitions, before);
+        assert.equal(existsSync(`${configPath}.transaction`), false);
+        assert.equal(existsSync(`${path}.transaction`), false);
+      }
+    };
+    assert.equal(unserialized(() => store.read()).version, 1);
     once(() => store.appendBatch(Array.from({ length: 6 }, (_, i) => ({ update_id: i + 1 }))));
     const receipt = { queueKind: "prompt" as const, receiptId: "synthetic", sourceUpdateIds: [1] };
     const owner = once(() => store.markQueued({ ...receipt, owner: queueOwnerIdentity })).queueOwner!;
@@ -4072,7 +4096,7 @@ for (const liveSource of [false, true]) test(`Source serialization gates every s
       failedAtMs: 1100, failureClass: "synthetic", summary: "synthetic", disposition: "failed", terminalReason: "synthetic" }));
     once(() => store.applyOperatorDisposition({ updateId: 4, failureId: failed.entry.terminalFailureId!, action: "discard" }));
     once(() => store.removeCompleted([5, 6]));
-    assert.deepEqual(once(() => store.read()).entries, []);
+    assert.deepEqual(unserialized(() => store.read()).entries, []);
     failPublication = true;
     assert.throws(() => once(() => store.appendBatch([{ update_id: 7 }])) , (error) => isJournalError(error, "io"));
     failPublication = false;
@@ -8434,6 +8458,43 @@ test("Update journal atomically rebinds a fully drained journal", async () => {
         error instanceof TelegramUpdateJournalError &&
         error.code === "identity-mismatch",
     );
+  });
+});
+
+test("Update journal reads published state without serialization and repairs only through it", async () => {
+  await withJournalTempDir(async ({ path }) => {
+    let serialized = 0;
+    const withSourceSerialization = <T>(operation: () => T): T => {
+      serialized += 1;
+      return operation();
+    };
+    const store = createTelegramUpdateJournalStore({
+      path,
+      profileName: "work",
+      botIdentity: createTelegramUpdateJournalBotIdentity({ botToken: "token-a", botId: 42 }),
+      withSourceSerialization,
+    });
+    store.appendBatch([{ update_id: 1 }], 1);
+    store.removeCompleted([1]);
+    assert.ok(serialized > 0);
+    serialized = 0;
+    const entriesBefore = (await readdir(dirname(path))).sort();
+    for (let index = 0; index < 3; index += 1)
+      assert.equal(store.read().acceptedThroughUpdateId, 1);
+    assert.equal(serialized, 0, "An idle cursor read takes no transaction");
+    assert.deepEqual((await readdir(dirname(path))).sort(), entriesBefore, "No guard or staging entry is created");
+
+    const reboundIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "token-b", botId: 99 });
+    const rebound = createTelegramUpdateJournalStore({
+      path,
+      profileName: "other",
+      botIdentity: reboundIdentity,
+      withSourceSerialization,
+    });
+    const snapshot = rebound.read();
+    assert.equal(serialized, 1, "Reconciliation still runs inside the serialized transaction");
+    assert.deepEqual(snapshot.botIdentity, reboundIdentity);
+    assert.equal(snapshot.acceptedThroughUpdateId, undefined);
   });
 });
 

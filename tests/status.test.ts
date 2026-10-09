@@ -111,6 +111,25 @@ test("Consolidated runtime projection compares fresh content, excludes event his
   } finally { rmSync(f.dir, { recursive: true, force: true }); }
 });
 
+test("Consolidated runtime projection skips the transaction when published content already matches", async () => {
+  const f = createProjectionFixture();
+  try {
+    f.owner.acquire({ cwd: "/repo" });
+    let publications = 0;
+    const store = f.createStore({ storage: { read: f.storage.read, publish(...args) {
+      publications += 1;
+      return f.storage.publish(...args);
+    } } });
+    assert.equal(await store.persist(f.snapshot), true);
+    assert.equal(publications, 1);
+    f.scope.now = 9000;
+    assert.equal(await store.persist(f.snapshot), false);
+    assert.equal(publications, 1, "An unchanged idle snapshot creates no transaction guard");
+    assert.equal(await store.persist({ ...f.snapshot, runtime: { pollingActive: false } }), true);
+    assert.equal(publications, 2);
+  } finally { rmSync(f.dir, { recursive: true, force: true }); }
+});
+
 for (const drift of ["generation", "profile", "path", "owner"] as const) {
   test(`Consolidated runtime projection refuses queued source drift (${drift})`, async () => {
     const f = createProjectionFixture();

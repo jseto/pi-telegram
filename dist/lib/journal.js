@@ -3221,31 +3221,29 @@ function createJournalStoreCore(options, getInputContext) {
             return { file: reset, exists: true, serializedBytes };
         }
     };
+    const acquireSource = () => sourceAccess
+        ? acquireTelegramUpdateJournalFamily({
+            ...sourceAccess,
+            path,
+            profile,
+            botIdentity: expectedIdentity,
+        }, version)
+        : undefined;
+    const readAcquiredSource = (source) => {
+        const file = source.evidence.kind === "present" ? source.evidence.file : emptyFile();
+        return {
+            file,
+            exists: source.evidence.kind === "present",
+            serializedBytes: assertCapacity(file),
+            source,
+        };
+    };
     const runJournalTransaction = (operation) => {
         try {
             // Acquire before the transaction helper can create parents or staging names.
             // The config continuation excludes participating writers through consumption.
-            const source = sourceAccess
-                ? acquireTelegramUpdateJournalFamily({
-                    ...sourceAccess,
-                    path,
-                    profile,
-                    botIdentity: expectedIdentity,
-                }, version)
-                : undefined;
-            const readSource = () => {
-                if (!source)
-                    return readCurrent();
-                const file = source.evidence.kind === "present"
-                    ? source.evidence.file
-                    : emptyFile();
-                return {
-                    file,
-                    exists: source.evidence.kind === "present",
-                    serializedBytes: assertCapacity(file),
-                    source,
-                };
-            };
+            const source = acquireSource();
+            const readSource = () => source ? readAcquiredSource(source) : readCurrent();
             return withTelegramFileTransaction(`${path}.transaction`, () => operation(readSource));
         }
         catch (error) {
@@ -4091,16 +4089,31 @@ function createJournalStoreCore(options, getInputContext) {
         assertCurrent();
         return { issued, entries: result };
     });
+    const projectRead = (current) => ({
+        ...cloneFile(current.file),
+        exists: current.exists,
+        serializedBytes: current.serializedBytes,
+    });
     const journal = {
         read() {
-            return runMutation((readCurrent) => {
-                const current = readCurrent();
-                return {
-                    ...cloneFile(current.file),
-                    exists: current.exists,
-                    serializedBytes: current.serializedBytes,
-                };
-            });
+            // Atomic publication makes a repair-free read safe without serialization, so idle
+            // status and polling cursor reads create no guards. Any read that needs reconciliation,
+            // or races a compaction, falls back to the serialized path that owns repair.
+            const attempt = () => {
+                try {
+                    const source = acquireSource();
+                    return source ? readAcquiredSource(source) : readCurrentStrict(false);
+                }
+                catch {
+                    return undefined;
+                }
+            };
+            const current = options.withWriterAdmission
+                ? options.withWriterAdmission(attempt)
+                : attempt();
+            return current
+                ? projectRead(current)
+                : runMutation((readCurrent) => projectRead(readCurrent()));
         },
         appendBatch(updates, requestedAcceptedThroughUpdateId) {
             const canonicalUpdates = updates.map((update) => normalizeIncomingJournaledUpdate(update, path));

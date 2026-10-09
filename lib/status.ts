@@ -1010,17 +1010,27 @@ export function createTelegramRuntimeProjectionStore(
       delete semantic.diagnostics.recentRuntimeEvents;
       const isCurrent = (): boolean =>
         getPath() === path && getProfile() === profile && authority() === true;
+      const isUnchanged = (
+        current: unknown,
+      ): current is TelegramStoredRuntimeProjection => {
+        if (!isRuntimeProjection(current)) return false;
+        const { writtenAtMs: _writtenAtMs, ...existing } = current;
+        return isDeepStrictEqual(existing, semantic);
+      };
       const publication = publicationQueue.then(() => {
         if (!isCurrent()) return false;
+        // Observational state needs no transaction when the published projection already matches.
+        try {
+          if (isUnchanged(read({ path, profile }))) return false;
+        } catch {
+          // An unreadable envelope stays with the transactional publisher's fail-closed path.
+        }
         return (
           publish(
             { path, profile },
             (current) => {
-              if (isRuntimeProjection(current)) {
-                const { writtenAtMs: _writtenAtMs, ...existing } = current;
-                if (isDeepStrictEqual(existing, semantic))
-                  return { value: current, changed: false };
-              }
+              if (isUnchanged(current))
+                return { value: current, changed: false };
               const writtenAtMs = getNowMs();
               if (!Number.isSafeInteger(writtenAtMs) || writtenAtMs < 0)
                 throw new Error(
