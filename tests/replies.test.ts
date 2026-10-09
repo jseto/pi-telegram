@@ -17,17 +17,17 @@ import {
   withTelegramReplyParameters,
   buildTelegramReplyTransport,
   createGuestMarkdownReplySender,
-  createReplyDedupRuntime,
   createTelegramGuestPlaceholderRuntime,
   createTelegramRenderedMessageDeliveryRuntime,
   createTelegramRenderedMessageRuntime,
-  dedupSendTextReply,
   editTelegramRenderedMessage,
   extractLatestAssistantMessageText,
   extractRunAssistantMessage,
   getAgentMessageText,
   isAssistantAgentMessage,
+  isTelegramMarkdownFenceClosing,
   normalizeTelegramNativeMarkdown,
+  parseTelegramMarkdownFenceOpening,
   preserveTransportReplyDedupOnNextReset,
   resetTransportReplyDedup,
   sendTelegramNativeMarkdownReply,
@@ -42,10 +42,177 @@ import {
   TELEGRAM_RICH_MESSAGE_MAX_BLOCKS,
   TELEGRAM_RICH_MESSAGE_MAX_CHARS,
 } from "../lib/replies.ts";
-import { createDedupAgentStartHook, createAgentStartDedupHook, setResetTransportReplyDedup } from "../lib/lifecycle.ts";
+import { createAgentStartDedupHook } from "../lib/lifecycle.ts";
 import { createTelegramActivityPublicationRuntime } from "../lib/activity.ts";
 import { createTelegramThreadTarget } from "../lib/target.ts";
-import { TelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
+import { createDefaultTelegramBridgeApiRuntime, TelegramApiAuthorityError, TelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
+import { createTelegramBusAwareApiRuntime } from "../lib/bus-api.ts";
+
+type RenderedFenceSurface = "plain" | "interactive" | "edit" | "html" | "native" | "rich";
+type RenderedFenceOptions = { target: { chatId: number; threadId: number }; replyToMessageId: number; assertAuthority: () => void };
+
+function createRenderedFenceFixture(options: RenderedFenceOptions, ports: {
+  fetch?: () => Promise<Response>;
+  render?: () => void;
+  record?: () => void;
+  direct?: boolean;
+  native?: boolean;
+} = {}) {
+  const originalFetch = globalThis.fetch, networkFamily = process.env.PI_TELEGRAM_NETWORK_FAMILY;
+  delete process.env.PI_TELEGRAM_NETWORK_FAMILY;
+  const requests: Array<{ method: string; body: Record<string, unknown> }> = [], owned: number[] = [], ipc: unknown[] = [];
+  globalThis.fetch = async (input, init) => {
+    requests.push({ method: String(input).split("/").at(-1)!, body: JSON.parse(String(init?.body)) });
+    return ports.fetch ? ports.fetch() : new Response(JSON.stringify({ ok: true, result: { message_id: requests.length } }));
+  };
+  const api = createTelegramBusAwareApiRuntime({
+    directRuntime: createDefaultTelegramBridgeApiRuntime({ getBotToken: () => "123:fixture", recordRuntimeEvent() {} }),
+    ownsDirect: () => ports.direct !== false,
+    async callFollowerApi(method, args) { ipc.push({ method, args }); return { message_id: 99 }; },
+  });
+  const expectedAuthority = options.assertAuthority;
+  const runtime = createTelegramRenderedMessageDeliveryRuntime<unknown>({
+    renderTelegramMessage() { ports.render?.(); return [{ text: "first" }, { text: "tail" }]; },
+    getAssistantRenderingMode: () => ports.native ? "rich" : "html",
+    sendMessage(body, supplied) { assert.equal(supplied?.assertAuthority, expectedAuthority); return api.sendMessage(body, supplied); },
+    editMessage(body, supplied) { assert.equal(supplied?.assertAuthority, expectedAuthority); return api.editMessageText(body, supplied); },
+    sendRichMessage(body, supplied) { assert.equal(supplied?.assertAuthority, expectedAuthority); return api.sendRichMessage(body, supplied); },
+    recordOwnership({ messageId }) { owned.push(messageId); ports.record?.(); },
+  });
+  return { requests, owned, ipc, runtime,
+    restore() {
+      globalThis.fetch = originalFetch;
+      if (networkFamily === undefined) delete process.env.PI_TELEGRAM_NETWORK_FAMILY;
+      else process.env.PI_TELEGRAM_NETWORK_FAMILY = networkFamily;
+    },
+  };
+}
+
+function issueRenderedFenceSurface(surface: RenderedFenceSurface, runtime: ReturnType<typeof createRenderedFenceFixture>["runtime"], options: RenderedFenceOptions) {
+  if (surface === "plain") return runtime.sendTextReply(7, 21, "text", options);
+  if (surface === "interactive") return runtime.sendInteractiveMessage(7, "text", "html", {}, options);
+  if (surface === "edit") return runtime.editInteractiveMessage(7, 99, "text", "html", {}, options);
+  if (surface === "html") return runtime.sendMarkdownReply(7, 21, "text", options);
+  if (surface === "native") return runtime.sendMarkdownReply(7, 21, "x".repeat(33_000), options);
+  return runtime.sendSectionRichMessage(7, { markdown: "text" }, options);
+}
+
+for (const surface of ["plain", "interactive", "edit", "html", "native", "rich"] as const) {
+  for (const revoke of [false, true]) {
+    test(`Rendered reply fence ${surface} ${revoke ? "refuses response-time loss" : "retains current authority"} through actual direct API`, async () => {
+      let current = true;
+      const options = { target: { chatId: 7, threadId: 42 }, replyToMessageId: 21,
+        assertAuthority() { if (!current) throw new Error("private recipient diagnostic"); } };
+      const f = createRenderedFenceFixture(options, { native: surface === "native", async fetch() {
+        await Promise.resolve();
+        if (revoke) { current = false; options.assertAuthority = () => {}; }
+        return new Response(JSON.stringify({ ok: true, result: { message_id: f.requests.length } }));
+      } });
+      try {
+        const issued = issueRenderedFenceSurface(surface, f.runtime, options);
+        if (revoke) {
+          await assert.rejects(issued, { name: "TelegramApiAuthorityError", requestIssued: true,
+            message: "Telegram API call authority is unavailable." });
+          assert.equal(f.requests.length, 1);
+          assert.deepEqual(f.owned, []);
+        } else {
+          await issued;
+          assert.equal(f.requests.length, surface === "rich" ? 1 : 2);
+          assert.equal(f.owned.length, f.requests.length);
+          assert.deepEqual(f.requests.map(({ method }) => method), surface === "edit" ? ["editMessageText", "sendMessage"] :
+            Array(f.requests.length).fill(surface === "rich" || surface === "native" ? "sendRichMessage" : "sendMessage"));
+        }
+        assert.ok(f.requests.every(({ body }) => body.chat_id === 7 && body.message_thread_id === 42));
+        assert.ok(f.requests.every(({ body }) => !("assertAuthority" in body)), "Local authority is not wire data.");
+        assert.deepEqual(f.ipc, []);
+      } finally { f.restore(); }
+    });
+  }
+}
+
+for (const surface of ["plain", "interactive", "edit", "html"] as const) {
+  test(`Rendered reply fence ${surface} captures authority before synchronous rendering`, async () => {
+    let current = true;
+    const options = { target: { chatId: 7, threadId: 42 }, replyToMessageId: 21,
+      assertAuthority() { if (!current) throw new Error("recipient replaced"); } };
+    const f = createRenderedFenceFixture(options, { render() { current = false; options.assertAuthority = () => {}; } });
+    try {
+      await assert.rejects(issueRenderedFenceSurface(surface, f.runtime, options), { name: "TelegramApiAuthorityError", requestIssued: false });
+      assert.deepEqual(f.requests, []);
+      assert.deepEqual(f.owned, []);
+      await withTelegramReplyParameters(7, 21, options.target, async (parameters) => assert.equal(parameters?.message_id, 21));
+    } finally { f.restore(); }
+  });
+}
+
+for (const boundary of ["rendering", "response"] as const) {
+  test(`Rendered reply fence fixes its target before ${boundary} carrier mutation`, async () => {
+    const options = { target: { chatId: 7, threadId: 42 }, replyToMessageId: 21, assertAuthority() {} };
+    const mutate = () => { options.target.chatId = 8; options.target.threadId = 84; options.replyToMessageId = 22; };
+    const f = createRenderedFenceFixture(options, {
+      render: boundary === "rendering" ? mutate : undefined,
+      async fetch() { if (boundary === "response") mutate(); return new Response(JSON.stringify({ ok: true, result: { message_id: f.requests.length } })); },
+    });
+    try {
+      await issueRenderedFenceSurface("interactive", f.runtime, options);
+      assert.equal(f.requests.length, 2);
+      assert.ok(f.requests.every(({ body }) => body.chat_id === 7 && body.message_thread_id === 42));
+      assert.deepEqual(f.requests.map(({ body }) => (body.reply_parameters as { message_id?: number } | undefined)?.message_id), [21, undefined]);
+    } finally { f.restore(); }
+  });
+}
+
+test("Rendered reply fence refuses final success after ownership publication revokes recipient", async () => {
+  let current = true;
+  const options = { target: { chatId: 7, threadId: 42 }, replyToMessageId: 21,
+    assertAuthority() { if (!current) throw new Error("recipient replaced"); } };
+  const f = createRenderedFenceFixture(options, { record() { current = false; } });
+  try {
+    await assert.rejects(issueRenderedFenceSurface("rich", f.runtime, options), { name: "TelegramApiAuthorityError", requestIssued: true });
+    assert.equal(f.requests.length, 1);
+    assert.deepEqual(f.owned, [1], "Previously current ownership is not undone or replayed.");
+  } finally { f.restore(); }
+});
+
+for (const issued of [false, true]) {
+  test(`Rendered reply fence ${issued ? "retains issued" : "releases unissued"} reply anchor after authority refusal`, async () => {
+    const target = { chatId: 7, threadId: 42 };
+    await assert.rejects(sendTelegramRenderedChunks(7, [{ text: "first" }], {
+      async sendMessage() { throw new TelegramApiAuthorityError(issued); }, async editMessage() {},
+    }, { target, replyToMessageId: 21, assertAuthority() {} }), { requestIssued: issued });
+    await withTelegramReplyParameters(7, 21, target, async (parameters) => assert.equal(parameters?.message_id, issued ? undefined : 21));
+  });
+}
+
+for (const boundary of ["adapter-return", "ownership-publication"] as const) {
+  test(`Rendered reply fence rechecks at ${boundary} without issuing later chunks`, async () => {
+    let current = true, calls = 0;
+    const owned: number[] = [], options = { assertAuthority() { if (!current) throw new Error("recipient replaced"); } };
+    await assert.rejects(sendTelegramRenderedChunks(7, [{ text: "first" }, { text: "tail" }], {
+      async sendMessage(_body, supplied) {
+        assert.equal(supplied?.assertAuthority, options.assertAuthority);
+        calls++;
+        if (boundary === "adapter-return") current = false;
+        return { message_id: 1 };
+      },
+      async editMessage() {},
+      recordOwnership({ messageId }) { owned.push(messageId); current = false; options.assertAuthority = () => {}; },
+    }, options), { name: "TelegramApiAuthorityError", requestIssued: true });
+    assert.equal(calls, 1);
+    assert.deepEqual(owned, boundary === "adapter-return" ? [] : [1]);
+  });
+}
+
+for (const surface of ["interactive", "edit", "rich"] as const) {
+  test(`Rendered reply fence ${surface} cannot serialize recipient authority through follower IPC`, async () => {
+    const options = { target: { chatId: 7, threadId: 42 }, replyToMessageId: 21, assertAuthority() {} };
+    const f = createRenderedFenceFixture(options, { direct: false });
+    try {
+      await assert.rejects(issueRenderedFenceSurface(surface, f.runtime, options), { name: "TelegramApiAuthorityError", requestIssued: false });
+      assert.deepEqual(f.requests, []); assert.deepEqual(f.owned, []); assert.deepEqual(f.ipc, []);
+    } finally { f.restore(); }
+  });
+}
 
 test("Reply helpers extract assistant message text and metadata", () => {
   const messages = [
@@ -1005,8 +1172,7 @@ test("Starting a new turn resets quoting behind the previous turn's queued final
   const gate = new Promise<void>((resolve) => { release = resolve; });
   const blocker = publication.enqueue(() => gate);
   const oldFinal = publication.enqueue(reply);
-  setResetTransportReplyDedup(resetTransportReplyDedup);
-  const start = createAgentStartDedupHook(async () => {}, (task) => { void publication.enqueue(task); });
+  const start = createAgentStartDedupHook(async () => {}, resetTransportReplyDedup, (task) => { void publication.enqueue(task); });
   try {
     await start({ type: "agent_start" }, {} as Parameters<typeof start>[1]);
     const first = publication.enqueue(reply);
@@ -1094,51 +1260,6 @@ test("Transport reply dedup preserves a dispatch notice through one agent-start 
     message_id: 42,
     allow_sending_without_reply: true,
   });
-});
-
-test("Reply dedup tracks first reply per prompt message id and resets", () => {
-  const dedup = createReplyDedupRuntime();
-  assert.equal(dedup.shouldReply(42), true);
-  assert.equal(dedup.shouldReply(42), false);
-  assert.equal(dedup.shouldReply(99), true);
-  dedup.reset();
-  assert.equal(dedup.shouldReply(42), true);
-});
-
-test("Dedup wrapper suppresses reply_to_message_id after the first message in a turn", async () => {
-  const dedup = createReplyDedupRuntime();
-  const passedReplyIds: Array<number | undefined> = [];
-  const inner = async (
-    _chatId: number,
-    replyToMessageId: number | undefined,
-  ) => {
-    passedReplyIds.push(replyToMessageId);
-    return 1;
-  };
-  const wrapped = dedupSendTextReply(dedup, inner);
-  await wrapped(7, 42, "first");
-  await wrapped(7, 42, "second");
-  await wrapped(7, 99, "other");
-  assert.deepEqual(passedReplyIds, [42, undefined, 99]);
-});
-
-test("Dedup reset fires on agent_start through lifecycle hook", async () => {
-  const dedup = createReplyDedupRuntime();
-  dedup.shouldReply(42); // marks replied
-  let agentStartCalled = false;
-  const hook = createDedupAgentStartHook(dedup, async () => {
-    agentStartCalled = true;
-  });
-  await hook(
-    {} as Parameters<typeof hook>[0],
-    {} as Parameters<typeof hook>[1],
-  );
-  assert.equal(agentStartCalled, true);
-  assert.equal(
-    dedup.shouldReply(42),
-    true,
-    "reset clears previous reply state",
-  );
 });
 
 interface GuestPlaceholderTestTimer {
@@ -1443,4 +1564,15 @@ test("Guest placeholder stopAll cancels every pending loop", async () => {
   runtime.stopAll();
   assert.equal(timers.pendingCount(), 0);
   await runtime.stop("inline-1");
+});
+
+test("Markdown fences open on three markers and close only on a long-enough matching run", () => {
+  assert.equal(parseTelegramMarkdownFenceOpening("plain"), undefined);
+  assert.equal(parseTelegramMarkdownFenceOpening("    ```"), undefined);
+  const fence = parseTelegramMarkdownFenceOpening("  ````ts");
+  assert.deepEqual(fence, { marker: "`", length: 4 });
+  assert.equal(isTelegramMarkdownFenceClosing("```", fence!), false);
+  assert.equal(isTelegramMarkdownFenceClosing("~~~~", fence!), false);
+  assert.equal(isTelegramMarkdownFenceClosing("````` ", fence!), true);
+  assert.equal(isTelegramMarkdownFenceClosing("```` code", fence!), false);
 });

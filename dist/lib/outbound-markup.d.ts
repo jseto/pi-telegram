@@ -17,10 +17,8 @@ export declare function replaceTelegramButtonFences(markdown: string, replace: (
 export declare function replaceTopLevelHtmlComments(markdown: string, replacer: (comment: TelegramTopLevelHtmlComment) => string): string;
 export declare function parseTelegramButtonPayloadRows(source: string): Record<string, unknown>[][] | undefined;
 export declare function parseTelegramActionPayloadRows(comment: TelegramTopLevelHtmlComment, command: string): Record<string, unknown>[][] | undefined;
-export declare function normalizeMarkdownAfterVoiceExtraction(markdown: string): string;
 export declare function stripTelegramCommentMarkupForPreview(markdown: string): string;
 export declare function stripTelegramCommentMarkupForDelivery(markdown: string): string;
-export declare function stripTelegramVoiceMarkupForPreview(markdown: string): string;
 export interface TelegramVoiceReplyItem {
     text: string;
     lang?: string;

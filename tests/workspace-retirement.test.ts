@@ -7,7 +7,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { constants } from "node:fs";
 import { mkdtemp, mkdir, realpath, rm, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, basename, join } from "node:path";
@@ -152,7 +151,7 @@ test("Strict namespace protection refuses a missing result or omitted polling ev
 });
 
 for (const scope of ["binding", "shared", "discovered"] as const) for (const availability of ["queued", "empty", "empty-incomplete", "unreadable"] as const) {
-  test(`Strict journal capture preserves rerouted accepted work (${scope}, ${availability})`, { skip: !constants.O_NOFOLLOW || !constants.O_NONBLOCK }, async () => {
+  test(`Strict journal capture preserves rerouted accepted work (${scope}, ${availability})`, async () => {
     const directory = await mkdtemp(join(tmpdir(), "pi-restore-provenance-"));
     const path = join(directory, "inbox.json");
     const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "fixture:provenance", botId: 7 });

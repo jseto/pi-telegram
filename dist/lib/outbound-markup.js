@@ -192,7 +192,9 @@ function removeTelegramJsonTrailingCommas(source) {
 }
 function parseTelegramJsonObjectCandidate(source) {
     const normalized = removeTelegramJsonTrailingCommas(source);
-    for (const candidate of normalized === source ? [source] : [source, normalized]) {
+    for (const candidate of normalized === source
+        ? [source]
+        : [source, normalized]) {
         try {
             const value = JSON.parse(candidate);
             if (isTelegramActionPayload(value))
@@ -207,36 +209,46 @@ function parseTelegramJsonObjectCandidate(source) {
 function looksLikeTelegramNamedJsonObject(source, offset) {
     return /^\{\s*"(?:[^"\\]|\\.)*"\s*:/u.test(source.slice(offset));
 }
-function parseTelegramActionPayload(comment, command) {
+/** Blank one structured span so tolerant attribute parsing never reads keys inside rejected JSON or matrices. */
+function blankTelegramActionSpan(text, start, end) {
+    return `${text.slice(0, start)}${" ".repeat(end - start)}${text.slice(end)}`;
+}
+/**
+ * Scans one action comment for its first accepted structured payload. Otherwise returns the attribute envelope
+ * with every structured span blanked; implausible `[` starts are skipped without a parse attempt.
+ */
+function scanTelegramActionComment(comment, command, parseStructured) {
     let content = comment.content.replace(/^\s+/, "").replace(/^!/, "");
     if (!content.startsWith(command))
         return undefined;
     content = content.slice(command.length);
     let attributeEnvelope = content;
     for (let offset = 0; offset < content.length; offset += 1) {
-        if (content[offset] !== "{" && content[offset] !== "[")
+        const char = content[offset];
+        if (char !== "{" && char !== "[")
             continue;
-        if (content[offset] === "[" &&
-            !isPlausibleTelegramMatrixStart(content, offset)) {
-            const noiseEnd = findTelegramStructuredPayloadEnd(content, offset);
-            if (noiseEnd !== undefined) {
-                attributeEnvelope = `${attributeEnvelope.slice(0, offset)}${" ".repeat(noiseEnd - offset)}${attributeEnvelope.slice(noiseEnd)}`;
-                offset = noiseEnd - 1;
-            }
-            continue;
-        }
-        if (content[offset] === "{") {
-            const parsed = parseTelegramAdaptiveActionPayloadRows(content.slice(offset), parseTelegramVoiceCompactActionPayload, { allowTrailing: true });
-            if (parsed)
-                return parsed.rows[0][0];
+        if (char === "{" || isPlausibleTelegramMatrixStart(content, offset)) {
+            const payload = parseStructured(content, offset);
+            if (payload !== undefined)
+                return { payload };
         }
         const end = findTelegramStructuredPayloadEnd(content, offset);
         if (end === undefined)
             continue;
-        attributeEnvelope = `${attributeEnvelope.slice(0, offset)}${" ".repeat(end - offset)}${attributeEnvelope.slice(end)}`;
+        attributeEnvelope = blankTelegramActionSpan(attributeEnvelope, offset, end);
         offset = end - 1;
     }
-    return parseTolerantTelegramAttributes(attributeEnvelope, [
+    return { attributeEnvelope };
+}
+function parseTelegramActionPayload(comment, command) {
+    const scanned = scanTelegramActionComment(comment, command, (content, offset) => content[offset] === "{"
+        ? parseTelegramAdaptiveActionPayloadRows(content.slice(offset), parseTelegramVoiceCompactActionPayload, { allowTrailing: true })?.rows[0][0]
+        : undefined);
+    if (!scanned)
+        return undefined;
+    if ("payload" in scanned)
+        return scanned.payload;
+    return parseTolerantTelegramAttributes(scanned.attributeEnvelope, [
         "text",
         "value",
         "lang",
@@ -259,7 +271,10 @@ function parseTelegramButtonCompactActionPayload(atoms) {
         selectedStyle !== "danger" &&
         !(atoms.length === 4 && selectedStyle === ""))
         return undefined;
-    if (atoms.length === 4 && !isDisabled && disabled !== "0" && disabled !== "false") {
+    if (atoms.length === 4 &&
+        !isDisabled &&
+        disabled !== "0" &&
+        disabled !== "false") {
         return undefined;
     }
     return {
@@ -464,9 +479,7 @@ function parseTelegramAdaptiveActionPayloadRows(source, parseCompactPayload, opt
         return rows.length > 0 ? rows : undefined;
     };
     skipWhitespace();
-    const rows = source[offset] === "{"
-        ? parseVerticalSequence()
-        : parseMatrix();
+    const rows = source[offset] === "{" ? parseVerticalSequence() : parseMatrix();
     if (!rows)
         return undefined;
     skipWhitespace();
@@ -511,57 +524,32 @@ function isPlausibleTelegramMatrixStart(source, start) {
     let offset = start + 1;
     while (/\s/u.test(source[offset] ?? ""))
         offset += 1;
-    return (source[offset] === "{" ||
-        source[offset] === "[" ||
-        source[offset] === "]");
+    return (source[offset] === "{" || source[offset] === "[" || source[offset] === "]");
 }
 export function parseTelegramButtonPayloadRows(source) {
     return parseTelegramAdaptiveActionPayloadRows(source.trim(), parseTelegramButtonCompactActionPayload, { maxCompactAtoms: 4 })?.rows;
 }
 export function parseTelegramActionPayloadRows(comment, command) {
-    let content = comment.content.replace(/^\s+/, "").replace(/^!/, "");
-    if (!content.startsWith(command))
+    const scanned = scanTelegramActionComment(comment, command, (content, offset) => parseTelegramAdaptiveActionPayloadRows(content.slice(offset), parseTelegramButtonCompactActionPayload, { allowTrailing: true, maxCompactAtoms: 4 })?.rows);
+    if (!scanned)
         return undefined;
-    content = content.slice(command.length);
-    let attributeEnvelope = content;
-    for (let offset = 0; offset < content.length; offset += 1) {
-        if (content[offset] !== "[" && content[offset] !== "{")
-            continue;
-        if (content[offset] === "[" &&
-            !isPlausibleTelegramMatrixStart(content, offset)) {
-            const noiseEnd = findTelegramStructuredPayloadEnd(content, offset);
-            if (noiseEnd !== undefined) {
-                attributeEnvelope = `${attributeEnvelope.slice(0, offset)}${" ".repeat(noiseEnd - offset)}${attributeEnvelope.slice(noiseEnd)}`;
-                offset = noiseEnd - 1;
-            }
-            continue;
-        }
-        const parsed = parseTelegramAdaptiveActionPayloadRows(content.slice(offset), parseTelegramButtonCompactActionPayload, { allowTrailing: true, maxCompactAtoms: 4 });
-        if (parsed)
-            return parsed.rows;
-        const end = findTelegramStructuredPayloadEnd(content, offset);
-        if (end === undefined)
-            continue;
-        attributeEnvelope = `${attributeEnvelope.slice(0, offset)}${" ".repeat(end - offset)}${attributeEnvelope.slice(end)}`;
-        offset = end - 1;
-    }
-    const attributes = parseTolerantTelegramAttributes(attributeEnvelope, [
-        "label",
-        "prompt",
-        "value",
-        "selected_style",
-        "disabled",
-    ]);
+    if ("payload" in scanned)
+        return scanned.payload;
+    const attributes = parseTolerantTelegramAttributes(scanned.attributeEnvelope, ["label", "prompt", "value", "selected_style", "disabled"]);
     if (!attributes)
         return undefined;
-    return [[{
+    return [
+        [
+            {
                 ...attributes,
                 ...(attributes.disabled === "true" || attributes.disabled === "false"
                     ? { disabled: attributes.disabled === "true" }
                     : {}),
-            }]];
+            },
+        ],
+    ];
 }
-export function normalizeMarkdownAfterVoiceExtraction(markdown) {
+function normalizeMarkdownAfterVoiceExtraction(markdown) {
     return markdown.replace(/\n{3,}/g, "\n\n").trim();
 }
 function isTelegramCommentOnlyLinePrefix(value) {
@@ -608,9 +596,6 @@ export function stripTelegramCommentMarkupForDelivery(markdown) {
         : withoutClosedBlocks;
     return normalizeMarkdownAfterVoiceExtraction(deliveryMarkdown);
 }
-export function stripTelegramVoiceMarkupForPreview(markdown) {
-    return stripTelegramCommentMarkupForPreview(markdown);
-}
 export function getTelegramActionString(payload, key) {
     const value = payload[key];
     if (typeof value !== "string")
@@ -624,7 +609,9 @@ export function planTelegramVoiceReply(markdown) {
     let rate;
     const stripped = replaceTopLevelHtmlComments(markdown, (comment) => {
         const command = "telegram_voice";
-        const normalizedContent = comment.content.replace(/^\s+/, "").replace(/^!/, "");
+        const normalizedContent = comment.content
+            .replace(/^\s+/, "")
+            .replace(/^!/, "");
         if (!normalizedContent.startsWith(command))
             return comment.raw;
         const payload = parseTelegramActionPayload(comment, command);

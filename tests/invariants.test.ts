@@ -10,6 +10,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, normalize, relative } from "node:path";
 import test from "node:test";
+import ts from "typescript";
 
 const PROJECT_ROOT = process.cwd();
 const releaseWorkflowSource = readFileSync(
@@ -222,7 +223,6 @@ test("Domain test filenames mirror their owning lib domain", () => {
     "index",
     "integration",
     "invariants",
-    "journal-downgrade",
     "process-shutdown",
     "public-api",
   ]);
@@ -616,6 +616,31 @@ test("Outbound attachment delivery stays decoupled from queue, inbound media, an
   assert.equal(attachmentImports.includes("./telegram-api.ts"), false);
 });
 
+test("Live-rebind command channel has no per-command wire or follower-owner aliases", () => {
+  for (const file of ["bus.ts", "bus-follower.ts", "routing.ts", "bindings.ts", "extension.ts"]) {
+    const source = readFileSync(join(PROJECT_ROOT, "lib", file), "utf8");
+    assert.doesNotMatch(source, /\b(selectedStatus|TelegramBusSelectedStatusInput|TelegramBusLiveRebindStatusObservation|getStatusOwner|isSelectedStatusAvailable|isLiveRebindStatusEnabled|isLiveRebindHeldCommandEnabled)\b|live-thread-rebind-(status|held-command)-v1|observe-status|status-observed/,
+      `${file} must use only the unified command marker, observation, capability and owner`);
+  }
+});
+
+test("Weakened live-rebind cleanup protection stays confined to its own origin", () => {
+  // The live veto and one-shot executor relax historical protection only for live-rebind cleanup; strict
+  // temporary-tab, retirement, adoption and custody consumers must not reach them.
+  const users = (pattern: RegExp) => readdirSync(join(PROJECT_ROOT, "lib")).filter(name => name.endsWith(".ts") &&
+    pattern.test(readFileSync(join(PROJECT_ROOT, "lib", name), "utf8"))).sort();
+  assert.deepEqual(users(/\bisWorkspaceLiveRebindCleanupTargetProtected\b/), ["routing.ts", "threads.ts"]);
+  assert.deepEqual(users(/\bissueLiveRebindThreadCleanup\b/), ["routing.ts", "thread-reconciler.ts"]);
+  // Raw source: the quote-stripping helper is not apostrophe-safe for prose comments in large modules.
+  const routing = readFileSync(join(PROJECT_ROOT, "lib", "routing.ts"), "utf8");
+  const start = routing.indexOf("async function inspectLiveRebindRecipient(");
+  const end = routing.indexOf("const observeLiveRebindLeaderWork", start);
+  assert.ok(start > 0 && end > start, "The live-rebind recipient owner remains a single locatable function");
+  const outside = routing.slice(0, start) + routing.slice(end);
+  assert.doesNotMatch(outside, /\b(isWorkspaceLiveRebindCleanupTargetProtected|issueLiveRebindThreadCleanup)\b/,
+    "Only the live-rebind recipient owner consumes the weakened protection or its executor");
+});
+
 await test("Export audit resolves aliases, namespace access, public stars and JS consumers", async () => {
   const root = await mkdtemp(join(tmpdir(), "telegram-export-audit-"));
   try {
@@ -675,4 +700,43 @@ await test("Export audit resolves aliases, namespace access, public stars and JS
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("Callback toasts carry no emoji and no terminal period", () => {
+  // Toasts are fleeting tooltips written in final form at their call site; no boundary rewrites them.
+  const emoji = /^(?:\p{Extended_Pictographic}|\p{Regional_Indicator})/u;
+  const offenders: string[] = [];
+  for (const name of readdirSync(join(PROJECT_ROOT, "lib")).filter((file) => file.endsWith(".ts"))) {
+    const path = join("lib", name);
+    const source = ts.createSourceFile(name, readFileSync(join(PROJECT_ROOT, path), "utf8"), ts.ScriptTarget.Latest, true);
+    const constants = new Map<string, string>();
+    const toasts: ts.Expression[] = [];
+    const walk = (node: ts.Node): void => {
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer && ts.isStringLiteral(node.initializer))
+        constants.set(node.name.text, node.initializer.text);
+      if (ts.isCallExpression(node)) {
+        const callee = node.expression.getText(source);
+        if (/(?:^|\.)answerCallbackQuery$/u.test(callee) && node.arguments[1]) toasts.push(node.arguments[1]);
+        if (callee === "finalizePendingReroute" && node.arguments[3]) toasts.push(node.arguments[3]);
+      }
+      if (ts.isPropertyAssignment(node) && node.name.getText(source) === "message" &&
+        node.parent.properties.some((property) => property.getText(source) === 'kind: "finalizing"'))
+        toasts.push(node.initializer);
+      ts.forEachChild(node, walk);
+    };
+    walk(source);
+    const texts = (node: ts.Expression): string[] => {
+      if (ts.isParenthesizedExpression(node)) return texts(node.expression);
+      if (ts.isConditionalExpression(node)) return [...texts(node.whenTrue), ...texts(node.whenFalse)];
+      if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return [node.text];
+      if (ts.isTemplateExpression(node)) return [node.getText(source).slice(1, -1)];
+      if (ts.isIdentifier(node) && constants.has(node.text)) return [constants.get(node.text)!];
+      return [];
+    };
+    for (const toast of toasts)
+      for (const text of texts(toast))
+        if (emoji.test(text) || /[^.]\.$/u.test(text))
+          offenders.push(`${path}:${source.getLineAndCharacterOfPosition(toast.getStart(source)).line + 1} ${text}`);
+  }
+  assert.deepEqual(offenders, []);
 });

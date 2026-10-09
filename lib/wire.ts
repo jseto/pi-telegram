@@ -16,7 +16,7 @@ export function hasOnlyWireKeys(
   allowedKeys: readonly string[],
 ): boolean {
   const allowed = new Set(allowedKeys);
-  return Object.keys(value).every(key => allowed.has(key));
+  return Object.keys(value).every((key) => allowed.has(key));
 }
 
 export function isNonEmptyWireString(value: unknown): value is string {

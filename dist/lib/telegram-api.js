@@ -7,15 +7,16 @@
  */
 import { randomUUID } from "node:crypto";
 import { createWriteStream, openAsBlob } from "node:fs";
-import { mkdir, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rename, stat, unlink, writeFile, } from "node:fs/promises";
 import { request as requestHttps } from "node:https";
 import { join } from "node:path";
-import { resolveTelegramAttachmentsDir } from "./paths.js";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { resolveTelegramAttachmentsDir } from "./paths.js";
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 export const TELEGRAM_FILE_MAX_BYTES = 50 * 1024 * 1024;
-export function getTelegramInboundFileByteLimitFromEnv(env, names, defaultValue = TELEGRAM_FILE_MAX_BYTES) {
+/** First positive safe-integer byte limit among ordered env names, else the caller's default. */
+export function getTelegramByteLimitFromEnv(env, names, defaultValue) {
     for (const name of names) {
         const rawValue = env[name]?.trim();
         if (!rawValue)
@@ -32,7 +33,7 @@ function getTelegramApiTempDir() {
 const TELEGRAM_TEMP_FILE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const TELEGRAM_DOWNLOAD_RENAME_MAX_ATTEMPTS = 6;
 const activeTelegramApiWorkspaceAdmissionOperationIds = new Set();
-const TELEGRAM_INBOUND_FILE_MAX_BYTES = getTelegramInboundFileByteLimitFromEnv(process.env, ["PI_TELEGRAM_INBOUND_FILE_MAX_BYTES", "TELEGRAM_MAX_FILE_SIZE_BYTES"], TELEGRAM_FILE_MAX_BYTES);
+const TELEGRAM_INBOUND_FILE_MAX_BYTES = getTelegramByteLimitFromEnv(process.env, ["PI_TELEGRAM_INBOUND_FILE_MAX_BYTES", "TELEGRAM_MAX_FILE_SIZE_BYTES"], TELEGRAM_FILE_MAX_BYTES);
 const TELEGRAM_NETWORK_FAMILY_ENV = "PI_TELEGRAM_NETWORK_FAMILY";
 const TELEGRAM_NETWORK_FAMILY_VALUES = new Set([
     "auto",
@@ -40,10 +41,32 @@ const TELEGRAM_NETWORK_FAMILY_VALUES = new Set([
     "ipv6",
     "ipv4-fallback",
 ]);
+export class TelegramApiAuthorityError extends Error {
+    requestIssued;
+    constructor(requestIssued) {
+        super("Telegram API call authority is unavailable.");
+        this.name = "TelegramApiAuthorityError";
+        this.requestIssued = requestIssued;
+    }
+}
+/** Recheck caller authority, classifying refusal by whether a Bot API request was already issued. */
+export function assertTelegramApiCallAuthority(assertAuthority, requestIssued) {
+    try {
+        assertAuthority?.();
+    }
+    catch {
+        throw new TelegramApiAuthorityError(requestIssued);
+    }
+}
 function parseTelegramApiTargetInteger(value) {
-    const parsed = typeof value === "number" ? value :
-        typeof value === "string" && /^-?\d+$/u.test(value) ? Number(value) : undefined;
-    return parsed !== undefined && Number.isSafeInteger(parsed) ? parsed : undefined;
+    const parsed = typeof value === "number"
+        ? value
+        : typeof value === "string" && /^-?\d+$/u.test(value)
+            ? Number(value)
+            : undefined;
+    return parsed !== undefined && Number.isSafeInteger(parsed)
+        ? parsed
+        : undefined;
 }
 export function createTelegramApiTargetActivityRuntime() {
     const pending = new Map();
@@ -59,8 +82,10 @@ export function createTelegramApiTargetActivityRuntime() {
             const chatId = parseTelegramApiTargetInteger(body.chat_id);
             const threadId = parseTelegramApiTargetInteger(body.message_thread_id);
             const messageId = parseTelegramApiTargetInteger(body.message_id);
-            const chatScoped = chatId !== undefined && threadId === undefined &&
-                messageId !== undefined && messageScopedMethods.has(method);
+            const chatScoped = chatId !== undefined &&
+                threadId === undefined &&
+                messageId !== undefined &&
+                messageScopedMethods.has(method);
             if (chatId === undefined || (threadId === undefined && !chatScoped)) {
                 return () => undefined;
             }
@@ -70,7 +95,10 @@ export function createTelegramApiTargetActivityRuntime() {
                 if (existing)
                     existing.count += 1;
                 else
-                    pending.set(key, { target: { chatId, threadId: threadId }, count: 1 });
+                    pending.set(key, {
+                        target: { chatId, threadId: threadId },
+                        count: 1,
+                    });
             }
             else {
                 pendingChats.set(chatId, (pendingChats.get(chatId) ?? 0) + 1);
@@ -96,8 +124,9 @@ export function createTelegramApiTargetActivityRuntime() {
             };
         },
         hasPendingTarget(target) {
-            return pendingChats.has(target.chatId) ||
-                (target.threadId !== undefined && pending.has(`${target.chatId}:${target.threadId}`));
+            return (pendingChats.has(target.chatId) ||
+                (target.threadId !== undefined &&
+                    pending.has(`${target.chatId}:${target.threadId}`)));
         },
         listPendingTargets() {
             return Array.from(pending.values(), ({ target }) => ({ ...target }));
@@ -216,14 +245,27 @@ function sanitizeFileName(name) {
 export function createTelegramAttachmentFileName(source, generatedName, botScope) {
     const chat = source.chat;
     const clean = (value) => sanitizeFileName(value.replace(/^@/u, "")).replace(/^[-.]+/u, "");
-    const scope = source.scope ? clean(source.scope) : chat?.type === "private" || !chat
-        ? botScope ? clean(botScope) : chat ? String(Math.abs(chat.id)) : ""
-        : chat.username ? clean(chat.username) : String(Math.abs(chat.id));
+    const scope = source.scope
+        ? clean(source.scope)
+        : chat?.type === "private" || !chat
+            ? botScope
+                ? clean(botScope)
+                : chat
+                    ? String(Math.abs(chat.id))
+                    : ""
+            : chat.username
+                ? clean(chat.username)
+                : String(Math.abs(chat.id));
     const dot = generatedName.lastIndexOf(".");
     const extension = dot > 0 ? sanitizeFileName(generatedName.slice(dot)) : "";
-    const tail = source.userFileName ? `-${clean(source.userFileName)}` : extension;
-    return [sanitizeFileName(source.kind), scope, String(source.messageId)].filter(Boolean).join("-") +
-        (source.index !== undefined ? `-${source.index}` : "") + tail;
+    const tail = source.userFileName
+        ? `-${clean(source.userFileName)}`
+        : extension;
+    return ([sanitizeFileName(source.kind), scope, String(source.messageId)]
+        .filter(Boolean)
+        .join("-") +
+        (source.index !== undefined ? `-${source.index}` : "") +
+        tail);
 }
 class TelegramApiMalformedSuccessError extends Error {
     constructor(method, detail) {
@@ -288,8 +330,9 @@ export function isTelegramStaleTargetHttpError(error) {
 }
 /** Only a parsed Telegram rejection of this method proves a request had no effect. */
 export function isTelegramApiRequestRejected(error, method) {
-    return error instanceof TelegramApiHttpError && error.rejectedRequestMethod !== undefined &&
-        error.rejectedRequestMethod === method;
+    return (error instanceof TelegramApiHttpError &&
+        error.rejectedRequestMethod !== undefined &&
+        error.rejectedRequestMethod === method);
 }
 export function isTelegramMessageNotModifiedError(error) {
     return (error instanceof Error && error.message.includes("message is not modified"));
@@ -322,13 +365,15 @@ export function isRetryableTelegramApiError(error) {
             (error.status !== undefined && error.status >= 500)));
 }
 export function getTelegramApiRetryAfterMs(error) {
-    return error instanceof TelegramApiHttpError && error.retryAfterSeconds !== undefined
+    return error instanceof TelegramApiHttpError &&
+        error.retryAfterSeconds !== undefined
         ? Math.max(0, error.retryAfterSeconds * 1000)
         : undefined;
 }
 export function isTelegramMessageUnavailableError(error) {
-    return error instanceof TelegramApiHttpError && error.status === 400 &&
-        /Bad Request: (message to edit not found|message not found|message_id_invalid)/iu.test(error.message);
+    return (error instanceof TelegramApiHttpError &&
+        error.status === 400 &&
+        /Bad Request: (message to edit not found|message not found|message_id_invalid)/iu.test(error.message));
 }
 function getTelegramRetryDelayMs(error, attempt, baseDelayMs) {
     if (error instanceof TelegramApiHttpError &&
@@ -402,7 +447,9 @@ async function publishTelegramDownload(partPath, targetPath, signal) {
         catch (error) {
             const code = error?.code;
             // Windows may briefly deny replacement while another publisher/scanner holds the file.
-            if (process.platform !== "win32" || (code !== "EPERM" && code !== "EACCES") || attempt + 1 >= TELEGRAM_DOWNLOAD_RENAME_MAX_ATTEMPTS)
+            if (process.platform !== "win32" ||
+                (code !== "EPERM" && code !== "EACCES") ||
+                attempt + 1 >= TELEGRAM_DOWNLOAD_RENAME_MAX_ATTEMPTS)
                 throw error;
             await sleepTelegramRetry(50 * 2 ** attempt, signal);
         }
@@ -438,8 +485,11 @@ async function parseTelegramApiResponse(response, method) {
         const retryAfterHeader = response.headers?.get("retry-after");
         const retryAfterSeconds = data?.parameters?.retry_after ??
             (retryAfterHeader ? Number.parseInt(retryAfterHeader, 10) : undefined);
-        throw new TelegramApiHttpError(`Telegram API ${method} failed: ${status}${description}`, response.status, Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : undefined, data?.ok === false && data.error_code === response.status &&
-            [400, 401, 403, 404, 429].includes(response.status) ? method : undefined);
+        throw new TelegramApiHttpError(`Telegram API ${method} failed: ${status}${description}`, response.status, Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : undefined, data?.ok === false &&
+            data.error_code === response.status &&
+            [400, 401, 403, 404, 429].includes(response.status)
+            ? method
+            : undefined);
     }
     if (!data) {
         throw new TelegramApiMalformedSuccessError(method, "returned invalid JSON");
@@ -638,6 +688,12 @@ function withTelegramTransportDiagnostics(error, details) {
     return transport ? { ...details, transport } : details;
 }
 async function callTelegramWithRetry(method, request, options) {
+    const assertAuthority = options?.assertAuthority;
+    let requestIssued = false;
+    const beforeRequest = () => {
+        assertTelegramApiCallAuthority(assertAuthority, requestIssued);
+        requestIssued = true;
+    };
     const retrySafe = options?.retrySafety === "safe" ||
         (options?.retrySafety !== "non-idempotent" &&
             isTelegramApiMethodRetrySafe(method));
@@ -665,10 +721,17 @@ async function callTelegramWithRetry(method, request, options) {
     };
     for (let attempt = 0;; attempt += 1) {
         throwIfTelegramApiCallAborted(options?.signal);
+        assertTelegramApiCallAuthority(assertAuthority, requestIssued);
         try {
-            return unwrapTelegramApiResult(method, await parseTelegramApiResponse(await callTelegramTransportRequest(request, retrySafe), method));
+            const result = unwrapTelegramApiResult(method, await parseTelegramApiResponse(await callTelegramTransportRequest((family) => request(family, beforeRequest), retrySafe), method));
+            assertTelegramApiCallAuthority(assertAuthority, requestIssued);
+            return result;
         }
         catch (error) {
+            // Authority refusal is never a transport failure, retry grant or acknowledged success.
+            if (error instanceof TelegramApiAuthorityError)
+                throw error;
+            assertTelegramApiCallAuthority(assertAuthority, requestIssued);
             const retryable = isRetryableTelegramApiError(error) &&
                 !(options?.retryRateLimit === false &&
                     error instanceof TelegramApiHttpError &&
@@ -734,12 +797,16 @@ function assertTelegramBotTokenConfigured(botToken) {
 export async function callTelegram(botToken, method, body, options) {
     const configuredBotToken = assertTelegramBotTokenConfigured(botToken);
     try {
-        return await callTelegramWithRetry(method, async (family) => telegramFetch(`${TELEGRAM_API_BASE}/bot${configuredBotToken}/${method}`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify(body),
-            signal: options?.signal,
-        }, family), options);
+        return await callTelegramWithRetry(method, async (family, beforeRequest) => {
+            const encodedBody = JSON.stringify(body);
+            beforeRequest();
+            return telegramFetch(`${TELEGRAM_API_BASE}/bot${configuredBotToken}/${method}`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: encodedBody,
+                signal: options?.signal,
+            }, family);
+        }, options);
     }
     catch (error) {
         attachTelegramApiRequestTarget(error, body);
@@ -759,11 +826,14 @@ export async function fetchTelegramBotIdentity(botToken, fetchImpl = fetch) {
  */
 export async function callTelegramMultipart(botToken, method, fields, fileField, filePath, fileName, options) {
     const configuredBotToken = assertTelegramBotTokenConfigured(botToken);
+    options = options && { ...options };
+    assertTelegramApiCallAuthority(options?.assertAuthority, false);
     const fileBlob = await openAsBlob(filePath);
     try {
-        return await callTelegramWithRetry(method, async (family) => {
+        return await callTelegramWithRetry(method, async (family, beforeRequest) => {
             if (family) {
                 const multipart = await buildTelegramMultipartBody(fields, fileField, fileBlob, fileName);
+                beforeRequest();
                 return telegramFetch(`${TELEGRAM_API_BASE}/bot${configuredBotToken}/${method}`, {
                     method: "POST",
                     headers: { "content-type": multipart.contentType },
@@ -776,6 +846,7 @@ export async function callTelegramMultipart(botToken, method, fields, fileField,
                 form.set(key, value);
             }
             form.set(fileField, fileBlob, fileName);
+            beforeRequest();
             return telegramFetch(`${TELEGRAM_API_BASE}/bot${configuredBotToken}/${method}`, {
                 method: "POST",
                 body: form,
@@ -812,20 +883,20 @@ export async function downloadTelegramFile(botToken, fileId, suggestedName, temp
     }
     return targetPath;
 }
-/** Tooltip-like callback answers omit a terminal sentence period; ellipses and other punctuation stay literal. */
-export function formatTelegramCallbackAnswerText(text) {
-    return text?.replace(/(?<!\.)\.\s*$/u, "");
-}
 export async function answerTelegramCallbackQuery(botToken, callbackQueryId, text, options = {}) {
     try {
         await callTelegram(botToken, "answerCallbackQuery", text
             ? { callback_query_id: callbackQueryId, text }
-            : { callback_query_id: callbackQueryId });
+            : { callback_query_id: callbackQueryId }, options.assertAuthority
+            ? { assertAuthority: options.assertAuthority }
+            : undefined);
     }
     catch (error) {
         options.recordRuntimeEvent?.("api", error, withTelegramTransportDiagnostics(error, {
             method: "answerCallbackQuery",
         }));
+        if (error instanceof TelegramApiAuthorityError)
+            throw error;
     }
 }
 export function createTelegramChatActionSender(sendChatAction, action) {
@@ -910,7 +981,8 @@ export function createDefaultTelegramBridgeApiRuntime(deps) {
             // The exclusive deletion permit replaces ordinary target admission.
             const target = authorize();
             const deleted = await client.call("deleteForumTopic", {
-                chat_id: target.chatId, message_thread_id: target.threadId,
+                chat_id: target.chatId,
+                message_thread_id: target.threadId,
             }, { maxAttempts: 1, retrySafety: "non-idempotent" });
             if (deleted !== true)
                 throw new Error("Telegram Workspace Thread deletion was not confirmed.");
@@ -923,7 +995,9 @@ export function createTelegramBridgeApiRuntime(deps) {
             await handler?.(error);
         }
         catch (recoveryError) {
-            deps.recordRuntimeEvent("api", recoveryError, { phase: "stale-target-recovery" });
+            deps.recordRuntimeEvent("api", recoveryError, {
+                phase: "stale-target-recovery",
+            });
         }
     };
     const now = deps.now ?? Date.now;
@@ -1028,9 +1102,11 @@ export function createTelegramBridgeApiRuntime(deps) {
         }
         catch (error) {
             await recoverRequestError(recoverError, error);
-            if (method === "deleteMessage" && error instanceof TelegramApiHttpError &&
-                error.status === 400 && error.message ===
-                "Telegram API deleteMessage failed: HTTP 400: Bad Request: message to delete not found") {
+            if (method === "deleteMessage" &&
+                error instanceof TelegramApiHttpError &&
+                error.status === 400 &&
+                error.message ===
+                    "Telegram API deleteMessage failed: HTTP 400: Bad Request: message to delete not found") {
                 return true;
             }
             deps.recordRuntimeEvent("api", error, withTelegramTransportDiagnostics(error, { method }));
@@ -1074,7 +1150,7 @@ export function createTelegramBridgeApiRuntime(deps) {
         },
         deleteWebhook: (signal) => callRecorded("deleteWebhook", { drop_pending_updates: false }, { signal }),
         getUpdates: (body, signal) => callRecorded("getUpdates", body, { signal }),
-        setMyCommands: (commands) => callRecorded("setMyCommands", { commands }),
+        setMyCommands: (commands, options) => callRecorded("setMyCommands", { commands }, options),
         sendChatAction: (chatId, action, options) => callRecorded("sendChatAction", {
             chat_id: chatId,
             action,
@@ -1111,13 +1187,13 @@ export function createTelegramBridgeApiRuntime(deps) {
                 body.message_thread_id = options.message_thread_id;
             return callRecorded("sendMessageDraft", body);
         },
-        sendMessage: (body) => callRecorded("sendMessage", body),
-        sendRichMessage: (body) => callRecorded("sendRichMessage", body),
+        sendMessage: (body, options) => callRecorded("sendMessage", body, options),
+        sendRichMessage: (body, options) => callRecorded("sendRichMessage", body, options),
         sendRichMessageDraft: (body) => callRecorded("sendRichMessageDraft", body),
-        editMessageText: async (body) => {
+        editMessageText: async (body, options) => {
             const recoverError = deps.captureRequestErrorHandler?.(body);
             try {
-                await deps.client.call("editMessageText", body);
+                await deps.client.call("editMessageText", body, options);
                 return "edited";
             }
             catch (error) {
@@ -1137,7 +1213,19 @@ export function createTelegramBridgeApiRuntime(deps) {
                 reply_markup: replyMarkup,
             });
         },
-        answerCallbackQuery: async (callbackQueryId, text) => {
+        answerCallbackQuery: async (callbackQueryId, text, options) => {
+            if (options?.assertAuthority) {
+                try {
+                    await callRecorded("answerCallbackQuery", text
+                        ? { callback_query_id: callbackQueryId, text }
+                        : { callback_query_id: callbackQueryId }, { assertAuthority: options.assertAuthority });
+                }
+                catch (error) {
+                    if (error instanceof TelegramApiAuthorityError)
+                        throw error;
+                }
+                return;
+            }
             try {
                 await deps.client.answerCallbackQuery(callbackQueryId, text);
             }
@@ -1145,6 +1233,8 @@ export function createTelegramBridgeApiRuntime(deps) {
                 deps.recordRuntimeEvent("api", error, withTelegramTransportDiagnostics(error, {
                     method: "answerCallbackQuery",
                 }));
+                if (error instanceof TelegramApiAuthorityError)
+                    throw error;
             }
         },
         answerGuestQuery: (guestQueryId, text, options) => callRecorded("answerGuestQuery", buildTelegramAnswerGuestQueryBody(guestQueryId, text, options)),
@@ -1219,7 +1309,8 @@ export function createTelegramApiClient(getBotToken, options = {}) {
             }
             catch (error) {
                 if (draftKey && isRetryableTelegramApiError(error)) {
-                    draftRetryNotBeforeByTarget.set(draftKey, Math.max(draftRetryNotBeforeByTarget.get(draftKey) ?? 0, now() + getTelegramRetryDelayMs(error, 0, options?.retryBaseDelayMs ?? 500)));
+                    draftRetryNotBeforeByTarget.set(draftKey, Math.max(draftRetryNotBeforeByTarget.get(draftKey) ?? 0, now() +
+                        getTelegramRetryDelayMs(error, 0, options?.retryBaseDelayMs ?? 500)));
                 }
                 throw error;
             }
@@ -1230,8 +1321,12 @@ export function createTelegramApiClient(getBotToken, options = {}) {
         downloadFile: async (fileId, suggestedName, tempDir, options) => {
             return downloadTelegramFile(getBotToken(), fileId, suggestedName, tempDir, options);
         },
-        answerCallbackQuery: async (callbackQueryId, text) => {
-            await answerTelegramCallbackQuery(getBotToken(), callbackQueryId, text, options);
+        answerCallbackQuery: async (callbackQueryId, text, authorityOptions) => {
+            const assertAuthority = authorityOptions?.assertAuthority;
+            const callbackOptions = assertAuthority
+                ? { ...options, assertAuthority }
+                : options;
+            await answerTelegramCallbackQuery(getBotToken(), callbackQueryId, text, callbackOptions);
         },
     };
 }

@@ -8,6 +8,8 @@ import { readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
 import {
+  appendTelegramAttachmentSection,
+  appendTelegramListSection,
   buildTelegramReplyContextBlock,
   collectTelegramFileInfos,
   collectTelegramMessageIds,
@@ -112,31 +114,6 @@ export function formatTelegramTurnStatusSummary(
   }
   if (files.length > 1) return `📎 ${files.length} attachments`;
   return "(empty message)";
-}
-
-function appendTelegramListSection(
-  text: string,
-  title: string,
-  items: string[],
-): string {
-  if (items.length === 0) return text;
-  const prefix = text.length > 0 ? `${text}\n\n` : "";
-  return `${prefix}[${title}]\n${items.map((item) => `- ${item}`).join("\n")}`;
-}
-
-function appendTelegramAttachmentSection(
-  text: string,
-  files: Pick<DownloadedTelegramTurnFile, "path">[],
-): string {
-  if (files.length === 0) return text;
-  const dirs = [...new Set(files.map((file) => dirname(file.path)))];
-  const sameDir = dirs.length === 1;
-  const header = sameDir ? `[attachments] ${dirs[0]}` : "[attachments]";
-  const items = sameDir
-    ? files.map((file) => `/${basename(file.path)}`)
-    : files.map((file) => file.path);
-  const prefix = text.length > 0 ? `${text}\n\n` : "";
-  return `${prefix}${header}\n${items.map((item) => `- ${item}`).join("\n")}`;
 }
 
 function appendTelegramSourceContext(
@@ -499,7 +476,9 @@ export function createTelegramPromptTurnRuntimePreparer<
               text: extractTelegramMessageText(message),
               message,
               fileNames: new Set(
-                collectTelegramFileInfos([message]).map((file) => file.fileName),
+                collectTelegramFileInfos([message]).map(
+                  (file) => file.fileName,
+                ),
               ),
             },
           ]
@@ -675,7 +654,12 @@ function collectTelegramTurnAdmissionReceipts(
 
 async function prepareTelegramPromptTurn(
   options: Omit<BuildTelegramPromptTurnOptions, "queueOrder" | "historyTurns">,
-): Promise<(queueOrder: number, historyTurns: PendingTelegramTurn[]) => PendingTelegramTurn> {
+): Promise<
+  (
+    queueOrder: number,
+    historyTurns: PendingTelegramTurn[],
+  ) => PendingTelegramTurn
+> {
   const images: TelegramPromptContent[] = [];
   for (const file of options.files) {
     if (!file.isImage) continue;
@@ -689,7 +673,10 @@ async function prepareTelegramPromptTurn(
     });
   }
   return (queueOrder, historyTurns) =>
-    buildPreparedTelegramPromptTurn({ ...options, queueOrder, historyTurns }, images);
+    buildPreparedTelegramPromptTurn(
+      { ...options, queueOrder, historyTurns },
+      images,
+    );
 }
 
 function buildPreparedTelegramPromptTurn(

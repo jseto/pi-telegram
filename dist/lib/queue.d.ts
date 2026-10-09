@@ -188,9 +188,7 @@ export declare function createTelegramQueueAdmissionReceipt(options: {
     scope: string;
     sourceUpdateIds: readonly number[];
 }): TelegramQueueAdmissionReceipt | undefined;
-export declare function isTelegramQueueItemDurablyAdmitted<TContext = unknown>(item: TelegramQueueItem<TContext>, isReceiptCommitted: (receipt: TelegramQueueAdmissionReceipt) => boolean): boolean;
 export declare function getTelegramQueueLaneContract(lane: TelegramQueueLane): TelegramQueueLaneContract;
-export declare function getTelegramQueueItemAdmissionMode(item: Pick<TelegramQueueItem, "queueLane">): TelegramQueueAdmissionMode;
 export declare function isTelegramQueueItemAdmissionValid(item: Pick<TelegramQueueItem, "kind" | "queueLane">): boolean;
 export declare function assertTelegramQueueItemAdmissionValid(item: Pick<TelegramQueueItem, "kind" | "queueLane" | "admissionReceipts">): void;
 export declare function createTelegramQueueStore<TContext = unknown>(initialItems?: TelegramQueueItem<TContext>[]): TelegramQueueStateStore<TContext>;
@@ -202,6 +200,13 @@ export declare function createTelegramTransportStampedQueueStore<TContext>(store
 export declare function countExecutableTelegramQueueItems<TContext = unknown>(items: readonly TelegramQueueItem<TContext>[]): number;
 export declare function createTelegramQueueItemCountGetter<TContext = unknown>(store: Pick<TelegramQueueStore<TContext>, "getQueuedItems">): () => number;
 export declare function createTelegramActiveTurnStore<TTurn extends PendingTelegramTurn = PendingTelegramTurn>(): TelegramActiveTurnStore<TTurn>;
+/** Current captured targets only; skipped/receipt-held items remain work, never historical census. */
+export declare function observeTelegramTargetQueueWork(target: TelegramQueueTarget & {
+    threadId: number;
+}, activeTurn: Pick<TelegramQueueItemBase, "chatId" | "target"> | undefined, items: readonly Pick<TelegramQueueItemBase, "chatId" | "target">[]): {
+    protected: boolean;
+    unknown: boolean;
+};
 export declare function partitionTelegramQueueItemsForHistory<TContext = unknown>(items: TelegramQueueItem<TContext>[]): {
     historyTurns: PendingTelegramTurn[];
     remainingItems: TelegramQueueItem<TContext>[];
@@ -586,7 +591,7 @@ export interface TelegramSessionShutdownRuntimeDeps<TQueueItem> {
     clearAbort: () => void;
     stopPolling: () => Promise<void>;
 }
-export interface TelegramSessionLifecycleHookRuntimeDeps<TContext, TQueueItem, TModel = unknown> extends TelegramRuntimeEventRecorderPort {
+export interface TelegramSessionLifecycleHookRuntimeDeps<TContext, TQueueItem, TModel = unknown> extends TelegramRuntimeEventRecorderPort, Omit<TelegramSessionShutdownRuntimeDeps<TQueueItem>, "isSessionActive" | "discardQueuedItems" | "applyState"> {
     getCurrentModel: (ctx: TContext) => TModel | undefined;
     loadConfig: () => Promise<void>;
     applySessionStartState: (state: TelegramSessionStartState<TModel>) => void;
@@ -594,20 +599,8 @@ export interface TelegramSessionLifecycleHookRuntimeDeps<TContext, TQueueItem, T
     prepareTempDir: () => Promise<unknown>;
     updateStatus: (ctx: TContext) => void;
     isSessionActive?: (ctx: TContext) => boolean;
-    unbindDeferredDispatchContext?: () => void;
     discardQueuedItems?: (ctx: TContext) => void;
     applySessionShutdownState: (state: TelegramSessionShutdownState<TQueueItem>) => void;
-    clearPendingMediaGroups: () => void;
-    clearModelMenuState: () => void;
-    getActiveTurnChatId: () => number | undefined;
-    getActiveTurnTarget?: () => TelegramQueueTarget | undefined;
-    clearPreview: (chatId: number, options?: {
-        target?: TelegramQueueTarget;
-    }) => Promise<void>;
-    previewShutdownTimeoutMs?: number;
-    clearActiveTurn: () => void;
-    clearAbort: () => void;
-    stopPolling: () => Promise<void>;
 }
 export type TelegramSessionLifecycleHookEvent = unknown;
 export declare function createTelegramSessionStateApplier<TQueueItem, TModel>(deps: TelegramSessionStateApplierDeps<TQueueItem, TModel>): TelegramSessionStateApplier<TQueueItem, TModel>;
@@ -648,6 +641,8 @@ export interface TelegramPromptEnqueueRuntimeDeps<TMessage, TContext = unknown> 
     updateStatus: () => void;
     dispatchNextQueuedTelegramTurn: () => void;
     assertExecutionCurrent?: () => void;
+    /** Input-specific relocation must not fold or replace unrelated queued work. */
+    preserveQueued?: boolean;
     onQueued?: (turn: PendingTelegramTurn) => void;
 }
 export interface TelegramPromptEnqueueControllerDeps<TMessage, TContext = unknown> extends TelegramQueueStore<TContext> {
@@ -660,7 +655,10 @@ export interface TelegramPromptEnqueueControllerDeps<TMessage, TContext = unknow
     assertExecutionCurrent?: (messages: TMessage[]) => void;
 }
 export interface TelegramPromptEnqueueController<TMessage, TContext = unknown> {
-    enqueue: (messages: TMessage[], ctx: TContext, onQueued?: (turn: PendingTelegramTurn) => void) => Promise<PendingTelegramTurn>;
+    enqueue: (messages: TMessage[], ctx: TContext, onQueued?: (turn: PendingTelegramTurn) => void, options?: {
+        assertCurrent?: () => void;
+        preserveQueued?: boolean;
+    }) => Promise<PendingTelegramTurn>;
 }
 export declare function buildTelegramSessionStartState<TModel = unknown>(currentModel: TModel | undefined): TelegramSessionStartState<TModel>;
 export declare function buildTelegramSessionShutdownState<TQueueItem>(): TelegramSessionShutdownState<TQueueItem>;

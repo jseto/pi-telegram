@@ -40,7 +40,7 @@ const sessionBinding = {
   bindingKey: `binding:a-s-${sessionKey}`,
 };
 const execFileAsync = promisify(execFile);
-const test = process.platform === "win32" ? nodeTest.skip : nodeTest;
+const test = nodeTest;
 const cleanupOwner = { processId: 1, processBirthId: "1:test" };
 const clear = {
   bindingKey: "binding:a", target: { chatId: -1001, threadId: 7 },
@@ -439,9 +439,12 @@ test("Cleanup work-set records one exact deletion permit across restart", async 
     now = 120;
     assert.equal(restarted.confirmDeleted({ operationId: "cleanup-1", bindingKey: "binding:a" }).confirmed, true);
     assert.equal(restarted.confirmDeleted({ operationId: "cleanup-1", bindingKey: "binding:a" }).confirmed, false);
-    await rm(path);
-    await symlink("/etc/passwd", path);
-    assert.throws(() => restarted.list(), /bounded private regular file/u);
+    // Creating symbolic links needs elevated rights on Windows.
+    if (process.platform !== "win32") {
+      await rm(path);
+      await symlink("/etc/passwd", path);
+      assert.throws(() => restarted.list(), /bounded private regular file/u);
+    }
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 

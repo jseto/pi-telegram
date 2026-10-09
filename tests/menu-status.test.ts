@@ -140,7 +140,7 @@ test("Status callback routing updates target menus and guards thinking controls"
     true,
   );
   assert.deepEqual(voiceCalls, [
-    "Thinking controls are disabled during voice replies.",
+    "Thinking controls are disabled during voice replies",
   ]);
 });
 

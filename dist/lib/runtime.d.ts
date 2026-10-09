@@ -142,18 +142,8 @@ export interface TelegramPromptDispatchLifecycleDeps<TContext> extends TelegramR
     }) => boolean | void;
     updateStatus: (ctx: TContext, error?: string) => void;
 }
-export interface TelegramPromptDispatchRuntimeDeps<TContext> extends TelegramRuntimeEventRecorderPort {
+export interface TelegramPromptDispatchRuntimeDeps<TContext> extends TelegramTypingLoopStarterDeps<TContext> {
     lifecycle: TelegramPromptDispatchLifecycleDeps<TContext>["lifecycle"];
-    typing: TelegramRuntimeTypingPort;
-    getDefaultChatId: () => number | undefined;
-    sendTypingAction: (chatId: number, options?: {
-        message_thread_id?: number;
-    }) => Promise<unknown>;
-    updateStatus: (ctx: TContext, error?: string) => void;
-    isContextActive?: (ctx: TContext) => boolean;
-    isTransportAvailable?: () => boolean;
-    getTransportAuthority?: () => string | number | undefined;
-    intervalMs?: number;
 }
 export interface TelegramPromptDispatchRuntime<TContext> {
     startTypingLoop: (ctx: TContext, chatId?: number, options?: {

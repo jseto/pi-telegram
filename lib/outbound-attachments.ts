@@ -25,8 +25,8 @@ import {
   TELEGRAM_MESSAGE_PROMPT_SNIPPET,
 } from "./prompts.ts";
 import {
-  withTelegramReplyParameters,
   normalizeTelegramNativeMarkdown,
+  withTelegramReplyParameters,
 } from "./replies.ts";
 import {
   getTelegramTargetThreadParams,
@@ -37,6 +37,7 @@ const MAX_ATTACHMENTS_PER_TURN = 10;
 
 export const TELEGRAM_OUTBOUND_ATTACHMENT_DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
 
+// Deliberately local: outbound attachment delivery stays decoupled from Bot API helpers.
 export function getTelegramOutboundAttachmentByteLimitFromEnv(
   env: NodeJS.ProcessEnv,
   names: string[],
@@ -86,12 +87,10 @@ export interface TelegramOutboundMessagePlan {
   replyMarkup?: unknown;
 }
 
-export interface TelegramOutboundMessageToolRegistrationDeps extends TelegramOutboundAttachmentRuntimeEventRecorderPort {
-  getDefaultChatId: () => number | undefined;
+export interface TelegramOutboundMessageDeliveryPorts {
+  getDefaultChatId?: () => number | undefined;
   getDefaultTarget?: () => TelegramTarget | undefined;
-  getActiveTurn?: () =>
-    | { chatId: number; target?: TelegramTarget }
-    | undefined;
+  getActiveTurn?: () => { chatId: number; target?: TelegramTarget } | undefined;
   resolveAgentTarget?: (
     selector: TelegramBusAgentTargetSelector,
   ) => Promise<TelegramTarget & { threadId: number }>;
@@ -116,6 +115,13 @@ export interface TelegramOutboundMessageToolRegistrationDeps extends TelegramOut
   ) => Promise<number | undefined>;
 }
 
+export interface TelegramOutboundMessageToolRegistrationDeps
+  extends
+    TelegramOutboundMessageDeliveryPorts,
+    TelegramOutboundAttachmentRuntimeEventRecorderPort {
+  getDefaultChatId: () => number | undefined;
+}
+
 export interface TelegramQueuedOutboundAttachmentView {
   path: string;
   fileName: string;
@@ -136,7 +142,9 @@ class TelegramRichAttachmentCommitUnknownError extends Error {
   readonly kind = "commit-unknown" as const;
 
   constructor(cause: unknown) {
-    super("Telegram Rich media upload may have committed without a message id.");
+    super(
+      "Telegram Rich media upload may have committed without a message id.",
+    );
     this.name = "TelegramRichAttachmentCommitUnknownError";
     this.cause = cause;
   }
@@ -180,15 +188,16 @@ export function planTelegramRichOutboundAttachment(options: {
   if (options.turn.queuedAttachments.length !== 1) return undefined;
   const attachment = options.turn.queuedAttachments[0]!;
   const normalizedPath = attachment.path.toLowerCase();
-  const mediaType = normalizedPath.endsWith(".jpg") ||
-      normalizedPath.endsWith(".jpeg") ||
-      normalizedPath.endsWith(".png")
-    ? "photo"
-    : normalizedPath.endsWith(".mp4")
-      ? "video"
-      : normalizedPath.endsWith(".mp3")
-        ? "audio"
-        : undefined;
+  const mediaType =
+    normalizedPath.endsWith(".jpg") ||
+    normalizedPath.endsWith(".jpeg") ||
+    normalizedPath.endsWith(".png")
+      ? "photo"
+      : normalizedPath.endsWith(".mp4")
+        ? "video"
+        : normalizedPath.endsWith(".mp3")
+          ? "audio"
+          : undefined;
   if (!mediaType) return undefined;
   const mediaId = "artifact";
   const richMessage = {
@@ -237,18 +246,27 @@ export function createTelegramRichOutboundAttachmentSender(
     if (!plan) return false;
     try {
       const result = await withTelegramReplyParameters(
-        turn.chatId, turn.replyToMessageId, turn.target,
-        (replyParameters) => deps.sendMultipart(
-          plan.method,
-          { ...plan.fields, ...(replyParameters ? { reply_parameters: JSON.stringify(replyParameters) } : {}) },
-          plan.fileField,
-          plan.filePath,
-          plan.fileName,
-        ),
+        turn.chatId,
+        turn.replyToMessageId,
+        turn.target,
+        (replyParameters) =>
+          deps.sendMultipart(
+            plan.method,
+            {
+              ...plan.fields,
+              ...(replyParameters
+                ? { reply_parameters: JSON.stringify(replyParameters) }
+                : {}),
+            },
+            plan.fileField,
+            plan.filePath,
+            plan.fileName,
+          ),
       );
       const messageId =
-        result && typeof result === "object" &&
-          Number.isInteger((result as { message_id?: unknown }).message_id)
+        result &&
+        typeof result === "object" &&
+        Number.isInteger((result as { message_id?: unknown }).message_id)
           ? (result as { message_id: number }).message_id
           : undefined;
       if (messageId === undefined) {
@@ -361,8 +379,22 @@ function formatTelegramOutboundAttachmentToolResultText(
   return ["", `${verb} ${count} Telegram attachment(s).`].join("\n");
 }
 
-function formatTelegramOutboundMessageToolResultText(chatId: number | string): string {
-  return ["", `Sent Telegram message to ${chatId}.`].join("\n");
+function buildTelegramOutboundMessageToolResult(
+  chatId: number | string,
+  messageId: number | undefined,
+): {
+  content: Array<{ type: "text"; text: string }>;
+  details: { chatId: number | string; messageId?: number };
+} {
+  return {
+    content: [
+      {
+        type: "text",
+        text: ["", `Sent Telegram message to ${chatId}.`].join("\n"),
+      },
+    ],
+    details: { chatId, messageId },
+  };
 }
 
 function getTelegramMultipartTargetFields(
@@ -450,7 +482,9 @@ async function buildTelegramOutboundAttachmentViews(options: {
 
 function formatTelegramOutboundToolError(error: unknown): Error {
   const message = error instanceof Error ? error.message : String(error);
-  return new Error(`\n${message.replace(/^\n+/u, "") || "Telegram outbound operation failed."}`);
+  return new Error(
+    `\n${message.replace(/^\n+/u, "") || "Telegram outbound operation failed."}`,
+  );
 }
 
 export function registerTelegramOutboundAttachmentTool(
@@ -540,19 +574,25 @@ export function registerTelegramOutboundMessageTool(
         }),
       ),
       chat_id: Type.Optional(
-        Type.Union([
-          Type.Number(),
-          Type.String({ pattern: "^@[A-Za-z0-9_]{5,32}$" }),
-        ], { description: "Optional exact Telegram chat id or public channel @username" }),
+        Type.Union(
+          [Type.Number(), Type.String({ pattern: "^@[A-Za-z0-9_]{5,32}$" })],
+          {
+            description:
+              "Optional exact Telegram chat id or public channel @username",
+          },
+        ),
       ),
       thread_id: Type.Optional(
         Type.Number({
           description: "Optional Telegram topic thread id with chat_id",
         }),
       ),
-      channel: Type.Optional(Type.Boolean({
-        description: "Set true only when a numeric chat_id is explicitly intended as a channel",
-      })),
+      channel: Type.Optional(
+        Type.Boolean({
+          description:
+            "Set true only when a numeric chat_id is explicitly intended as a channel",
+        }),
+      ),
       thread: Type.Optional(
         Type.Union([Type.String(), Type.Number()], {
           description:
@@ -582,12 +622,17 @@ export function registerTelegramOutboundMessageTool(
           sendChannelMediaMessage: deps.sendChannelMediaMessage,
         });
       } catch (error) {
-        const isChannelTarget = typeof params.chat_id === "string" || params.channel === true;
-        const reportableError = isChannelTarget &&
-            !isTelegramChannelPostValidationError(error)
-          ? new Error("Telegram channel publication failed; inspect the retained local record before retrying.")
-          : error;
-        deps.recordRuntimeEvent?.("message", reportableError, { phase: "direct" });
+        const isChannelTarget =
+          typeof params.chat_id === "string" || params.channel === true;
+        const reportableError =
+          isChannelTarget && !isTelegramChannelPostValidationError(error)
+            ? new Error(
+                "Telegram channel publication failed; inspect the retained local record before retrying.",
+              )
+            : error;
+        deps.recordRuntimeEvent?.("message", reportableError, {
+          phase: "direct",
+        });
         throw formatTelegramOutboundToolError(reportableError);
       }
     },
@@ -702,7 +747,9 @@ export async function deliverTelegramGuestCachedAttachment(options: {
   deleteMessage: (chatId: number, messageId: number) => Promise<void>;
   recordRuntimeEvent?: TelegramOutboundAttachmentRuntimeEventRecorderPort["recordRuntimeEvent"];
 }): Promise<void> {
-  const transport = getTelegramGuestAttachmentTransport(options.attachment.path);
+  const transport = getTelegramGuestAttachmentTransport(
+    options.attachment.path,
+  );
   let stagingMessageId: number | undefined;
   let answerAttempted = false;
   try {
@@ -725,7 +772,8 @@ export async function deliverTelegramGuestCachedAttachment(options: {
       const photo = [...(message.photo ?? [])]
         .sort((left, right) => (left.file_size ?? 0) - (right.file_size ?? 0))
         .at(-1);
-      if (!photo?.file_id) throw new Error("Guest staging upload returned no photo file_id");
+      if (!photo?.file_id)
+        throw new Error("Guest staging upload returned no photo file_id");
       result = {
         type: "photo",
         id: "attachment-1",
@@ -765,11 +813,7 @@ export async function deliverTelegramGuestCachedAttachment(options: {
     answerAttempted = true;
     await options.answerGuestQuery(options.guestQueryId, result);
   } catch (error) {
-    if (
-      !answerAttempted &&
-      options.answerGuestText &&
-      options.fallbackText
-    ) {
+    if (!answerAttempted && options.answerGuestText && options.fallbackText) {
       answerAttempted = true;
       await options.answerGuestText(options.guestQueryId, options.fallbackText);
     } else {
@@ -790,54 +834,39 @@ export async function deliverTelegramGuestCachedAttachment(options: {
   }
 }
 
-export async function sendTelegramOutboundMessage(options: {
-  text: string;
-  media?: string;
-  operationId?: string;
-  channel?: boolean;
-  chatId?: number | string;
-  threadId?: number;
-  agentThread?: string | number;
-  target?: TelegramTarget;
-  getDefaultChatId?: () => number | undefined;
-  getDefaultTarget?: () => TelegramTarget | undefined;
-  getActiveTurn?: () =>
-    | { chatId: number; target?: TelegramTarget }
-    | undefined;
-  resolveAgentTarget?: (
-    selector: TelegramBusAgentTargetSelector,
-  ) => Promise<TelegramTarget & { threadId: number }>;
-  routeAgentMessage?: (message: TelegramBusAgentMessage) => Promise<void>;
-  canSendDirect: () => boolean;
-  planMessage: (markdown: string) => TelegramOutboundMessagePlan;
-  sendMarkdownMessage: (
-    chatId: number,
-    markdown: string,
-    options?: { replyMarkup?: unknown; target?: TelegramTarget },
-  ) => Promise<number | undefined>;
-  sendChannelMarkdownMessage?: (
-    channel: number | string,
-    markdown: string,
-    options: { operationId: string; replyMarkup?: unknown },
-  ) => Promise<number | undefined>;
-  sendChannelMediaMessage?: (
-    channel: number | string,
-    mediaPath: string,
-    markdown: string,
-    options: { operationId: string; replyMarkup?: unknown },
-  ) => Promise<number | undefined>;
-}): Promise<{
+export async function sendTelegramOutboundMessage(
+  options: TelegramOutboundMessageDeliveryPorts & {
+    text: string;
+    media?: string;
+    operationId?: string;
+    channel?: boolean;
+    chatId?: number | string;
+    threadId?: number;
+    agentThread?: string | number;
+    target?: TelegramTarget;
+  },
+): Promise<{
   content: Array<{ type: "text"; text: string }>;
   details: { chatId: number | string; messageId?: number };
 }> {
   assertTelegramDirectDeliveryAllowed(options.canSendDirect);
   const activeTurn = options.getActiveTurn?.();
   if (typeof options.chatId === "string" || options.channel === true) {
-    if (!((typeof options.chatId === "string" && /^@[A-Za-z0-9_]{5,32}$/u.test(options.chatId)) ||
-        (typeof options.chatId === "number" && Number.isSafeInteger(options.chatId) && options.chatId < 0)) ||
-        options.threadId !== undefined ||
-        options.target !== undefined || options.agentThread !== undefined) {
-      throw new Error("Telegram channel delivery requires one exact @username or negative numeric channel ID without a thread target.");
+    if (
+      !(
+        (typeof options.chatId === "string" &&
+          /^@[A-Za-z0-9_]{5,32}$/u.test(options.chatId)) ||
+        (typeof options.chatId === "number" &&
+          Number.isSafeInteger(options.chatId) &&
+          options.chatId < 0)
+      ) ||
+      options.threadId !== undefined ||
+      options.target !== undefined ||
+      options.agentThread !== undefined
+    ) {
+      throw new Error(
+        "Telegram channel delivery requires one exact @username or negative numeric channel ID without a thread target.",
+      );
     }
     const plan = options.planMessage(options.text);
     if (options.media !== undefined) {
@@ -847,21 +876,24 @@ export async function sendTelegramOutboundMessage(options: {
         );
       }
       const messageId = await options.sendChannelMediaMessage(
-        options.chatId, options.media, plan.markdown,
-        { operationId: options.operationId, replyMarkup: plan.replyMarkup });
-      return { content: [{ type: "text",
-        text: formatTelegramOutboundMessageToolResultText(options.chatId) }],
-      details: { chatId: options.chatId, messageId } };
+        options.chatId,
+        options.media,
+        plan.markdown,
+        { operationId: options.operationId, replyMarkup: plan.replyMarkup },
+      );
+      return buildTelegramOutboundMessageToolResult(options.chatId, messageId);
     }
     if (!options.sendChannelMarkdownMessage || !options.operationId) {
-      throw new Error("Telegram channel delivery requires direct leader transport ownership and operation identity.");
+      throw new Error(
+        "Telegram channel delivery requires direct leader transport ownership and operation identity.",
+      );
     }
     const messageId = await options.sendChannelMarkdownMessage(
-      options.chatId, plan.markdown, { operationId: options.operationId,
-        replyMarkup: plan.replyMarkup });
-    return { content: [{ type: "text",
-      text: formatTelegramOutboundMessageToolResultText(options.chatId) }],
-    details: { chatId: options.chatId, messageId } };
+      options.chatId,
+      plan.markdown,
+      { operationId: options.operationId, replyMarkup: plan.replyMarkup },
+    );
+    return buildTelegramOutboundMessageToolResult(options.chatId, messageId);
   }
   if (options.media !== undefined) {
     throw new TelegramChannelPostValidationError(
@@ -876,7 +908,7 @@ export async function sendTelegramOutboundMessage(options: {
       : activeTurn &&
           options.resolveAgentTarget &&
           options.routeAgentMessage &&
-          ((options.target?.threadId !== undefined) ||
+          (options.target?.threadId !== undefined ||
             (options.chatId !== undefined && options.threadId !== undefined))
         ? {
             chatId: options.target?.chatId ?? options.chatId,
@@ -930,15 +962,7 @@ export async function sendTelegramOutboundMessage(options: {
       text: options.text,
     });
   }
-  return {
-    content: [
-      {
-        type: "text",
-        text: formatTelegramOutboundMessageToolResultText(chatId),
-      },
-    ],
-    details: { chatId, messageId },
-  };
+  return buildTelegramOutboundMessageToolResult(chatId, messageId);
 }
 
 export async function sendTelegramOutboundFiles(options: {
@@ -1017,7 +1041,9 @@ export function createTelegramQueuedOutboundAttachmentSender(
   ): Promise<void> => {
     await sendQueuedTelegramOutboundAttachments(turn, {
       ...deps,
-      isDeliveryActive: () => deps.isDeliveryActive?.() !== false && options?.isDeliveryActive?.() !== false,
+      isDeliveryActive: () =>
+        deps.isDeliveryActive?.() !== false &&
+        options?.isDeliveryActive?.() !== false,
       maxAttachmentSizeBytes:
         deps.maxAttachmentSizeBytes ?? TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES,
     });
@@ -1047,18 +1073,23 @@ export async function sendQueuedTelegramOutboundAttachments(
       const method = isPhoto ? "sendPhoto" : "sendDocument";
       const fieldName = isPhoto ? "photo" : "document";
       await withTelegramReplyParameters(
-        turn.chatId, turn.replyToMessageId, turn.target,
-        (replyParameters) => deps.sendMultipart(
-          method,
-          {
-            chat_id: String(turn.chatId),
-            ...(replyParameters ? { reply_parameters: JSON.stringify(replyParameters) } : {}),
-            ...getTelegramMultipartTargetFields(turn.target),
-          },
-          fieldName,
-          attachment.path,
-          attachment.fileName,
-        ),
+        turn.chatId,
+        turn.replyToMessageId,
+        turn.target,
+        (replyParameters) =>
+          deps.sendMultipart(
+            method,
+            {
+              chat_id: String(turn.chatId),
+              ...(replyParameters
+                ? { reply_parameters: JSON.stringify(replyParameters) }
+                : {}),
+              ...getTelegramMultipartTargetFields(turn.target),
+            },
+            fieldName,
+            attachment.path,
+            attachment.fileName,
+          ),
       );
     } catch (error) {
       if (deps.isDeliveryActive?.() === false) return;

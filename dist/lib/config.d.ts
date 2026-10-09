@@ -3,9 +3,9 @@
  * Zones: telegram config, pairing, filesystem
  * Owns persisted bot/session pairing state, local config storage, live config controls, authorization policy, and first-user pairing side effects
  */
-export { TELEGRAM_DEFAULT_PROFILE_NAME } from "./paths.ts";
 import type { CommandTemplateObjectConfig } from "./command-templates.ts";
 import type { TelegramInboundHandlerConfig } from "./inbound.ts";
+export { TELEGRAM_DEFAULT_PROFILE_NAME } from "./paths.ts";
 /** Parsed stored bot-token form: a literal secret or one environment-variable reference. */
 export type TelegramBotTokenReference = {
     kind: "literal";
@@ -152,20 +152,13 @@ export interface TelegramInvalidConfigRecovery {
     recoveryPath: string;
     error: unknown;
 }
-export interface TelegramConfigRuntime {
-    updateVoiceConfig: (voice: NonNullable<TelegramConfig["voice"]>) => void;
-}
-export declare function setGlobalTelegramConfigRuntime(runtime: TelegramConfigRuntime | undefined): void;
-export declare function updateTelegramVoiceConfig(voice: NonNullable<TelegramConfig["voice"]>): boolean;
 type TelegramMutableConfigStore = Pick<TelegramConfigStore, "get" | "set" | "persist"> & {
     load?: () => Promise<void>;
     didLastLoadRecoverInvalidConfig?: () => boolean;
 };
-export declare function bindGlobalTelegramConfigRuntime(configStore: TelegramMutableConfigStore): void;
 export declare function readTelegramConfig(configPath: string, options?: {
     onInvalidConfig?: (recovery: TelegramInvalidConfigRecovery) => void;
 }): Promise<TelegramConfig>;
-export declare function writeTelegramConfig(agentDir: string, configPath: string, config: TelegramConfig): Promise<void>;
 export declare function getTelegramProfileFields(config: TelegramConfig): TelegramBotProfile | undefined;
 export declare function normalizeTelegramDefaultProfileConfig(config: TelegramConfig): {
     config: TelegramConfig;

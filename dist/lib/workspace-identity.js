@@ -12,8 +12,8 @@ export function normalizeTelegramSessionId(sessionId) {
     if (typeof sessionId !== "string")
         return undefined;
     const normalized = sessionId.trim();
-    return normalized && Buffer.byteLength(normalized, "utf8") <=
-        TELEGRAM_SESSION_ID_MAX_LENGTH
+    return normalized &&
+        Buffer.byteLength(normalized, "utf8") <= TELEGRAM_SESSION_ID_MAX_LENGTH
         ? normalized
         : undefined;
 }
@@ -27,9 +27,9 @@ export function normalizeTelegramWorkspacePath(cwd) {
     const trimmed = cwd.trim();
     if (!trimmed)
         return undefined;
-    const normalized = (trimmed.startsWith("/")
+    const normalized = trimmed.startsWith("/")
         ? posix.normalize(trimmed)
-        : resolve(trimmed).replaceAll("\\", "/"));
+        : resolve(trimmed).replaceAll("\\", "/");
     const withoutTrailingSeparators = normalized.length > 1 ? normalized.replace(/\/+$/u, "") : normalized;
     return process.platform === "win32"
         ? withoutTrailingSeparators.replace(/^([A-Z]):/u, (_, drive) => `${drive.toLowerCase()}:`)
@@ -39,9 +39,8 @@ export function createTelegramWorkspaceDirectoryKey(cwd) {
     const normalized = normalizeTelegramWorkspacePath(cwd);
     if (!normalized)
         return undefined;
-    const readable = normalized
-        .replace(/[^\p{L}\p{N}._-]+/gu, "-")
-        .replace(/^-+|-+$/gu, "") || "root";
+    const readable = normalized.replace(/[^\p{L}\p{N}._-]+/gu, "-").replace(/^-+|-+$/gu, "") ||
+        "root";
     const candidate = `--${readable}--`;
     if (candidate.length <= TELEGRAM_WORKSPACE_KEY_MAX_LENGTH)
         return candidate;
@@ -68,18 +67,14 @@ export function createTelegramWorkspaceBindingIdentityWithKey(cwd, workspaceKey,
     const instanceSlot = createTelegramWorkspaceInstanceSlot(ordinal);
     if (!instanceSlot)
         return undefined;
-    const normalizedSessionId = sessionId === undefined
-        ? undefined
-        : normalizeTelegramSessionId(sessionId);
+    const normalizedSessionId = sessionId === undefined ? undefined : normalizeTelegramSessionId(sessionId);
     const sessionKey = normalizedSessionId
         ? createTelegramSessionKey(normalizedSessionId)
         : undefined;
     if (sessionId !== undefined && (!normalizedSessionId || !sessionKey)) {
         return undefined;
     }
-    const legacyBindingKey = instanceSlot === "a"
-        ? workspaceKey
-        : `${workspaceKey}${instanceSlot}`;
+    const legacyBindingKey = instanceSlot === "a" ? workspaceKey : `${workspaceKey}${instanceSlot}`;
     return {
         cwd,
         workspaceKey,

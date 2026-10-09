@@ -23,7 +23,6 @@ import {
   formatGenerativeAppToolOutput,
   installGenerativeApp,
   invokeGenerativeApp,
-  invokeGenerativeAppBoundAction,
   parseGenerativeAppBoundAction,
   registerTelegramBindTool,
   resolveGenerativeAppDir,
@@ -131,9 +130,9 @@ test("Generative App install initializes state and later methods commit or remai
       JSON.parse(await readFile(join(agentDir, "genapps", "counter", "state.json"), "utf8")),
       { count: 2 },
     );
-    const incremented = await invokeGenerativeAppBoundAction({
+    const incremented = await invokeGenerativeApp({
       agentDir,
-      prompt: "counter::increment(3)",
+      ...parseGenerativeAppBoundAction("counter::increment(3)")!,
     });
     assert.ok(incremented);
     assert.equal(incremented.output, "5");
@@ -367,10 +366,10 @@ export function echo({ argument }) { return { output: JSON.stringify(argument ??
       '{"a":[1,2],"b":"x"}',
     );
     assert.equal(
-      (await invokeGenerativeAppBoundAction({
+      (await invokeGenerativeApp({
         agentDir,
-        prompt: 'echo::echo({"nested":{"n":true}})',
-      }))?.output,
+        ...parseGenerativeAppBoundAction('echo::echo({"nested":{"n":true}})')!,
+      })).output,
       '{"nested":{"n":true}}',
     );
   } finally {

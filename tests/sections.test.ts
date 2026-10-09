@@ -13,7 +13,7 @@ import {
   handleTelegramSectionOpen,
   handleTelegramSectionSettingsOpen,
   parseTelegramSectionCallback,
-  type TelegramSectionCallbackHandlerDeps,
+  type TelegramSectionRuntimeDeps,
   type TelegramSectionRegistration,
 } from "../lib/sections.ts";
 
@@ -31,8 +31,8 @@ function stubSection(
 }
 
 function stubDeps(
-  overrides: Partial<TelegramSectionCallbackHandlerDeps> = {},
-): TelegramSectionCallbackHandlerDeps {
+  overrides: Partial<TelegramSectionRuntimeDeps> = {},
+): TelegramSectionRuntimeDeps {
   return {
     answerCallbackQuery: async () => {},
     editInteractiveMessage: async () => {},

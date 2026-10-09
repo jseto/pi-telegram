@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { existsSync, constants } from "node:fs";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -35,13 +35,11 @@ import {
   createTelegramUpdateAdmissionRuntimeAssembly,
   createTelegramUpdateAdmissionRuntimeBinding,
   createTelegramUpdateAdmissionWorkerRuntime,
-  createTelegramUpdateHandle,
   createTelegramUpdateRuntime,
   createTelegramUpdateWorkerOwnerRuntime,
   createTelegramUpdateWorkerRuntime,
   executeTelegramUpdate,
   executeTelegramUpdatePlan,
-  extractDeletedTelegramMessageIds,
   getAuthorizedTelegramCallbackQuery,
   getAuthorizedTelegramEditedMessage,
   getAuthorizedTelegramGuestMessage,
@@ -53,9 +51,14 @@ import {
   handleAuthorizedTelegramReactionUpdate,
   inspectTelegramAbandoningUpdates,
   inspectTelegramDeferredSource,
+  inspectTelegramDeferredSourceSnapshot,
+  inspectTelegramDeferredSourceCompletion,
+  prepareTelegramDeferredSourceCompletion,
+  type TelegramDeferredSourceCompletionPreparation,
   inspectTelegramHistoricalInputs,
   isTelegramHistoricalInput,
   normalizeTelegramReactionEmoji,
+  prepareTelegramLiveDeferredInput,
   registerTelegramUpdateHandler,
   reportTelegramQueueAdmission,
   reportTelegramUpdateCompleted,
@@ -79,6 +82,7 @@ import {
   type TelegramUpdateWorkerJournalSnapshot,
 } from "../lib/updates.ts";
 import * as Locks from "../lib/locks.ts";
+import * as Updates from "../lib/updates.ts";
 import * as Polling from "../lib/polling.ts";
 import {
   createTelegramQueueHandoffStagingRuntime,
@@ -94,6 +98,77 @@ import {
   type TelegramUpdateJournalQueueOwner,
   type TelegramUpdateJournalStore,
 } from "../lib/journal.ts";
+
+for (const fault of ["normal", "refused", "authority", "context", "binding", "owner", "changed", "missing", "reported",
+  "cold", "stop", "before-publication", "after-publication", "lost-before", "lost-after", "bad-ack", "no-exact", "observer-replaced"] as const) {
+  test(`Live donor group settlement requires current originals and one exact ACK (${fault})`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "telegram-live-donor-"));
+    let authority = true, context = true, generation = 1, activeFault = false, removed = 0;
+    const completed: number[] = [], executed: number[] = [], originals = new Map<number, unknown>();
+    const journal = createTelegramUpdateJournalStore({ path: join(dir, "journal.json"), profileName: "default",
+      botIdentity: createTelegramUpdateJournalBotIdentity({ botToken: "live-donor" }),
+      onPublicationBoundary(boundary) {
+        if (activeFault && fault === "before-publication" && boundary === "after-write-before-rename") authority = false;
+      } });
+    let binding = "source";
+    const worker = createTelegramUpdateAdmissionWorkerRuntime<TelegramJournaledUpdate & TelegramUpdateFlow, string>({
+      journal: { ...journal, removeCompletedExact: fault === "no-exact" ? undefined : (...args) => {
+        removed++;
+        if (fault === "lost-before") throw new Error("Removal not confirmed before effect");
+        const result = journal.removeCompletedExact(...args);
+        if (fault === "after-publication") authority = false;
+        if (fault === "lost-after") throw new Error("Removal ACK lost after effect");
+        return fault === "bad-ack" ? { ...result, removedUpdateIds: [10] } : result;
+      } }, getJournalBindingKey: () => binding, hasAuthority: () => authority, isContextCurrent: () => context,
+      getQueueOwnerIdentity: () => ({ instanceId: "leader", processId: process.pid, processBirthId: `${process.pid}:donor`, sessionGeneration: generation }),
+      async defaultHandle(update) {
+        executed.push(update.update_id);
+        if (update.update_id === 10 || update.update_id === 11) {
+          originals.set(update.update_id, update.message); reportTelegramUpdateDeferred(update.message);
+        }
+      }, onUpdateCompleted(id) { completed.push(id); if (fault === "observer-replaced") context = false; },
+    });
+    const updates = [10, 11].map(update_id => ({ update_id, message: { message_id: update_id, chat: { id: 7 }, text: "original" } }));
+    try {
+      if (fault === "cold") journal.appendBatch(updates);
+      worker.start("ctx"); await worker.waitForDrain();
+      if (fault !== "cold") { journal.appendBatch(updates); worker.signal(); await worker.waitForDrain(); }
+      const messages = [10, 11].map(id => originals.get(id));
+      const preparation = prepareTelegramLiveDeferredInput(messages, () => authority);
+      if (fault === "cold") { assert.equal(preparation, undefined); return; }
+      assert.ok(preparation); assert.equal(preparation.confirmSaved(), true);
+      if (fault === "authority") authority = false;
+      if (fault === "context") context = false;
+      if (fault === "binding") binding = "replaced";
+      if (fault === "owner") generation++;
+      if (fault === "stop") await worker.stop();
+      if (fault === "changed") { journal.routingInputs!.arm({ entries: journal.read().entries.slice(1), journalBindingKey: createTelegramUpdateJournalBindingKey({
+        path: join(dir, "journal.json"), profileName: "default", botIdentity: createTelegramUpdateJournalBotIdentity({ botToken: "live-donor" }) }),
+        operatorUserId: 7, publishedAtMs: Date.now(), isCurrent: () => true }); }
+      if (fault === "missing") journal.removeCompleted([11]);
+      if (fault === "reported") reportTelegramQueueAdmission(messages, [{ receiptId: "independent", queueKind: "prompt", sourceUpdateIds: [10, 11], journalBindingKey: binding }]);
+      const before = journal.read(); activeFault = true;
+      const result = preparation.settleTransferred(() => fault !== "refused");
+      const issued = ["normal", "before-publication", "after-publication", "lost-before", "lost-after", "bad-ack", "observer-replaced"].includes(fault);
+      assert.equal(result, fault === "normal" ? "settled" : issued ? "unknown" : "protected");
+      assert.equal(removed, issued ? 1 : 0);
+      assert.notEqual(preparation.settleTransferred(() => fault !== "refused"), "settled", "A warm retry cannot mint or replay removal authority");
+      assert.equal(removed, issued ? 1 : 0);
+      if (issued) {
+        assert.equal(preparation.beginRelease(() => true), false); assert.equal(preparation.cancel(), false);
+      }
+      if (["normal", "lost-after", "bad-ack", "after-publication", "observer-replaced"].includes(fault)) assert.deepEqual(journal.read().entries, []);
+      else assert.deepEqual(journal.read(), before, "Failed eligibility and pre-publication loss retain the exact group");
+      assert.equal(journal.read().sourceCompletions, undefined, "Donor disposition does not mint legacy Restore ACKs");
+      assert.deepEqual(completed, fault === "normal" ? [10, 11] : fault === "observer-replaced" ? [10] : [], "Only exact current removal ACKs publish ordinary completion hints");
+      assert.deepEqual(executed, [10, 11], "Settlement never replays original handlers");
+      if (["normal", "lost-before", "lost-after", "bad-ack"].includes(fault)) {
+        journal.appendBatch([{ update_id: 12 }]); worker.signal(); await worker.waitForDrain();
+        assert.deepEqual(executed, [10, 11, 12], "Unrelated ordinary execution remains runnable");
+      }
+    } finally { await worker.stop(); await rm(dir, { recursive: true, force: true }); }
+  });
+}
 
 const TEST_CONTEXT = "ctx";
 const REGISTRY_KEY = "__piTelegramUpdateHandlerRegistry__";
@@ -368,22 +443,6 @@ test("Update helpers extract private and thread targets from messages", () => {
     getTelegramMessageTarget({ chat: { type: "private" }, message_id: 1 }),
     undefined,
   );
-});
-
-test("Update helpers extract deleted business-message ids only from Bot API shapes", () => {
-  assert.deepEqual(
-    extractDeletedTelegramMessageIds({
-      deleted_business_messages: { message_ids: [1, 2] },
-    }),
-    [1, 2],
-  );
-  assert.deepEqual(
-    extractDeletedTelegramMessageIds({
-      deleted_business_messages: { message_ids: [3, "bad"] },
-    }),
-    [],
-  );
-  assert.deepEqual(extractDeletedTelegramMessageIds({}), []);
 });
 
 test("Paired update runtime binds pairing ports into update routing", async () => {
@@ -1865,7 +1924,7 @@ test("Update runtime keeps callback authority after its error answer", async () 
     /forwarder-unavailable/u,
   );
   assert.deepEqual(events, [
-    "answer:cb-foreign:This Telegram message belongs to another Pi instance.",
+    "answer:cb-foreign:This Telegram message belongs to another Pi instance",
   ]);
 });
 
@@ -2267,7 +2326,7 @@ test("Update runtime handles callback deny and message pair flows", async () => 
   );
   assert.deepEqual(events, [
     "pair:1",
-    "answer:cb:🚫 Access denied.",
+    "answer:cb:Access denied",
     "reply:7:9:Telegram bridge paired with this account.:7:44",
     "message",
   ]);
@@ -4224,37 +4283,6 @@ test("Void/undefined return values are treated as 'pass'", async () => {
   clearGlobalRegistry();
 });
 
-test("createTelegramUpdateHandle skips defaultHandle on consume", async () => {
-  clearGlobalRegistry();
-  const defaultCalls: number[] = [];
-  const defaultHandle = async (update: { update_id: number }) => {
-    defaultCalls.push(update.update_id);
-  };
-  const off = registerTelegramUpdateHandler((update) => {
-    const id = (update as { update_id?: number }).update_id;
-    return id === 99 ? "consume" : "pass";
-  });
-  const handler = createTelegramUpdateHandle({ defaultHandle });
-  await handler({ update_id: 1 }, undefined);
-  await handler({ update_id: 99 }, undefined);
-  await handler({ update_id: 2 }, undefined);
-  assert.deepEqual(defaultCalls, [1, 2]);
-  off();
-  clearGlobalRegistry();
-});
-
-test("createTelegramUpdateHandle calls defaultHandle when no handlers registered", async () => {
-  clearGlobalRegistry();
-  const defaultCalls: unknown[] = [];
-  const defaultHandle = async (update: { update_id: number }, ctx: string) => {
-    defaultCalls.push({ update, ctx });
-  };
-  const handler = createTelegramUpdateHandle({ defaultHandle });
-  await handler({ update_id: 7 }, "ctx");
-  assert.deepEqual(defaultCalls, [{ update: { update_id: 7 }, ctx: "ctx" }]);
-  clearGlobalRegistry();
-});
-
 test("Pre-existing docs-style registry missing 'dispatch' is replaced with a valid one", async () => {
   clearGlobalRegistry();
   const docsHandlers = new Set<TelegramUpdateHandler>();
@@ -4350,31 +4378,6 @@ test("Pre-existing non-object value at registry key is replaced", () => {
   const registry = getTelegramUpdateHandlerRegistry();
   assert.equal(registry.version, 1);
   assert.equal(typeof registry.dispatch, "function");
-  clearGlobalRegistry();
-});
-
-test("createTelegramUpdateHandle accepts an explicit registry override", async () => {
-  clearGlobalRegistry();
-  const seen: unknown[] = [];
-  const customRegistry: TelegramUpdateHandlerRegistry = {
-    version: 1,
-    add: () => () => {},
-    async dispatch(update) {
-      seen.push(update);
-      return "consume";
-    },
-  };
-  const defaultCalls: unknown[] = [];
-  const handler = createTelegramUpdateHandle({
-    defaultHandle: async (update) => {
-      defaultCalls.push(update);
-    },
-    registry: customRegistry,
-  });
-  await handler({ update_id: 1 }, undefined);
-  assert.deepEqual(seen, [{ update_id: 1 }]);
-  assert.deepEqual(defaultCalls, []);
-  assert.equal(getGlobalRegistry(), undefined);
   clearGlobalRegistry();
 });
 
@@ -4637,6 +4640,309 @@ test("Admission worker selects optional custody and bypasses legacy settlement",
     assert.deepEqual(storage.getUpdateIds(), []);
     assert.deepEqual(storage.getRemovals(), [[1]]);
   } finally { await worker.stop(); }
+});
+
+type LiveInputWorkerFixture = {
+  journal: ReturnType<typeof createTelegramUpdateJournalStore>;
+  worker: ReturnType<typeof createTelegramUpdateWorkerRuntime<string>>;
+  scope: { authority: boolean; context: boolean; binding: string; generation: number; badRead: boolean; changed: boolean; version?: 2 | 3 };
+  executed: number[];
+  setHandler(handler: Parameters<typeof createTelegramUpdateWorkerRuntime<string>>[0]["executeUpdate"]): void;
+  setPublicationHook(hook: NonNullable<Parameters<typeof createTelegramUpdateJournalStore>[0]["onPublicationBoundary"]>): void;
+  setBeforeRemove(hook: () => void): void;
+  setAfterRemove(hook: () => void): void;
+  getRemovalCount(): number;
+};
+async function withLiveInputWorker(version: 1, run: (f: LiveInputWorkerFixture) => Promise<void>) {
+  const dir = await mkdtemp(join(tmpdir(), "telegram-live-input-"));
+  let publicationHook: Parameters<LiveInputWorkerFixture["setPublicationHook"]>[0] | undefined;
+  let beforeRemove: (() => void) | undefined, afterRemove: (() => void) | undefined, removalCount = 0;
+  const journal = createTelegramUpdateJournalStore({ path: join(dir, "journal.json"), profileName: "default",
+    botIdentity: createTelegramUpdateJournalBotIdentity({ botToken: `live-input-fixture-v${version}` }),
+    onPublicationBoundary: (boundary, path) => publicationHook?.(boundary, path) });
+  const scope: LiveInputWorkerFixture["scope"] = { authority: true, context: true, binding: "recipient-journal", generation: 1, badRead: false, changed: false };
+  const executed: number[] = [];
+  let handle: Parameters<typeof createTelegramUpdateWorkerRuntime<string>>[0]["executeUpdate"] = () => ({ kind: "complete" });
+  const worker = createTelegramUpdateWorkerRuntime<string>({ journal: { ...journal,
+    removeCompletedExact(...args) { removalCount++; beforeRemove?.(); const result = journal.removeCompletedExact(...args); afterRemove?.(); return result; }, read() {
+    if (scope.badRead) throw new Error("Recipient journal unreadable");
+    const value = journal.read();
+    if (scope.changed) for (const entry of value.entries) entry.update.changed = true;
+    return { ...value, ...(scope.version ? { version: scope.version } : {}) };
+  } }, getJournalBindingKey: () => scope.binding, hasAuthority: () => scope.authority, isContextCurrent: () => scope.context,
+    getQueueOwnerIdentity: () => ({ instanceId: "recipient", processId: process.pid, processBirthId: `${process.pid}:live-input`, sessionGeneration: scope.generation }),
+    spendHistoricalInput: true, shouldReviewHistoricalInput: () => "retain",
+    executeUpdate(update, ctx, signal) { executed.push(update.update_id); return handle(update, ctx, signal); } });
+  worker.start(TEST_CONTEXT); await worker.waitForDrain();
+  try { await run({ journal, worker, scope, executed, setHandler(handler) { handle = handler; },
+    setPublicationHook(hook) { publicationHook = hook; }, setBeforeRemove(hook) { beforeRemove = hook; },
+    setAfterRemove(hook) { afterRemove = hook; }, getRemovalCount: () => removalCount }); }
+  finally { await worker.stop(); await rm(dir, { recursive: true, force: true }); }
+}
+
+for (const version of [1] as const) {
+  for (const ids of [[2], [2, 3]]) {
+    test(`Live input preparation holds fresh IDs before append and releases only saved/current input (v${version}, ${ids.length})`, async () => {
+      await withLiveInputWorker(version, async f => {
+        const requested = [...ids];
+        const held = f.worker.prepareLiveInput!(TEST_CONTEXT, requested)!;
+        assert.ok(held); requested.push(900);
+        assert.deepEqual(held.sourceUpdateIds, ids);
+        assert.equal(f.worker.getState().preparedInputCount, ids.length);
+        assert.equal(held.confirmSaved(), false);
+        assert.equal(held.release(() => true), false);
+        f.journal.appendBatch([...ids.map(update_id => ({ update_id })), { update_id: 99 }]);
+        f.worker.signal(); await f.worker.waitForDrain();
+        assert.deepEqual(f.executed, [99], "A wake never spends the prepared inputs");
+        assert.deepEqual(f.journal.read().entries.map(entry => entry.updateId), ids);
+        assert.equal(held.cancelEmpty(), false, "Saved input is not a failed empty append");
+        assert.equal(held.confirmSaved(), true);
+        assert.equal(held.release(() => false), false, "Binding/local apply must be confirmed by the caller");
+        assert.equal(held.release(() => true), true);
+        await f.worker.waitForDrain();
+        assert.deepEqual(f.executed, [99, ...ids]);
+        assert.deepEqual(f.journal.read().entries, []);
+        assert.equal(f.worker.getState().preparedInputCount, undefined);
+        assert.equal(held.release(() => true), false, "A consumed capability cannot replay input");
+      });
+    });
+  }
+  test(`Live input preparation protects arrivals while a worker is already executing (v${version})`, async () => {
+    await withLiveInputWorker(version, async f => {
+      const entered = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>();
+      f.setHandler(async update => { if (update.update_id === 1) { entered.resolve(); await finish.promise; } return { kind: "complete" }; });
+      f.journal.appendBatch([{ update_id: 1 }]); f.worker.signal(); await entered.promise;
+      const held = f.worker.prepareLiveInput!(TEST_CONTEXT, [2, 3])!;
+      assert.ok(held);
+      assert.equal(f.worker.prepareLiveInput!(TEST_CONTEXT, [1]), undefined, "Executing work cannot be captured");
+      f.journal.appendBatch([{ update_id: 2 }, { update_id: 3 }, { update_id: 4 }]);
+      assert.equal(held.confirmSaved(), true);
+      f.worker.signal(); finish.resolve(); await f.worker.waitForDrain();
+      assert.deepEqual(f.executed, [1, 4]);
+      assert.equal(held.release(() => true), true); await f.worker.waitForDrain();
+      assert.deepEqual(f.executed, [1, 4, 2, 3]);
+    });
+  });
+}
+
+for (const loss of ["authority", "context", "binding", "generation", "stop", "restart", "release-check"] as const) {
+  test(`Live input preparation refuses stale release without replay (${loss})`, async () => {
+    await withLiveInputWorker(1, async f => {
+      const held = f.worker.prepareLiveInput!(TEST_CONTEXT, [2])!;
+      f.journal.appendBatch([{ update_id: 2 }]); assert.equal(held.confirmSaved(), true);
+      if (loss === "authority") f.scope.authority = false;
+      if (loss === "context") f.scope.context = false;
+      if (loss === "binding") f.scope.binding = "other-journal";
+      if (loss === "generation") f.scope.generation++;
+      if (loss === "stop" || loss === "restart") await f.worker.stop();
+      if (loss === "restart") { f.worker.start(TEST_CONTEXT); await f.worker.waitForDrain(); }
+      let calls = 0;
+      assert.equal(held.release(() => loss !== "release-check" || ++calls === 1), false);
+      assert.deepEqual(f.executed, []);
+      assert.deepEqual(f.journal.read().entries.map(entry => entry.updateId), [2]);
+      assert.equal(held.cancelEmpty(), false);
+    });
+  });
+}
+
+test("Live input preparation enters ordinary receipt readiness only after release", async () => {
+  await withLiveInputWorker(1, async f => {
+    const receipt = { queueKind: "prompt" as const, receiptId: "prepared-prompt", sourceUpdateIds: [2, 3], journalBindingKey: f.scope.binding };
+    f.setHandler(update => update.update_id === 2 ? { kind: "deferred" } : { kind: "queued", ...receipt });
+    const held = f.worker.prepareLiveInput!(TEST_CONTEXT, [2, 3])!;
+    f.journal.appendBatch([{ update_id: 2 }, { update_id: 3 }]);
+    assert.equal(held.confirmSaved(), true);
+    f.worker.signal(); await f.worker.waitForDrain();
+    assert.equal(f.worker.isQueueReceiptCommitted!(receipt), false);
+    assert.equal(held.release(() => true), true); await f.worker.waitForDrain();
+    assert.deepEqual(f.executed, [2, 3]);
+    assert.equal(f.worker.isQueueReceiptCommitted!(receipt), true);
+    assert.equal(f.worker.getState().queuedClaimCount, 2);
+    assert.deepEqual(f.journal.read().entries.map(entry => entry.state), ["queued", "queued"]);
+  });
+});
+
+test("Live input preparation refuses changed queued authority without publishing readiness or pausing unrelated input", async () => {
+  await withLiveInputWorker(1, async f => {
+    const receipt = { queueKind: "prompt" as const, receiptId: "changed-prompt", sourceUpdateIds: [2], journalBindingKey: f.scope.binding };
+    const held = f.worker.prepareLiveInput!(TEST_CONTEXT, [2])!;
+    f.journal.appendBatch([{ update_id: 2 }, { update_id: 4 }]);
+    assert.equal(held.confirmSaved(), true);
+    f.journal.markQueued({ ...receipt, owner: { instanceId: "recipient", processId: process.pid,
+      processBirthId: `${process.pid}:live-input`, sessionGeneration: 1 } });
+    f.worker.signal(); await f.worker.waitForDrain();
+    assert.deepEqual(f.executed, [4]);
+    assert.equal(f.worker.isQueueReceiptCommitted!(receipt), false);
+    assert.equal(held.release(() => true), false);
+    assert.equal(held.cancelEmpty(), false);
+    assert.deepEqual(f.journal.read().entries.map(entry => entry.state), ["queued"]);
+  });
+});
+
+test("Live input preparation cancels a failed empty append without changing the journal", async () => {
+  await withLiveInputWorker(1, async f => {
+    const held = f.worker.prepareLiveInput!(TEST_CONTEXT, [2])!;
+    assert.equal(held.confirmSaved(), false);
+    assert.equal(held.cancelEmpty(), true); await f.worker.waitForDrain();
+    assert.equal(f.worker.getState().preparedInputCount, undefined);
+    assert.equal(held.confirmSaved(), false);
+    assert.ok(f.worker.prepareLiveInput!(TEST_CONTEXT, [3]));
+    assert.deepEqual(f.journal.read().entries, []);
+  });
+});
+
+test("Live input preparation retains partial/unreadable/changed save while unrelated input progresses", async () => {
+  await withLiveInputWorker(1, async f => {
+    const held = f.worker.prepareLiveInput!(TEST_CONTEXT, [2, 3])!;
+    f.journal.appendBatch([{ update_id: 2 }, { update_id: 4 }]);
+    assert.equal(held.confirmSaved(), false);
+    assert.equal(held.cancelEmpty(), false);
+    f.worker.signal(); await f.worker.waitForDrain();
+    assert.deepEqual(f.executed, [4]);
+    f.journal.appendBatch([{ update_id: 3 }]);
+    f.scope.badRead = true;
+    assert.equal(held.confirmSaved(), false); assert.equal(held.release(() => true), false);
+    f.scope.badRead = false; assert.equal(held.confirmSaved(), true);
+    f.scope.changed = true;
+    assert.equal(held.confirmSaved(), false); assert.equal(held.release(() => true), false);
+    f.scope.changed = false;
+    assert.equal(held.release(() => true), true); await f.worker.waitForDrain();
+    assert.deepEqual(f.executed, [4, 2, 3]);
+  });
+});
+
+test("Live input preparation rejects invalid, already admitted and unsupported custody sources", async () => {
+  await withLiveInputWorker(1, async f => {
+    for (const ids of [[], [1, 1], [-1], [1.5], [Number.MAX_SAFE_INTEGER + 1]]) assert.equal(f.worker.prepareLiveInput!(TEST_CONTEXT, ids), undefined);
+    for (const version of [2, 3] as const) {
+      f.scope.version = version;
+      assert.equal(f.worker.prepareLiveInput!(TEST_CONTEXT, [2]), undefined);
+    }
+    delete f.scope.version;
+    f.journal.appendBatch([{ update_id: 2 }]);
+    assert.equal(f.worker.prepareLiveInput!(TEST_CONTEXT, [2]), undefined, "Existing work must not be adopted as a fresh preparation");
+    assert.equal(f.worker.prepareLiveInput!("other-context", [3]), undefined);
+    assert.equal(f.worker.getState().preparedInputCount, undefined);
+  });
+});
+
+for (const savedIds of [[2], [2, 3]]) {
+  test(`Live input discard removes only its never-dispatched saved copy (${savedIds.length})`, async () => {
+    await withLiveInputWorker(1, async f => {
+      const held = f.worker.prepareLiveInput!(TEST_CONTEXT, [2, 3])!;
+      f.journal.appendBatch([...savedIds.map(update_id => ({ update_id })), { update_id: 4 }]);
+      assert.equal(held.confirmSaved(), savedIds.length === 2);
+      assert.equal(held.discardSaved(() => false), "protected");
+      assert.equal(f.getRemovalCount(), 0);
+      assert.equal(held.discardSaved(() => true), "discarded");
+      assert.equal(f.getRemovalCount(), 1);
+      assert.equal(held.release(() => true), false);
+      assert.equal(held.discardSaved(() => true), "protected");
+      await f.worker.waitForDrain();
+      assert.deepEqual(f.executed, [4]);
+      assert.deepEqual(f.journal.read().entries, []);
+      assert.equal(f.journal.read().sourceCompletions, undefined, "Discard is not execution or a Restore ACK");
+      assert.ok(f.worker.prepareLiveInput!(TEST_CONTEXT, [5]), "Confirmed disposal permits the next attempt");
+    });
+  });
+}
+
+for (const loss of ["authority", "context", "binding", "generation", "unreadable", "changed", "queued"] as const) {
+  test(`Live input discard protects stale or changed saved work (${loss})`, async () => {
+    await withLiveInputWorker(1, async f => {
+      const held = f.worker.prepareLiveInput!(TEST_CONTEXT, [2])!;
+      f.journal.appendBatch([{ update_id: 2 }]); assert.equal(held.confirmSaved(), true);
+      if (loss === "authority") f.scope.authority = false;
+      if (loss === "context") f.scope.context = false;
+      if (loss === "binding") f.scope.binding = "foreign";
+      if (loss === "generation") f.scope.generation++;
+      if (loss === "unreadable") f.scope.badRead = true;
+      if (loss === "changed") f.scope.changed = true;
+      if (loss === "queued") f.journal.markQueued({ queueKind: "prompt", receiptId: "protected-work", sourceUpdateIds: [2],
+        owner: { instanceId: "foreign", processId: process.pid, processBirthId: `${process.pid}:foreign`, sessionGeneration: 1 } });
+      assert.equal(held.discardSaved(() => true), "protected");
+      assert.equal(f.getRemovalCount(), 0);
+      assert.deepEqual(f.journal.read().entries.map(entry => entry.updateId), [2]);
+      assert.deepEqual(f.executed, []);
+    });
+  });
+}
+
+for (const boundary of ["before-write", "after-write-before-rename", "after-publication"] as const) {
+  for (const fault of ["lost-reply", "revoked"] as const) {
+    test(`Live input discard fences publication and never retries unknown issuance (${boundary}, ${fault})`, async () => {
+      await withLiveInputWorker(1, async f => {
+        const held = f.worker.prepareLiveInput!(TEST_CONTEXT, [2])!;
+        f.journal.appendBatch([{ update_id: 2 }]); assert.equal(held.confirmSaved(), true);
+        let tripped = false;
+        const trip = () => {
+          tripped = true;
+          if (fault === "revoked") f.scope.generation++;
+          else throw new Error("Discard publication reply lost");
+        };
+        if (boundary === "after-publication") f.setAfterRemove(trip);
+        else f.setPublicationHook(stage => { if (stage === boundary) trip(); });
+        assert.equal(held.discardSaved(() => true), "unknown");
+        assert.equal(tripped, true);
+        assert.equal(f.getRemovalCount(), 1);
+        assert.equal(held.release(() => true), false);
+        assert.equal(held.cancelEmpty(), false);
+        assert.equal(held.confirmSaved(), false);
+        held.discardSaved(() => true);
+        assert.equal(f.getRemovalCount(), 1, "Issued/unknown removal must never be reissued");
+        assert.deepEqual(f.journal.read().entries.map(entry => entry.updateId), boundary === "after-publication" ? [] : [2]);
+        assert.deepEqual(f.executed, []);
+      });
+    });
+  }
+}
+
+test("Live input discard treats missing confirmed input as conflict, not disposition ACK", async () => {
+  await withLiveInputWorker(1, async f => {
+    const held = f.worker.prepareLiveInput!(TEST_CONTEXT, [2, 3])!;
+    f.journal.appendBatch([{ update_id: 2 }, { update_id: 3 }]); assert.equal(held.confirmSaved(), true);
+    f.journal.removeCompletedExact([2], [createTelegramUpdateJournalEntryDigest(f.journal.read().entries[0]!)]);
+    assert.equal(held.discardSaved(() => true), "protected");
+    assert.equal(f.getRemovalCount(), 0);
+    assert.deepEqual(f.journal.read().entries.map(entry => entry.updateId), [3]);
+  });
+});
+
+test("Live input preparation refuses a journal lacking exact fenced removal", async () => {
+  const storage = createTestUpdateWorkerJournal([]);
+  const worker = createTelegramUpdateWorkerRuntime({ journal: storage.journal, getJournalBindingKey: () => "legacy-port",
+    hasAuthority: () => true, executeUpdate: () => ({ kind: "complete" }) });
+  worker.start(TEST_CONTEXT); await worker.waitForDrain();
+  try { assert.equal(worker.prepareLiveInput!(TEST_CONTEXT, [2]), undefined); }
+  finally { await worker.stop(); }
+});
+
+test("Live input discard rechecks generation inside the exact writer", async () => {
+  await withLiveInputWorker(1, async f => {
+    const held = f.worker.prepareLiveInput!(TEST_CONTEXT, [2])!;
+    f.journal.appendBatch([{ update_id: 2 }]); assert.equal(held.confirmSaved(), true);
+    f.setBeforeRemove(() => { f.scope.generation++; });
+    assert.equal(held.discardSaved(() => true), "unknown");
+    assert.equal(f.getRemovalCount(), 1);
+    assert.deepEqual(f.journal.read().entries.map(entry => entry.updateId), [2]);
+    assert.deepEqual(f.executed, []);
+  });
+});
+
+test("Live input discard rejects a queue acquisition between observation and exact removal", async () => {
+  await withLiveInputWorker(1, async f => {
+    const held = f.worker.prepareLiveInput!(TEST_CONTEXT, [2])!;
+    f.journal.appendBatch([{ update_id: 2 }]); assert.equal(held.confirmSaved(), true);
+    f.setBeforeRemove(() => f.journal.markQueued({ queueKind: "prompt", receiptId: "acquired-work", sourceUpdateIds: [2],
+      owner: { instanceId: "recipient", processId: process.pid, processBirthId: `${process.pid}:live-input`, sessionGeneration: 1 } }));
+    assert.equal(held.discardSaved(() => true), "unknown");
+    assert.equal(f.getRemovalCount(), 1);
+    assert.equal(held.discardSaved(() => true), "unknown");
+    assert.equal(f.getRemovalCount(), 1);
+    assert.equal(f.journal.read().entries[0]!.state, "queued");
+    f.journal.appendBatch([{ update_id: 4 }]); f.worker.signal(); await f.worker.waitForDrain();
+    assert.deepEqual(f.executed, [4]);
+  });
 });
 
 test("Update worker consumes custodied completion without a second legacy settlement", async () => {
@@ -5187,6 +5493,89 @@ test("Admission runtime assembly owns queue identity and leader/follower workers
   await assembly.follower.onTransportChanged("follower-context");
   assert.equal(assembly.follower.getJournalBindingKey(), "follower-binding");
   await runtimeBinding.onSessionShutdown();
+});
+
+test("Admission live preparation uses a retained source reference without pausing ordinary work or adopting leader originals", async () => {
+  await withLiveInputWorker(1, async f => {
+    let references = 0;
+    const lifecycle = createTelegramUpdateAdmissionLifecycleRuntime<string>({
+      resolveBinding: () => ({ runtimeKey: "live-runtime", recoveryKey: f.scope.binding, journal: f.journal }),
+      acquireSourceReference() { references++; return () => { references--; }; }, createWorker: () => f.worker,
+    });
+    await lifecycle.onSessionStart(TEST_CONTEXT); await f.worker.waitForDrain();
+    assert.equal(references, 1);
+    f.setHandler(update => ({ kind: update.update_id === 1 ? "deferred" : "complete" }));
+    lifecycle.appendBatch([{ update_id: 1 }]); lifecycle.signal(); await f.worker.waitForDrain();
+    assert.equal(lifecycle.prepareLiveInput!(TEST_CONTEXT, [1]), undefined, "Leader deferred original keeps its original carrier");
+    const held = lifecycle.prepareLiveInput!(TEST_CONTEXT, [2, 3])!; assert.ok(held);
+    lifecycle.appendBatch([{ update_id: 2 }, { update_id: 3 }, { update_id: 4 }]);
+    assert.equal(held.confirmSaved(), true); lifecycle.signal(); await f.worker.waitForDrain();
+    assert.deepEqual(f.executed, [1, 4]);
+    assert.equal(held.release(() => true), true); await f.worker.waitForDrain();
+    assert.deepEqual(f.executed, [1, 4, 2, 3]);
+    assert.deepEqual(f.journal.read().entries.map(entry => entry.updateId), [1]);
+    await lifecycle.onSessionShutdown(); assert.equal(references, 0);
+    assert.equal(lifecycle.prepareLiveInput!(TEST_CONTEXT, [5]), undefined, "Stopped retained observations cannot grant preparation");
+  });
+});
+
+for (const change of ["runtime", "missing", "authority", "renewal", "shutdown", "resume", "session"] as const) {
+  test(`Admission live preparation refuses old carriers across binding/source lifetime changes (${change})`, async () => {
+    await withLiveInputWorker(1, async f => {
+      let runtimeKey = "live-runtime", present = true, authorized = true, references = 0;
+      const lifecycle = createTelegramUpdateAdmissionLifecycleRuntime<string>({
+        resolveBinding: () => present ? { runtimeKey, recoveryKey: f.scope.binding, journal: f.journal, hasAuthority: () => authorized } : undefined,
+        acquireSourceReference() { references++; return () => { references--; }; }, createWorker: () => f.worker,
+      });
+      await lifecycle.onSessionStart(TEST_CONTEXT); await f.worker.waitForDrain();
+      const held = lifecycle.prepareLiveInput!(TEST_CONTEXT, [2])!;
+      lifecycle.appendBatch([{ update_id: 2 }]); assert.equal(held.confirmSaved(), true);
+      if (change === "runtime") runtimeKey = "replacement";
+      if (change === "missing") present = false;
+      if (change === "authority") authorized = false;
+      // Replace with the very same worker object: old source-reference identity still must not become a grant.
+      if (change === "renewal") { await lifecycle.onTransportChanged(TEST_CONTEXT); await f.worker.waitForDrain(); }
+      if (change === "shutdown") await lifecycle.onSessionShutdown();
+      if (change === "resume") { await lifecycle.onSessionShutdown(); await lifecycle.onSessionStart(TEST_CONTEXT); await f.worker.waitForDrain(); }
+      if (change === "session") { await lifecycle.onSessionStart("other-context"); await f.worker.waitForDrain(); }
+      assert.equal(held.confirmSaved(), false);
+      assert.equal(held.release(() => true), false);
+      assert.equal(held.cancelEmpty(), false);
+      assert.equal(held.discardSaved(() => true), "protected");
+      assert.equal(f.getRemovalCount(), 0);
+      assert.deepEqual(f.executed, []);
+      assert.deepEqual(f.journal.read().entries.map(entry => entry.updateId), [2]);
+      await lifecycle.onSessionShutdown(); assert.equal(references, 0);
+    });
+  });
+}
+
+test("Admission live preparation refuses startup readiness and fences parent binding changes during publication", async () => {
+  await withLiveInputWorker(1, async f => {
+    let runtimeKey = "live-runtime", startupProbe: unknown = "not-probed", workerProbe: unknown = "not-probed";
+    await f.worker.stop();
+    const lifecycle = createTelegramUpdateAdmissionLifecycleRuntime<string>({
+      resolveBinding: () => ({ runtimeKey, recoveryKey: f.scope.binding, journal: f.journal }),
+      createWorker: () => ({ ...f.worker, start(ctx) {
+        f.worker.start(ctx);
+        workerProbe = f.worker.prepareLiveInput!(ctx, [2]);
+        startupProbe = lifecycle.prepareLiveInput!(ctx, [2]);
+      } }),
+    });
+    assert.equal(lifecycle.prepareLiveInput!(TEST_CONTEXT, [2]), undefined);
+    await lifecycle.onSessionStart(TEST_CONTEXT);
+    assert.equal(workerProbe, undefined, "Initial drain must establish the ordinary startup baseline");
+    assert.equal(startupProbe, undefined, "Starting source has not published execution context yet");
+    await f.worker.waitForDrain();
+    const held = lifecycle.prepareLiveInput!(TEST_CONTEXT, [2])!;
+    lifecycle.appendBatch([{ update_id: 2 }]); assert.equal(held.confirmSaved(), true);
+    f.setPublicationHook(stage => { if (stage === "after-write-before-rename") runtimeKey = "replacement"; });
+    assert.equal(held.discardSaved(() => true), "unknown");
+    assert.equal(f.getRemovalCount(), 1);
+    assert.deepEqual(f.journal.read().entries.map(entry => entry.updateId), [2]);
+    assert.equal(held.release(() => true), false);
+    await lifecycle.onSessionShutdown();
+  });
 });
 
 test("Admission lifecycle reuses only the active runtime identity without resetting queued authority", async () => {
@@ -6490,6 +6879,7 @@ for (const scenario of ["normal", "binding", "authority", "context", "identity",
       async defaultHandle(update) {
         carrier = update.message;
         assert.equal(inspectTelegramDeferredSource(carrier), undefined, "execution has not yielded a deferred claim yet");
+        assert.equal(inspectTelegramDeferredSourceSnapshot(carrier), undefined);
         reportTelegramUpdateDeferred(carrier);
       },
     });
@@ -6513,14 +6903,26 @@ for (const scenario of ["normal", "binding", "authority", "context", "identity",
       if (scenario === "reported") assert.equal(reportTelegramUpdateCompleted(carrier), true);
       const before = await readFile(options.path, "utf8");
       probing = true;
-      if (scenario === "unreadable") assert.throws(() => inspectTelegramDeferredSource(projected), /Source inspection unavailable/);
-      else if (scenario === "normal") {
+      if (scenario === "unreadable") {
+        assert.throws(() => inspectTelegramDeferredSource(projected), /Source inspection unavailable/);
+        assert.throws(() => inspectTelegramDeferredSourceSnapshot(projected), /Source inspection unavailable/);
+      } else if (scenario === "normal") {
         assert.deepEqual(inspectTelegramDeferredSource(projected), expected);
         const detached = inspectTelegramDeferredSource(projected)!;
         detached.sourceSha256 = "changed";
         assert.deepEqual(inspectTelegramDeferredSource(carrier), expected, "no mutable evidence alias escapes the worker");
         assert.equal(inspectTelegramDeferredSource({ pi_telegram_source_update_id: 1 }), undefined, "an ID is not a source capability");
-      } else assert.equal(inspectTelegramDeferredSource(projected), undefined);
+        const snapshot = inspectTelegramDeferredSourceSnapshot(projected)!;
+        assert.deepEqual(snapshot, { source: expected, update: original.update });
+        snapshot.source.sourceSha256 = "changed";
+        (snapshot.update.message as Record<string, unknown>).text = "changed";
+        assert.deepEqual(inspectTelegramDeferredSourceSnapshot(carrier), { source: expected, update: original.update },
+          "Snapshot reads the original journal body and exposes no alias into retained authority");
+        assert.equal(inspectTelegramDeferredSourceSnapshot({ pi_telegram_source_update_id: 1 }), undefined);
+      } else {
+        assert.equal(inspectTelegramDeferredSourceSnapshot(projected), undefined);
+        assert.equal(inspectTelegramDeferredSource(projected), undefined);
+      }
       if (["binding", "authority", "context", "identity", "stopped", "reported"].includes(scenario)) assert.equal(reads, 0,
         "ended source authority never even reads the journal");
       assert.equal(await readFile(options.path, "utf8"), before, "observation neither removes nor repairs source input");
@@ -6529,6 +6931,394 @@ for (const scenario of ["normal", "binding", "authority", "context", "identity",
       await worker.stop();
       await rm(dir, { recursive: true, force: true });
     }
+  });
+}
+
+for (const scenario of ["current", "clock-only", "cold", "port-before", "read-before", "source-changed-before", "source-missing-before", "missing-owner", "missing-reader", "missing-commit", "source-before", "binding-before", "identity-before",
+  "binding-after", "identity-after", "context-after", "stopped", "renewed", "held", "lost-before", "lost-after", "wrong-ack", "wrong-receipt",
+  "wrong-kind", "wrong-group", "native-after", "owner-native-after", "foreign-ack", "post-read-loss", "read-failure", "settled", "port-replaced"] as const) {
+  test(`Deferred queue admission preparation observes exact warm worker receipt (${scenario})`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-selected-queue-proof-"));
+    const options = { path: join(dir, "inbox.json"), botIdentity: createTelegramUpdateJournalBotIdentity({ botToken: "fixture" }) };
+    const journal = createTelegramUpdateJournalStore(options), key = createTelegramUpdateJournalBindingKey(options);
+    let carrier: unknown, liveKey = key, generation = 1, current = true, commits = 0, reads = 0, probing = false;
+    const held = Promise.withResolvers<void>();
+    const identity = () => ({ instanceId: "fixture", processId: process.pid, processBirthId: `${process.pid}:queue-proof`, sessionGeneration: generation });
+    const port = { ...journal, read() {
+      reads++; const snapshot = journal.read();
+      if (probing && scenario === "post-read-loss") current = false;
+      if (probing && scenario === "read-failure") throw new Error("Receipt observation unavailable");
+      return snapshot;
+    }, isQueueReceiptCurrent: scenario === "missing-reader" ? undefined : (receipt: Updates.TelegramQueueAdmissionReceiptLike, owner: TelegramUpdateJournalQueueOwner) => {
+      const entries = journal.read().entries.filter(entry => entry.queueReceiptId === receipt.receiptId);
+      return entries.length === receipt.sourceUpdateIds.length && entries.every((entry, index) =>
+        entry.updateId === receipt.sourceUpdateIds[index] && entry.state === "queued" && entry.queueKind === receipt.queueKind &&
+        !entry.queueHandoff && JSON.stringify(entry.queueOwner) === JSON.stringify(owner));
+    },
+      markQueued: scenario === "missing-commit" ? undefined! : (input: Parameters<typeof journal.markQueued>[0]) => {
+        commits++; if (scenario === "lost-before") throw new Error("Queue publication unavailable");
+        const result = journal.markQueued(input);
+        if (scenario === "lost-after") throw new Error("Queue ACK lost");
+        if (scenario === "foreign-ack") return { ...result, queueOwner: { ...result.queueOwner!, instanceId: "other" } };
+        return scenario === "wrong-ack" ? { ...result, queuedUpdateIds: [], duplicateUpdateIds: [] } : result;
+      } };
+    const worker = createTelegramUpdateAdmissionWorkerRuntime<TelegramJournaledUpdate & TelegramUpdateFlow, string>({
+      journal: port, getJournalBindingKey: () => liveKey, hasAuthority: () => current, isContextCurrent: () => current,
+      getQueueOwnerIdentity: scenario === "missing-owner" ? undefined : identity,
+      async defaultHandle(update) {
+        carrier = update.message;
+        assert.equal(Updates.prepareTelegramDeferredQueueAdmission(carrier), undefined, "Executing input is not a deferred preparation");
+        reportTelegramUpdateDeferred(carrier);
+      },
+      beforeQueueReceiptPublished: scenario === "held" ? async () => { await held.promise; } : undefined,
+      expireRoutingInput: scenario === "clock-only" ? async () => {} : undefined,
+    });
+    const receipt = { queueKind: "prompt" as const, receiptId: "prepared-normal", sourceUpdateIds: [1], journalBindingKey: key };
+    try {
+      if (scenario !== "cold") { worker.start(TEST_CONTEXT); await worker.waitForDrain(); }
+      journal.appendBatch([{ update_id: 1, message: { message_id: 2, message_thread_id: 10,
+        chat: { id: 7, type: "private" }, text: "/selected original" } }]);
+      if (scenario === "cold") worker.start(TEST_CONTEXT);
+      worker.signal(); await worker.waitForDrain();
+      const original = journal.read().entries[0]!;
+      if (scenario === "port-before") port.isQueueReceiptCurrent = () => true;
+      if (scenario === "read-before") port.read = () => { assert.fail("A replaced source reader cannot lend preparation authority"); };
+      if (scenario === "source-before") journal.markQueued({ ...receipt, owner: identity() });
+      if (scenario === "source-changed-before") {
+        const { exists: _exists, serializedBytes: _bytes, ...snapshot } = journal.read();
+        (snapshot.entries[0]!.update.message as { text: string }).text = "changed before preparation";
+        await writeFile(options.path, JSON.stringify(snapshot));
+      }
+      if (scenario === "source-missing-before") journal.removeCompleted([1]);
+      if (scenario === "binding-before") liveKey = "foreign";
+      if (scenario === "identity-before") generation++;
+      const before = await readFile(options.path, "utf8");
+      const prepared = Updates.prepareTelegramDeferredQueueAdmission(carrier);
+      assert.equal(await readFile(options.path, "utf8"), before, "Preparation is read-only and holds no source/queue reservation");
+      const refused = ["cold", "port-before", "read-before", "source-changed-before", "source-missing-before", "missing-owner", "missing-reader", "missing-commit", "source-before", "binding-before", "identity-before"].includes(scenario);
+      assert.equal(!!prepared, !refused);
+      if (!prepared) { assert.equal(commits, 0); return; }
+      assert.equal(prepared.isCurrent(), true); assert.equal(prepared.inspectReceipt(receipt), undefined);
+      if (scenario === "clock-only") {
+        assert.ok(Updates.armTelegramRoutingInputs([carrier], 7));
+        assert.deepEqual(inspectTelegramDeferredSource(carrier), { journalBindingKey: key,
+          ...createTelegramUpdateJournalEntryDigest(journal.read().entries[0]!) }, "Arming keeps exact decoder-owned source authority");
+        acquireTelegramUpdateRouting(carrier, true)();
+        assert.deepEqual(inspectTelegramDeferredSource(carrier), { journalBindingKey: key,
+          ...createTelegramUpdateJournalEntryDigest(journal.read().entries[0]!) }, "Selection keeps exact decoder-owned source authority");
+      }
+      assert.equal(reportTelegramQueueAdmission([carrier], [receipt]), true);
+      assert.equal(prepared.inspectReceipt(receipt), undefined, "Reporting is not a worker ACK");
+      for (let i = 0; i < 4; i++) await new Promise<void>(resolve => setImmediate(resolve));
+      if (scenario === "held") {
+        assert.equal(prepared.inspectReceipt(receipt), undefined, "Durable queue bytes alone cannot borrow unfinished worker publication");
+        held.resolve();
+        for (let i = 0; i < 4; i++) await new Promise<void>(resolve => setImmediate(resolve));
+      }
+      assert.equal(Updates.prepareTelegramDeferredQueueAdmission(carrier), undefined, "Accepted reporting cannot recapture another preparation");
+      if (scenario === "binding-after") liveKey = "foreign";
+      if (scenario === "identity-after") generation++;
+      if (scenario === "context-after") current = false;
+      if (scenario === "stopped" || scenario === "renewed") await worker.stop();
+      if (scenario === "renewed") { worker.start(TEST_CONTEXT); await worker.waitForDrain(); }
+      if (scenario === "native-after" || scenario === "owner-native-after") {
+        const { exists: _exists, serializedBytes: _bytes, ...snapshot } = journal.read();
+        if (scenario === "owner-native-after") snapshot.entries[0]!.queueOwner!.acquisitionId = "foreign-acquisition";
+        else (snapshot.entries[0]!.update.message as { text: string }).text = "changed exact original";
+        await writeFile(options.path, JSON.stringify(snapshot));
+      }
+      if (scenario === "settled") worker.completeQueueReceipts({ receipts: [receipt], ctx: TEST_CONTEXT, reason: "prompt-handoff" });
+      if (scenario === "port-replaced") port.isQueueReceiptCurrent = () => true;
+      const query = { ...receipt, sourceUpdateIds: [...receipt.sourceUpdateIds] };
+      if (scenario === "wrong-receipt") query.receiptId = "other";
+      if (scenario === "wrong-kind") (query as { queueKind: string }).queueKind = "control";
+      if (scenario === "wrong-group") query.sourceUpdateIds = [1, 2];
+      const persisted = await readFile(options.path, "utf8"), previousReads = reads;
+      probing = true;
+      const proof = prepared.inspectReceipt(query);
+      const confirmed = scenario === "current" || scenario === "clock-only" || scenario === "held";
+      assert.equal(!!proof, confirmed);
+      if (proof) {
+        assert.deepEqual(proof.source, { journalBindingKey: key, ...createTelegramUpdateJournalEntryDigest(original) });
+        assert.deepEqual(journal.read().entries[0]!.update, original.update, "Selection/queue metadata may change, not the original bytes");
+        assert.deepEqual(proof.receipt, { queueKind: receipt.queueKind, receiptId: receipt.receiptId, sourceUpdateIds: [1],
+          queueOwner: journal.read().entries[0]!.queueOwner });
+        proof.source.sourceSha256 = "mutated"; proof.receipt.sourceUpdateIds.push(99); proof.receipt.queueOwner.instanceId = "other";
+        assert.equal(prepared.inspectReceipt(receipt)!.source.sourceSha256, createTelegramUpdateJournalEntryDigest(original).sourceSha256);
+      }
+      if (["binding-after", "identity-after", "context-after", "stopped", "renewed", "port-replaced"].includes(scenario))
+        assert.equal(reads, previousReads, "Ended authority refuses before source I/O");
+      assert.equal(await readFile(options.path, "utf8"), persisted);
+      assert.equal(commits, 1, "Observation never repeats queue admission after a lost/unknown receipt");
+    } finally { probing = false; held.resolve(); await worker.stop(); await rm(dir, { recursive: true, force: true }); }
+  });
+}
+
+for (const mode of ["current", "missing-native", "wrong-source", "no-readiness", "before-release", "refused-release", "discard", "port-change", "authority", "bind-refused", "consume-throw", "report-lost", "ack-lost", "changed", "neighbor", "bind-loss"] as const) {
+  test(`Native held status consumption skips registry/handler and never falls back (${mode})`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-native-status-consume-")), options = { path: join(dir, "journal.json"), botIdentity: createTelegramUpdateJournalBotIdentity({ botToken: "fixture" }) };
+    const journal = createTelegramUpdateJournalStore(options), binding = createTelegramUpdateJournalBindingKey(options);
+    let defaults = 0, registryCalls = 0, executions = 0, binds = 0, removals = 0, current = false;
+    let completion: TelegramDeferredSourceCompletionPreparation | undefined;
+    const records: unknown[] = [];
+    const deps = { journal: { ...journal, removeCompletedExact(...args: Parameters<typeof journal.removeCompletedExact>) { removals++; const result = journal.removeCompletedExact(...args); if (mode === "ack-lost") throw new Error("ACK lost"); return result; } },
+      getJournalBindingKey: () => binding, hasAuthority: () => true, isContextCurrent: () => true,
+      getQueueOwnerIdentity: () => ({ instanceId: "recipient", processId: process.pid, processBirthId: `${process.pid}:status-consume`, sessionGeneration: 1 }),
+      async defaultHandle() { defaults++; }, registry: { version: 1 as const, add: () => () => {}, async dispatch() { registryCalls++; return "pass" as const; } },
+      recordRuntimeEvent(_category: string, error: unknown) { records.push(error); } };
+    const worker = mode === "missing-native" ? createTelegramUpdateWorkerRuntime<string>({ ...deps, executeUpdate() { defaults++; return { kind: "complete" }; } })
+      : createTelegramUpdateAdmissionWorkerRuntime<TelegramJournaledUpdate & TelegramUpdateFlow, string>(deps);
+    worker.start(TEST_CONTEXT); await worker.waitForDrain();
+    const held = worker.prepareLiveInput!(TEST_CONTEXT, [100])!; assert.ok(held);
+    const update = { update_id: 100, message: { message_id: 11, chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: "/status" } };
+    journal.appendBatch([update]); worker.signal(); await worker.waitForDrain(); assert.equal(held.confirmSaved(), true);
+    const readiness = mode === "no-readiness" ? undefined : held.prepareSourceCompletion?.();
+    const consumer = { source: readiness?.snapshot.source ?? { updateId: 100, journalBindingKey: binding, sourceSha256: "f".repeat(64) },
+      assertCurrent() { if (!current) throw new Error("Recipient not released/current"); },
+      bindCarrier(value: unknown) { binds++; completion = readiness?.bindCarrier(value); assert.ok(completion); if (mode === "bind-loss") current = false; return mode !== "bind-refused"; },
+      async execute() { executions++; assert.ok(completion); if (mode === "consume-throw") throw new Error("Lost consumption result");
+        assert.equal(completion.reportCompleted(), true); if (mode === "report-lost") throw new Error("Report return lost"); return true; } };
+    if (mode === "wrong-source") consumer.source = { ...consumer.source, sourceSha256: "f".repeat(64) };
+    const before = await readFile(options.path, "utf8");
+    try {
+      const accepted = held.prepareStatusConsumption?.(consumer); assert.equal(accepted, !["missing-native", "wrong-source", "no-readiness"].includes(mode));
+      assert.equal(defaults, 0); assert.equal(registryCalls, 0); assert.equal(executions, 0); assert.equal(removals, 0); assert.equal(await readFile(options.path, "utf8"), before);
+      if (!accepted) return;
+      assert.equal(held.prepareStatusConsumption?.(consumer), false, "No plan replacement or second preparation");
+      if (mode === "before-release") return;
+      if (mode === "refused-release") { assert.equal(held.release(() => false), false); return; }
+      if (mode === "discard") { assert.equal(held.discardSaved(() => true), "discarded"); assert.equal(executions, 0); return; }
+      if (mode === "port-change") { consumer.execute = async () => { throw new Error("Replacement must not execute"); }; assert.equal(held.release(() => true), false); return; }
+      if (mode === "neighbor") journal.appendBatch([{ update_id: 101, message: { text: "neighbor" } }]);
+      current = mode !== "authority";
+      assert.equal(held.release(() => true), true);
+      if (mode === "changed") journal.markExecutionFailure({ updateId: 100, expectedAttemptCount: 0, failedAtMs: 1, failureClass: "fixture", summary: "changed", disposition: "retry-wait", nextRetryAtMs: Date.now() + 60000 });
+      await worker.waitForDrain(); await new Promise(resolve => setImmediate(resolve)); await worker.waitForDrain();
+      const refused = ["authority", "changed"].includes(mode), noReport = refused || ["bind-refused", "bind-loss", "consume-throw"].includes(mode);
+      assert.equal(binds, refused ? 0 : 1); assert.equal(executions, refused || mode === "bind-refused" || mode === "bind-loss" ? 0 : 1);
+      assert.equal(defaults, mode === "neighbor" ? 1 : 0); assert.equal(registryCalls, defaults);
+      assert.equal(removals, noReport ? 0 : 1);
+      assert.deepEqual(completion?.inspectCompletion(), noReport || mode === "ack-lost" ? undefined : readiness!.snapshot.source);
+      const executionCount = executions, bindCount = binds; worker.signal(); await worker.waitForDrain();
+      assert.equal(executions, executionCount); assert.equal(binds, bindCount); assert.equal(defaults, mode === "neighbor" ? 1 : 0);
+      if (noReport && mode !== "changed") assert.equal(await readFile(options.path, "utf8"), before);
+      if (["authority", "bind-refused", "consume-throw", "report-lost"].includes(mode)) assert.ok(records.length);
+    } finally { await worker.stop(); await rm(dir, { recursive: true, force: true }); }
+  });
+}
+
+for (const scenario of ["current", "before-save", "group", "before-release", "refused-release", "discard", "wrong-carrier", "binding", "context", "identity", "stopped", "read-owner", "changed", "cold-restart", "lost-ack"] as const) {
+  test(`Held singleton completion readiness bridges only its warm released source (${scenario})`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-held-command-readiness-"));
+    const options = { path: join(dir, "journal.json"), botIdentity: createTelegramUpdateJournalBotIdentity({ botToken: "fixture" }) };
+    const journal = createTelegramUpdateJournalStore(options), binding = createTelegramUpdateJournalBindingKey(options);
+    let carrier: unknown, calls = 0, removals = 0, generation = 1, liveBinding = binding, context = true;
+    const native = { ...journal, removeCompletedExact(...args: Parameters<typeof journal.removeCompletedExact>) { removals++; const result = journal.removeCompletedExact(...args); if (scenario === "lost-ack") throw new Error("ACK lost"); return result; } };
+    const worker = createTelegramUpdateAdmissionWorkerRuntime<TelegramJournaledUpdate & TelegramUpdateFlow, string>({ journal: native,
+      getJournalBindingKey: () => liveBinding, hasAuthority: () => true, isContextCurrent: () => context,
+      getQueueOwnerIdentity: () => ({ instanceId: "recipient", processId: process.pid, processBirthId: `${process.pid}:held-command`, sessionGeneration: generation }),
+      async defaultHandle(update) { calls++; carrier = update.message; reportTelegramUpdateDeferred(carrier); } });
+    worker.start(TEST_CONTEXT); await worker.waitForDrain();
+    const held = worker.prepareLiveInput!(TEST_CONTEXT, scenario === "group" ? [100, 101] : [100])!; assert.ok(held);
+    try {
+      if (scenario === "before-save") { assert.equal(held.prepareSourceCompletion?.(), undefined); return; }
+      const update = { update_id: 100, message: { message_id: 11, message_thread_id: 10, chat: { id: 7, type: "private" }, text: "/status" } };
+      journal.appendBatch(scenario === "group" ? [update, { ...update, update_id: 101 }] : [update]); worker.signal(); await worker.waitForDrain();
+      assert.equal(calls, 0); assert.equal(held.confirmSaved(), true);
+      const before = await readFile(options.path, "utf8"), readiness = held.prepareSourceCompletion?.();
+      if (scenario === "group") { assert.equal(readiness, undefined); return; }
+      assert.ok(readiness); assert.equal(held.prepareSourceCompletion?.(), readiness, "Same hold keeps one preparation");
+      assert.equal(calls, 0); assert.equal(removals, 0); assert.equal(await readFile(options.path, "utf8"), before);
+      const expected = readiness.snapshot; assert.deepEqual(expected.update, update); expected.source.sourceSha256 = "f".repeat(64); (expected.update.message as Record<string, unknown>).text = "changed";
+      assert.deepEqual(readiness.snapshot.update, update); assert.notEqual(readiness.snapshot.source.sourceSha256, expected.source.sourceSha256);
+      assert.equal(readiness.bindCarrier({ pi_telegram_source_update_id: 100 }), undefined);
+      if (scenario === "before-release") { assert.equal(readiness.bindCarrier(carrier), undefined); return; }
+      if (scenario === "refused-release") { assert.equal(held.release(() => false), false); assert.equal(readiness.bindCarrier(carrier), undefined); assert.equal(calls, 0); return; }
+      if (scenario === "discard") { assert.equal(held.discardSaved(() => true), "discarded"); assert.equal(readiness.bindCarrier(carrier), undefined); assert.equal(calls, 0); return; }
+      if (scenario === "changed") journal.markExecutionFailure({ updateId: 100, expectedAttemptCount: 0, failedAtMs: 1, failureClass: "fixture", summary: "changed", disposition: "retry-wait", nextRetryAtMs: Date.now() + 60000 });
+      if (scenario === "changed") { assert.equal(held.release(() => true), false); assert.equal(readiness.bindCarrier(carrier), undefined); return; }
+      assert.equal(held.release(() => true), true); await worker.waitForDrain(); assert.equal(calls, 1);
+      if (scenario === "binding") liveBinding = "other";
+      if (scenario === "context") context = false;
+      if (scenario === "identity") generation++;
+      if (scenario === "stopped") await worker.stop();
+      if (scenario === "read-owner") native.read = () => journal.read();
+      if (scenario === "cold-restart") { await worker.stop(); worker.start(TEST_CONTEXT); await worker.waitForDrain(); }
+      const prepared = readiness.bindCarrier(scenario === "wrong-carrier" ? {} : carrier);
+      if (["wrong-carrier", "binding", "context", "identity", "stopped", "read-owner", "cold-restart"].includes(scenario)) { assert.equal(prepared, undefined); assert.equal(removals, 0); return; }
+      assert.ok(prepared); assert.equal(readiness.bindCarrier(carrier), prepared, "Same warm bridge never re-prepares");
+      assert.equal(readiness.bindCarrier({}), undefined); assert.equal(prepared.inspectCompletion(), undefined);
+      assert.equal(prepared.reportCompleted(), true); assert.equal(prepared.reportCompleted(), false);
+      await new Promise(resolve => setImmediate(resolve)); await worker.waitForDrain(); await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(prepared.inspectCompletion(), scenario === "lost-ack" ? undefined : readiness.snapshot.source);
+      assert.equal(removals, 1); assert.equal(calls, 1);
+    } finally { await worker.stop(); await rm(dir, { recursive: true, force: true }); }
+  });
+}
+
+for (const scenario of ["current", "cold", "raw", "missing-cas", "prepare-change", "changed", "queued", "missing", "lost-ack", "wrong-ack", "lost-report", "binding", "context", "identity", "stopped", "read-owner", "cas-owner", "accepted-without-ack", "revived"] as const) {
+  test(`Warm source completion preparation refuses reconstruction and observes its actual ACK (${scenario})`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-prepared-source-"));
+    const options = { path: join(dir, "journal.json"), botIdentity: createTelegramUpdateJournalBotIdentity({ botToken: "fixture" }) };
+    const journal = createTelegramUpdateJournalStore(options), binding = createTelegramUpdateJournalBindingKey(options);
+    let carrier: unknown, original: unknown, removals = 0, reads = 0, reports = 0, ctxCurrent = true, generation = 1, liveBinding = binding;
+    const native = { ...journal, read() { reads++; return journal.read(); }, removeCompletedExact: scenario === "missing-cas" ? undefined : (...args: Parameters<typeof journal.removeCompletedExact>) => {
+      removals++; const result = journal.removeCompletedExact(...args);
+      if (scenario === "lost-ack") throw new Error("Removal ACK lost");
+      return scenario === "wrong-ack" ? { ...result, removedUpdateIds: [] } : result;
+    } };
+    const worker = createTelegramUpdateAdmissionWorkerRuntime<TelegramJournaledUpdate & TelegramUpdateFlow, string>({ journal: native,
+      getJournalBindingKey: () => liveBinding, hasAuthority: () => true, isContextCurrent: () => ctxCurrent,
+      getQueueOwnerIdentity: () => ({ instanceId: "recipient", processId: process.pid, processBirthId: `${process.pid}:prepared`, sessionGeneration: generation }),
+      async defaultHandle(update) {
+        original = update.message; reportTelegramUpdateDeferred(original);
+        carrier = bindTelegramUpdateCompletionAcceptance(original, () => { reports++; throw new Error("Wrong scoped proof cannot be borrowed"); });
+        if (scenario !== "lost-report") carrier = original;
+      } });
+    const append = () => journal.appendBatch([{ update_id: 100, message: { message_id: 11, message_thread_id: 10, chat: { id: 7, type: "private" }, text: "/status" } }]);
+    if (scenario === "cold") append();
+    worker.start(TEST_CONTEXT); await worker.waitForDrain();
+    if (scenario !== "cold") { append(); worker.signal(); await worker.waitForDrain(); }
+    if (scenario === "raw") carrier = { message_id: 11, pi_telegram_source_update_id: 100 };
+    if (scenario === "prepare-change") journal.markExecutionFailure({ updateId: 100, expectedAttemptCount: 0, failedAtMs: 1, failureClass: "fixture", summary: "changed", disposition: "retry-wait", nextRetryAtMs: Date.now() + 60000 });
+    const before = await readFile(options.path, "utf8"), prepared = prepareTelegramDeferredSourceCompletion(carrier);
+    try {
+      const early = ["cold", "raw", "missing-cas", "prepare-change"].includes(scenario);
+      if (early) { assert.equal(prepared, undefined); assert.equal(await readFile(options.path, "utf8"), before); assert.equal(removals, 0); return; }
+      assert.ok(prepared); assert.equal(removals, 0); assert.equal(prepared.inspectCompletion(), undefined); assert.equal(await readFile(options.path, "utf8"), before);
+      const expected = inspectTelegramDeferredSource(original)!; const copy = prepared.source; copy.sourceSha256 = "f".repeat(64); assert.deepEqual(prepared.source, expected);
+      if (scenario === "changed") journal.markExecutionFailure({ updateId: 100, expectedAttemptCount: 0, failedAtMs: 1, failureClass: "fixture", summary: "changed", disposition: "retry-wait", nextRetryAtMs: Date.now() + 60000 });
+      if (scenario === "queued") journal.markQueued({ queueKind: "prompt", receiptId: "receipt", sourceUpdateIds: [100], owner: { instanceId: "other", processId: process.pid, processBirthId: `${process.pid}:other`, sessionGeneration: 1 } });
+      if (scenario === "missing") journal.removeCompleted([100]);
+      if (scenario === "binding") liveBinding = "other";
+      if (scenario === "context" || scenario === "revived") ctxCurrent = false;
+      if (scenario === "identity") generation++;
+      if (scenario === "stopped") await worker.stop();
+      if (scenario === "read-owner") native.read = () => journal.read();
+      if (scenario === "cas-owner") native.removeCompletedExact = () => assert.fail("Cannot borrow another CAS");
+      if (scenario === "accepted-without-ack") reportTelegramUpdateCompleted(original);
+      const rejected = ["changed", "queued", "missing", "binding", "context", "identity", "stopped", "read-owner", "cas-owner", "accepted-without-ack", "revived"].includes(scenario);
+      if (scenario === "lost-report") assert.throws(prepared.reportCompleted, /Wrong scoped proof/);
+      else assert.equal(prepared.reportCompleted(), !rejected);
+      if (scenario === "revived") { ctxCurrent = true; assert.equal(prepared.isCurrent(), true); }
+      assert.equal(prepared.reportCompleted(), false); assert.equal(prepared.inspectCompletion(), undefined);
+      await new Promise(resolve => setImmediate(resolve)); await worker.waitForDrain(); await new Promise(resolve => setImmediate(resolve));
+      const count = reads, calls = removals, bytes = await readFile(options.path, "utf8");
+      assert.deepEqual(prepared.inspectCompletion(), scenario === "current" ? expected : undefined);
+      assert.deepEqual(prepared.inspectCompletion(), scenario === "current" ? expected : undefined);
+      assert.equal(reads, count); assert.equal(removals, calls); assert.equal(await readFile(options.path, "utf8"), bytes);
+      assert.equal(removals, ["current", "lost-ack", "wrong-ack"].includes(scenario) ? 1 : 0);
+      if (scenario === "current") { const observed = prepared.inspectCompletion()!; observed.sourceSha256 = "0".repeat(64); assert.deepEqual(prepared.inspectCompletion(), expected); await worker.stop(); assert.equal(prepared.inspectCompletion(), undefined); }
+      assert.equal(reports, scenario === "lost-report" ? 1 : 0);
+    } finally { await worker.stop(); await rm(dir, { recursive: true, force: true }); }
+  });
+}
+
+for (const scenario of ["normal", "generic", "changed", "missing", "queued", "unavailable", "lost-ack", "wrong-ack",
+  "publication-loss", "post-ack-loss", "observer-loss", "binding", "context", "identity", "stopped", "renewed", "mutated-report"] as const) {
+  test(`Warm exact source disposition observes only the issuing worker removal ACK (${scenario})`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-warm-source-disposition-"));
+    const options = { path: join(dir, "inbox.json"), botIdentity: createTelegramUpdateJournalBotIdentity({ botToken: "fixture" }) };
+    const journal = createTelegramUpdateJournalStore(options), binding = createTelegramUpdateJournalBindingKey(options);
+    let carrier: unknown, exactCalls = 0, reads = 0, owned = true, contextCurrent = true, generation = 1, liveBinding = binding;
+    const completions: number[] = [];
+    const worker = createTelegramUpdateAdmissionWorkerRuntime<TelegramJournaledUpdate & TelegramUpdateFlow, string>({
+      journal: { ...journal, read() { reads++; return journal.read(); },
+        removeCompletedExact: scenario === "unavailable" ? undefined : (ids, guards, scoped, isCurrent) => {
+          exactCalls++;
+          assert.equal(typeof isCurrent, "function", "exact late completion reaches the actual journal publication fence");
+          if (scenario === "publication-loss") owned = false;
+          const ack = journal.removeCompletedExact(ids, guards, scoped, isCurrent);
+          if (scenario === "lost-ack") throw new Error("Exact removal reply lost");
+          if (scenario === "wrong-ack") return { ...ack, removedUpdateIds: [] };
+          if (scenario === "post-ack-loss") owned = false;
+          return ack;
+        } },
+      getJournalBindingKey: () => liveBinding, hasAuthority: () => owned, isContextCurrent: () => contextCurrent,
+      getQueueOwnerIdentity: () => ({ instanceId: "fixture", processId: process.pid,
+        processBirthId: `${process.pid}:warm-disposition`, sessionGeneration: generation }),
+      async defaultHandle(update) { carrier = update.message; reportTelegramUpdateDeferred(carrier); },
+      onUpdateCompleted(id) { completions.push(id); if (scenario === "observer-loss") owned = false; },
+    });
+    journal.appendBatch([{ update_id: 1, message: { message_id: 2, message_thread_id: 10,
+      chat: { id: 7, type: "private" }, text: "/status" } }]);
+    try {
+      worker.start(TEST_CONTEXT); await worker.waitForDrain();
+      const expected = inspectTelegramDeferredSource(carrier)!;
+      assert.ok(expected);
+      assert.equal(inspectTelegramDeferredSourceCompletion(carrier), undefined, "pending input has no disposal ACK");
+      if (scenario === "changed") journal.markExecutionFailure({ updateId: 1, expectedAttemptCount: 0, failedAtMs: 1000,
+        failureClass: "fixture", summary: "changed", disposition: "retry-wait", nextRetryAtMs: Date.now() + 60_000 });
+      if (scenario === "missing") journal.removeCompleted([1]);
+      if (scenario === "queued") journal.markQueued({ queueKind: "prompt", receiptId: "independent", sourceUpdateIds: [1],
+        owner: { instanceId: "other", processId: process.pid, processBirthId: `${process.pid}:other`, sessionGeneration: 1 } });
+      const reported = { ...expected };
+      assert.equal(reportTelegramUpdateCompleted(carrier, scenario === "generic" ? undefined : reported), true);
+      assert.equal(inspectTelegramDeferredSource(carrier), undefined, "semantic reporting hides unsettled inspection, not proof of removal");
+      assert.equal(inspectTelegramDeferredSourceCompletion(carrier), undefined, "a completion hint precedes its worker ACK");
+      if (scenario === "mutated-report") reported.sourceSha256 = "f".repeat(64);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      await worker.waitForDrain();
+      await new Promise<void>(resolve => setImmediate(resolve));
+      if (scenario === "binding") liveBinding = "other";
+      if (scenario === "context") contextCurrent = false;
+      if (scenario === "identity") generation++;
+      if (scenario === "stopped" || scenario === "renewed") await worker.stop();
+      if (scenario === "renewed") { worker.start(TEST_CONTEXT); await worker.waitForDrain(); }
+      const confirmed = scenario === "normal" || scenario === "mutated-report";
+      const before = await readFile(options.path, "utf8"), beforeReads = reads, beforeCalls = exactCalls;
+      assert.deepEqual(inspectTelegramDeferredSourceCompletion(carrier), confirmed ? expected : undefined);
+      assert.equal(inspectTelegramDeferredSourceCompletion({ pi_telegram_source_update_id: 1 }), undefined);
+      if (confirmed) {
+        const observed = inspectTelegramDeferredSourceCompletion(carrier)!;
+        observed.sourceSha256 = "f".repeat(64);
+        assert.deepEqual(inspectTelegramDeferredSourceCompletion(carrier), expected, "no mutable evidence alias escapes");
+        owned = false;
+        assert.equal(inspectTelegramDeferredSourceCompletion(carrier), undefined, "an ACK cannot outlive recipient/source worker authority");
+      }
+      assert.equal(reads, beforeReads, "warm inspection never rereads source absence or reconstructs an operation");
+      assert.equal(exactCalls, beforeCalls, "inspection never repeats removal, including after a lost ACK");
+      assert.equal(await readFile(options.path, "utf8"), before);
+      assert.equal(exactCalls, ["generic", "unavailable"].includes(scenario) ? 0 : 1);
+      assert.deepEqual(completions, ["changed", "missing", "queued", "unavailable", "lost-ack", "wrong-ack", "publication-loss", "post-ack-loss"].includes(scenario) ? [] : [1]);
+      assert.equal(journal.read().entries.length, ["changed", "queued", "unavailable", "publication-loss"].includes(scenario) ? 1 : 0);
+    } finally { await worker.stop(); await rm(dir, { recursive: true, force: true }); }
+  });
+}
+
+for (const scenario of ["current", "void", "mismatched", "mutated-adapter", "revoked", "aborted", "rejected"] as const) {
+  test(`Warm source disposition never upgrades a held or void late-outcome adapter (${scenario})`, async () => {
+    const expected = { updateId: 1, journalBindingKey: "fixture-source", sourceSha256: "a".repeat(64) };
+    let carrier: unknown, current = true, calls = 0;
+    type Ack = { source: typeof expected; isCurrent(): boolean };
+    let release!: (ack: Ack | undefined) => void, reject!: (error: Error) => void;
+    const held = new Promise<Ack | undefined>((resolve, fail) => { release = resolve; reject = fail; });
+    const failures: unknown[] = [], controller = new AbortController();
+    const handle = createTelegramUpdateAdmissionHandle<TelegramJournaledUpdate & TelegramUpdateFlow, string>({
+      async defaultHandle(update) { carrier = update.message; reportTelegramUpdateDeferred(carrier); },
+      async onLateOutcome(outcome) {
+        calls++;
+        if (scenario === "mutated-adapter" && outcome.kind === "complete" && outcome.expectedSource) outcome.expectedSource.sourceSha256 = "b".repeat(64);
+        return await held;
+      },
+      onLateOutcomeError(error) { failures.push(error); },
+    });
+    const update = { update_id: 1, message: { message_id: 2, chat: { id: 7, type: "private" }, text: "/status" } };
+    await handle(update, TEST_CONTEXT, controller.signal);
+    assert.equal(reportTelegramUpdateCompleted(carrier, expected), true);
+    await Promise.resolve();
+    assert.equal(calls, 1);
+    assert.equal(inspectTelegramDeferredSourceCompletion(carrier), undefined, "held work is not removal confirmation");
+    if (scenario === "revoked") current = false;
+    if (scenario === "aborted") controller.abort();
+    if (scenario === "rejected") reject(new Error("Lost completion acknowledgement"));
+    else release(scenario === "void" ? undefined : { source: scenario === "mismatched" || scenario === "mutated-adapter" ? { ...expected, sourceSha256: "b".repeat(64) } : expected,
+      isCurrent: () => current });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.deepEqual(inspectTelegramDeferredSourceCompletion(carrier), scenario === "current" ? expected : undefined);
+    assert.deepEqual(inspectTelegramDeferredSourceCompletion(carrier), scenario === "current" ? expected : undefined);
+    assert.equal(calls, 1, "observation cannot replay a lost/unknown completion");
+    assert.equal(failures.length, scenario === "rejected" ? 1 : 0);
   });
 }
 
@@ -6610,7 +7400,7 @@ for (const scenario of ["immediate", "mixed", "late", "changed", "binding", "ide
 for (const scenario of ["immediate", "mixed", "late", "lost-ack", "no-result", "foreign-result", "mutated-input", "missing-reader",
   "empty-read", "foreign-read", "post-commit-identity", "post-read-binding", "conflicting-report", "bad-scope", "capability-snapshot"] as const) {
   test(`Scoped worker completion requires a retained journal ACK before notification (${scenario})`,
-    { skip: !constants.O_NOFOLLOW || !constants.O_NONBLOCK }, async () => {
+    async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-scoped-worker-ack-"));
     const config = createTelegramConfigStore({ agentDir: dir });
     const resolve = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture",
@@ -6722,7 +7512,7 @@ test("Ordinary queue receipts publish where strict journal source access is unav
 });
 
 for (const scenario of ["exact", "foreign-binding", "read-only", "completed-after", "corrupt-after"] as const) {
-  test(`Production journal binding composes strict queued observation with publication readiness (${scenario})`, { skip: !constants.O_NOFOLLOW || !constants.O_NONBLOCK }, async () => {
+  test(`Production journal binding composes strict queued observation with publication readiness (${scenario})`, async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-queued-native-binding-"));
     const path = join(dir, "inbox.json"), config = createTelegramConfigStore({ agentDir: dir });
     let writesAllowed = true;
@@ -6772,7 +7562,7 @@ for (const scenario of ["normal", "transport-lost", "ordinary", "grouped", "batc
   "lost-ack", "no-result", "no-removed-result", "foreign-result", "reader-empty", "reader-throws", "reader-foreign",
   "post-commit-context", "post-read-binding", "post-read-identity", "detached", "capability-snapshot", "downgrade", "conflicting-retry"] as const) {
   test(`Scoped queued worker disposition acknowledges only retained full-source proof (${scenario})`,
-    { skip: !constants.O_NOFOLLOW || !constants.O_NONBLOCK }, async () => {
+    async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-queue-terminal-"));
     const identity = { instanceId: "queue-terminal", processId: process.pid, processBirthId: `${process.pid}:fixture`, sessionGeneration: 1 };
     const resolve = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture",
@@ -6888,7 +7678,7 @@ for (const scenario of ["normal", "transport-lost", "ordinary", "grouped", "batc
 }
 
 for (const scenario of ["ready", "group", "control", "batch", "mixed", "mixed-lost", "mixed-batch-lost", "mixed-ordinary-fails", "mixed-context", "mixed-binding", "mixed-identity", "mixed-control", "mixed-discard", "subset", "override", "detached", "missing-reader", "missing-disposer", "observer", "cold"] as const) {
-  test(`Prepared queue scopes reach lifecycle disposal without ordinary downgrade (${scenario})`, { skip: !constants.O_NOFOLLOW || !constants.O_NONBLOCK }, async () => {
+  test(`Prepared queue scopes reach lifecycle disposal without ordinary downgrade (${scenario})`, async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-prepared-queue-scopes-"));
     const identity = { instanceId: "prepared", processId: process.pid, processBirthId: `${process.pid}:prepared`, sessionGeneration: 1 };
     const resolve = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture", getBotId: () => undefined,
@@ -6987,7 +7777,7 @@ for (const scenario of ["ready", "group", "control", "batch", "mixed", "mixed-lo
 }
 
 for (const scenario of ["positive", "batch", "before-write", "after-write", "partial-result", "context", "binding", "identity", "abort", "origin-binding", "observer-context", "observer-throws"] as const) {
-  test(`Ordinary queued source hints require a whole ACK and fresh origin authority (${scenario})`, { skip: !constants.O_NOFOLLOW || !constants.O_NONBLOCK }, async () => {
+  test(`Ordinary queued source hints require a whole ACK and fresh origin authority (${scenario})`, async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-ordinary-queue-hint-"));
     const identity = { instanceId: "ordinary", processId: process.pid, processBirthId: `${process.pid}:ordinary`, sessionGeneration: 1 };
     const resolve = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture", getBotId: () => undefined,
@@ -7048,7 +7838,7 @@ for (const scenario of ["positive", "batch", "before-write", "after-write", "par
 
 for (const scenario of ["positive", "lost", "before-write", "no-result", "readback", "batch", "mixed", "origin-missing", "origin-empty", "origin-owner",
   "origin-member", "origin-source", "origin-pending", "origin-context", "origin-binding", "origin-identity", "captured", "restart-held", "sticky-missing-witness"] as const) {
-  test(`Prepared partial queue scopes acknowledge only immutable whole-receipt origin (${scenario})`, { skip: !constants.O_NOFOLLOW || !constants.O_NONBLOCK }, async () => {
+  test(`Prepared partial queue scopes acknowledge only immutable whole-receipt origin (${scenario})`, async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-partial-queue-origin-"));
     const identity = { instanceId: "partial", processId: process.pid, processBirthId: `${process.pid}:partial`, sessionGeneration: 1 };
     const resolve = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture", getBotId: () => undefined,
@@ -7227,7 +8017,7 @@ for (const scenario of ["hold", "publisher-fails", "authority", "context", "bind
 }
 
 for (const scenario of ["complete", "duplicate", "queued", "queued-complete", "queued-guarded", "queued-commit-fails", "publisher-fails", "missing-scope", "wrong-id", "conflicting-scope", "stopped", "detached"] as const) {
-  test(`Completion acceptance carrier gates only its local report before journal disposition (${scenario})`, { skip: !constants.O_NOFOLLOW || !constants.O_NONBLOCK }, async () => {
+  test(`Completion acceptance carrier gates only its local report before journal disposition (${scenario})`, async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-completion-publisher-"));
     const resolve = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture",
       getBotId: () => undefined, getJournalPath: () => join(dir, "inbox.json"),
@@ -8131,4 +8921,101 @@ test("Update worker contains state-observer and diagnostic-sink failures", async
   assert.equal(worker.getState().phase, "idle");
   await worker.stop();
   assert.equal(worker.getState().phase, "stopped");
+});
+
+for (const scenario of ["handoff", "discard", "unscoped", "unobserved", "lost-ack", "reconciled", "partial-ack", "changed-source", "changed-receipt", "changed-marker",
+  "binding", "identity", "context", "stopped", "reader-before", "disposer-before", "reader-replaced", "reader-loss", "reader-throws"] as const) {
+  test(`Held queue completion observes only an exact native scoped receipt ACK (${scenario})`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-held-queue-completion-"));
+    const identity = { instanceId: "held-queue", processId: process.pid, processBirthId: `${process.pid}:held-queue`, sessionGeneration: 1 };
+    const resolve = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture", getBotId: () => undefined,
+      getJournalPath: () => join(dir, "inbox.json"), getQueueRuntimeIdentity: () => identity,
+      withSourceSerialization: createTelegramConfigStore({ agentDir: dir }).withSourceSerialization });
+    const binding = resolve()!, journal = binding.journal;
+    let current = true, liveBinding = binding.recoveryKey, handlers = 0, disposals = 0, probing = false, reads = 0;
+    let carrier: unknown, prepared: Updates.TelegramDeferredQueueAdmissionPreparation | undefined;
+    const port = { ...journal, completeQueuedExact(...args: Parameters<typeof journal.completeQueuedExact>) {
+      disposals++; const result = journal.completeQueuedExact(...args);
+      if (scenario === "lost-ack" || scenario === "reconciled") throw new Error("Native queue ACK lost after publication");
+      return scenario === "partial-ack" ? { ...result, removedUpdateIds: [] } : result;
+    }, inspectSourceCompletion(...args: Parameters<typeof journal.inspectSourceCompletion>) {
+      reads++; const result = journal.inspectSourceCompletion(...args);
+      if (probing && scenario === "reader-loss") current = false;
+      if (probing && scenario === "reader-throws") throw new Error("Completion observation unavailable");
+      return result;
+    } };
+    const receipt = { queueKind: "prompt" as const, receiptId: "held-queue-receipt", sourceUpdateIds: [100], journalBindingKey: binding.recoveryKey };
+    const worker = createTelegramUpdateAdmissionWorkerRuntime<TelegramJournaledUpdate & TelegramUpdateFlow, string>({ journal: port,
+      getJournalBindingKey: () => liveBinding, getQueueOwnerIdentity: () => identity, hasAuthority: () => current, isContextCurrent: () => current,
+      async defaultHandle() { handlers++; assert.fail("Held commands must not replay the ordinary handler"); },
+      beforeQueueReceiptPublished: scenario === "unscoped" ? undefined : () => journal.read().entries.map(entry => ({
+        ...createTelegramUpdateJournalEntryDigest(entry), journalBindingKey: binding.recoveryKey, completionSha256: "a".repeat(64),
+      })),
+    });
+    try {
+      worker.start(TEST_CONTEXT); await worker.waitForDrain();
+      const held = worker.prepareLiveInput!(TEST_CONTEXT, [100])!;
+      journal.appendBatch([{ update_id: 100, message: { message_id: 11, chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: "/continue" } }]);
+      worker.signal(); await worker.waitForDrain(); assert.equal(held.confirmSaved(), true);
+      const readiness = held.prepareSourceCompletion!()!;
+      assert.ok(held.prepareStatusConsumption!({ source: readiness.snapshot.source, assertCurrent() {},
+        bindCarrier(value) {
+          carrier = value; prepared = Updates.prepareTelegramDeferredQueueAdmission(value);
+          assert.ok(prepared); assert.deepEqual(inspectTelegramDeferredSource(value), readiness.snapshot.source); return true;
+        }, async execute() { assert.equal(reportTelegramQueueAdmission([carrier], [receipt]), true); return true; } }));
+      if (scenario === "reader-before") port.inspectSourceCompletion = () => { assert.fail("Pre-binding replacement cannot lend its reader"); };
+      if (scenario === "disposer-before") port.completeQueuedExact = () => { assert.fail("Pre-binding replacement cannot lend its disposer"); };
+      assert.equal(held.release(() => true), true); await worker.waitForDrain();
+      for (let i = 0; i < 4; i++) await new Promise<void>(resolve => setImmediate(resolve));
+      assert.ok(prepared); assert.equal(worker.isQueueReceiptCommitted(receipt), true);
+      if (scenario !== "unobserved") assert.ok(prepared.inspectReceipt(receipt));
+      assert.equal(prepared.inspectCompletion(receipt), undefined, "Queue publication is not source removal");
+      if (scenario === "changed-source") {
+        const { exists: _exists, serializedBytes: _bytes, ...snapshot } = journal.read();
+        (snapshot.entries[0]!.update.message as { text: string }).text = "/template changed";
+        await writeFile(join(dir, "inbox.json"), JSON.stringify(snapshot));
+      }
+      const removed = worker.completeQueueReceipts({ receipts: [receipt], ctx: TEST_CONTEXT, reason: scenario === "discard" ? "discard" : "prompt-handoff" });
+      assert.equal(removed, !["lost-ack", "reconciled", "partial-ack", "changed-source"].includes(scenario));
+      if (scenario === "reconciled") {
+        assert.equal(prepared.inspectCompletion(receipt), undefined, "Lost disposal ACK cannot be manufactured by observation");
+        assert.equal(worker.completeQueueReceipts({ receipts: [receipt], ctx: TEST_CONTEXT, reason: "prompt-handoff" }), true,
+          "Only the existing queued terminal owner can reconcile its issued scope without another removal");
+      }
+      if (scenario === "changed-receipt") receipt.sourceUpdateIds.push(101);
+      if (scenario === "changed-marker") {
+        const { exists: _exists, serializedBytes: _bytes, ...snapshot } = journal.read();
+        snapshot.sourceCompletions![0]!.completionSha256 = "b".repeat(64);
+        await writeFile(join(dir, "inbox.json"), JSON.stringify(snapshot));
+      }
+      if (scenario === "binding") liveBinding = "foreign";
+      if (scenario === "identity") identity.sessionGeneration++;
+      if (scenario === "context") current = false;
+      if (scenario === "stopped") await worker.stop();
+      if (scenario === "reader-replaced") port.inspectSourceCompletion = () => { assert.fail("Replacement cannot lend completion authority"); };
+      const bytes = await readFile(join(dir, "inbox.json"), "utf8"), previousReads = reads;
+      probing = true;
+      const proof = prepared.inspectCompletion(receipt);
+      assert.deepEqual(proof, ["handoff", "discard", "reconciled"].includes(scenario) ? readiness.snapshot.source : undefined);
+      assert.equal(prepared.inspectCompletion({ ...receipt, sourceUpdateIds: [...receipt.sourceUpdateIds] }), undefined, "Reconstructed objects cannot borrow a native ACK");
+      if (proof) { proof.sourceSha256 = "mutated"; assert.deepEqual(prepared.inspectCompletion(receipt), readiness.snapshot.source); }
+      if (["binding", "identity", "context", "stopped", "reader-before", "disposer-before", "reader-replaced"].includes(scenario)) assert.equal(reads, previousReads, "Ended authority refuses before I/O");
+      assert.equal(await readFile(join(dir, "inbox.json"), "utf8"), bytes, "Observation cannot write, dispose or repair the journal");
+      assert.equal(disposals, scenario === "unscoped" ? 0 : 1); assert.equal(handlers, 0);
+    } finally { await worker.stop(); await rm(dir, { recursive: true, force: true }); }
+  });
+}
+
+test("Only an untouched, unexpired chooser clock with a recorded chooser is revivable after restart", () => {
+  const chooser = { chatId: 7, threadId: 55, messageId: 501 };
+  const waiting = { operatorUserId: 7, publishedAtMs: 1_000, expiresAtMs: 3_601_000, phase: "waiting" as const, chooser };
+  assert.equal(Updates.isRevivableTelegramRoutingInput({ state: "pending", routingInput: waiting }, 2_000), true);
+  assert.equal(Updates.isRevivableTelegramRoutingInput({ state: "pending", routingInput: { ...waiting, phase: "selected" } }, 2_000), false,
+    "a saved selection may already have effects");
+  assert.equal(Updates.isRevivableTelegramRoutingInput({ state: "pending", routingInput: waiting }, 3_601_000), false, "the deadline is final");
+  const { chooser: _chooser, ...unlocated } = waiting;
+  assert.equal(Updates.isRevivableTelegramRoutingInput({ state: "pending", routingInput: unlocated }, 2_000), false,
+    "a clock without a recorded chooser has nothing to revive");
+  assert.equal(Updates.isRevivableTelegramRoutingInput({ state: "queued", routingInput: waiting }, 2_000), false);
+  assert.equal(Updates.isRevivableTelegramRoutingInput({ state: "pending" }, 2_000), false);
 });

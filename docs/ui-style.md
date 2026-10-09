@@ -20,7 +20,8 @@ Use emoji as stable semantic markers, not decoration. Emoji carry transportable 
 
 | Emoji | Meaning | Canonical surfaces | Notes |
 | --- | --- | --- | --- |
-| `🧵` | Telegram/Pi thread routing | Thread chooser headings, unbound-thread warnings, thread lifecycle/status copy | Canonical thread marker. Do not add it to every concrete target button; target buttons use the acknowledged display title or stable-name fallback. |
+| `🧵` | Telegram/Pi thread | Unbound-thread warnings, thread lifecycle/status copy, and concrete thread target buttons in the Reroute and Restore submenus | Canonical thread marker. In route submenus the action lives in the heading and every target button is a thread, so each one carries `🧵` before its acknowledged display title or stable-name fallback. |
+| `🚦` | Routing decision | Root route chooser heading in unbound or temporary tabs (`🚦 Route this message:`) | The heading only asks for a decision; the buttons name each available action. |
 | `📡` | Telegram transport / bridge connection | Instance connected notices, polling/transport role, bridge online copy | Transport is not thread identity; use `🧵` for thread concepts. |
 | `📊` | Status / overview | `/status` command description, status cards or status rows | Use for status summaries, not queue priority. |
 | `🤖` | Model selection | `/model`, model menu headings, model status rows | Keep model-control surfaces visually distinct from thinking. |
@@ -50,11 +51,10 @@ Use emoji as stable semantic markers, not decoration. Emoji carry transportable 
 | `🟥` | Destructive stop command | `/stop` command description | Strong warning at the command/action entrypoint; standalone results use the more precise idle or abort state icon. |
 | `🆕` | New session / fresh start | `/new`, session replacement notices | `/new` replaces the active Pi session while preserving the current classic chat or Thread target; use it only for a real session reset. |
 | `🔄` | Refresh | Queue refresh row and future refresh buttons | Re-fetch/re-render current surface, not transport reconnect. |
-| `↪️` | Reroute to an existing target | Thread chooser buttons that send a captured command/message from one thread to another live thread | Curved arrow means the message arrived here but bends to another target. |
-| `🔁` | Replace/restore mode | Thread replace/restore chooser entrypoints | Opens a second step for moving a Pi instance binding to the current source thread. |
-| `➡️` | Choose replacement target | Thread replace/restore target buttons that select which Pi instance should move to the current thread | Use inside the second replace/restore chooser, not for ordinary reroutes. |
+| `🔀` | Reroute to an existing target | Root `🔀 Reroute: send it to a Pi thread` button, the `🔀 Reroute … to:` submenu heading | Crossing arrows mean the held message branches off to another live thread; its target buttons use `🧵`. |
+| `🔁` | Replace/restore mode | Root `🔁 Restore: move a Pi into this tab` button and the `🔁 Restore into this tab & send …:` submenu heading | Same marker for the action at both levels, like `🔀` for Reroute; its target buttons use `🧵`. |
 | `☑️` | Activate / choose this item | Model detail activation action, generated button-only choice heading | Positive selection cue; use `🟢 Active` for already-current state. |
-| `⛔️` | Cancel source routing | `⛔️ Cancel routing` chooser action and confirmed `⛔️ Routing cancelled.` feedback | Not an abort of active Pi work. Private retention remains mandatory; disposable-tab removal must be stated in the chooser and bound to exact eligible target authority. |
+| `⛔️` | Cancel source routing | `⛔️ Cancel routing` chooser action and confirmed `⛔️ Routing cancelled.` feedback | Not an abort of active Pi work. Private retention remains mandatory; disposable-tab removal stays bound to exact eligible target authority and follows only once every input in the tab is resolved. |
 | `❌` | No / cancel / terminal failure | Confirmation cancel buttons and terminal failure notices | Do not use for a recoverable operation failure that leaves session state intact. |
 | `🗑` | Delete / defer removal | Destructive confirmations and removal reaction | In the queue menu, reversible Keep/Skip selectors replace immediate deletion. |
 
@@ -64,7 +64,7 @@ Use emoji as stable semantic markers, not decoration. Emoji carry transportable 
 | --- | --- | --- | --- |
 | `💤` | Nothing active | No-active-turn notices | Neutral idle result, not an error. |
 | `✅` | Completed successfully | Compaction and other completion notices | Use only after the operation has completed. |
-| `🚫` | Unavailable, denied, or cancelled operation | Missing capability/auth notices, access denial, and compaction cancellation | Callback alerts use the same emoji without bold markup. |
+| `🚫` | Unavailable, denied, or cancelled operation | Missing capability/auth notices, access denial, and compaction cancellation | Callback toasts carry no emoji. |
 | `⚠️` | Recoverable operation failure | Compaction failure notice | The attempted operation failed, but the original session state remains usable. |
 
 ### State Indicators And Button Grammars
@@ -108,7 +108,7 @@ The menu may clear internal Skip but cannot remove a reaction created by the use
 
 Some emoji are intentionally local examples or decorative variants, not global semantics. Empty-queue rotating messages (`🫙`, `🍃`, `🕳`, `🦗`, `🌙`, `🧘`, `🪐`, `🧺`, `🔭`, `🫧`, `🛸`) are copy flavor only and must not become controls. The Guest Mode placeholder frames (`🌎`, `🌍`, `🌏` stepping every second with dots growing once every two seconds) are the same kind of decorative copy: they complete whole 6-frame cycles over at least a ~20 s rotation while a guest answer is pending and then hold the cycle's final frame (a 26 s safety bound caps slow streams), never become controls, and must not carry another meaning. Example extension icons such as `🧪`, `🔧`, and `🗂` are documentation fixtures for companion extensions, not built-in pi-telegram meanings.
 
-Thread UI rule: when a message heading, chooser, or status line is specifically about Telegram/Pi threads or target thread selection, start the heading with `🧵`. Button labels for concrete thread targets should stay clean (`threadName` or slot fallback) and should not add `🧵` to every target button unless the row would otherwise be ambiguous.
+Thread UI rule: thread lifecycle and status copy starts with `🧵`. Route choosers lead with their action instead: `🚦` asks for the routing decision at the root, the `🔀`/`🔁` submenu headings name the chosen action, and the concrete thread target buttons beneath them carry `🧵`, so the same marker always means "a thread".
 
 ## Button Control Hierarchy
 
@@ -232,9 +232,23 @@ Examples:
 - Main menu → Settings: first row is `⬆️ Main menu`.
 - Settings → Voice reply mode: first row is `⬆️ Back`.
 
+## Route Chooser
+
+A message (or All-tab command) held in an unbound or temporary tab gets one route chooser.
+
+- Root text: bold heading `🚦 Route this message:` (or `🚦 Route <code>/start</code>:` for a command), a blank line, then the italic note `The choice expires in 60 minutes.` When Reroute is the only possible action (an All-tab command without a temporary tab), the italic note says `To restore a Pi instead, send a message in a new tab.` instead.
+- Root buttons, one per row and only when available: `🔀 Reroute: send it to a Pi thread`, `🔁 Restore: move a Pi into this tab`, `⛔️ Cancel routing`. The `🚦` heading echoes these three choices, with `⛔️` as the red stop.
+- Submenus start with `⬆️ Back`, which restores the root with its exact original text. Headings name the same subject as the root: bold `🔀 Reroute this message to:` / `🔀 Reroute <code>/start</code> to:`, and `🔁 Restore into this tab & send this message:` / `🔁 Restore into this tab & send <code>/start</code>:`. Every target button below is a thread, written `🧵 <display title>`.
+- Cancel appears only at the root. A confirmed cancellation replaces the chooser with bold `⛔️ Routing cancelled.` and an empty keyboard.
+- Old or expired controls answer `⌛ Routing choice expired.`
+- Tab name: every temporary routing tab is named `🚦 Routing`, whether the bot created it (menu command or threadless prompt) or adopted the `New Chat` tab Telegram opened for a typed input. It is never renamed after its first input.
+- Status → `❌ Pending cancellations` lists one row per protected original: its text, or `📎` plus the caption, file name or the message field carrying Telegram's `file_id`.
+
 ## Pi Connection Notices
 
 Pi TUI connection notices use plain text: a short known cause and one recovery action. Unknown failures use a generic connection-failed notice with `/telegram-status --debug`; never interpolate raw exceptions, credentials, stack traces or Pi lifecycle guidance. Technical evidence belongs in the redacted runtime recorder. Failed disconnect must retain the instruction to keep Pi open; do not also rethrow the same error as a second Pi banner. These TUI notices are distinct from Telegram bot message cards below.
+
+The compact TUI status bar preserves the acknowledged Thread display title and its casing, including manual `/name` overrides. Names equal to `Telegram`, `Leader` or `Follower` are ordinary titles, not fallback markers. Connection states, including disconnected and error, do not replace a supplied title; only an absent or empty title uses the generic `telegram` label.
 
 ## Message Cards
 
@@ -244,10 +258,13 @@ Rules:
 
 - Start with a bold heading or, for dialogs, a bold question.
 - Format standalone notices as one fully bold line: relevant emoji, one space, concise sentence, and terminal period. Menu or chooser headings use the same fully bold form but end in a colon when controls or detail follow. Empty-queue headings are the deliberate exception: fully bold, with no trailing period or colon.
+- List items in bot-authored messages and cards start with `<code>-</code>` and a space, the same marker rendered Markdown lists use; never `•`.
 - Keep the emoji and complete sentence or heading inside the single bold span; do not bold only a fragment. A material name or phrase may receive nested italic emphasis without breaking the outer bold hierarchy—for example `<b>📡 Instance <i>Cedar</i> connected.</b>`.
 - Apply the same hierarchy to success, progress, empty, busy, unavailable, cancellation, and failure notices.
 - Once an action has settled, describe only the completed result in completed-state language. Do not append transitional copy such as “returning” or “starting”; use a separate progress surface only while work is genuinely still pending.
-- Transient callback toasts remain plain text with the relevant emoji and concise wording, without a terminal sentence period. The shared typed callback-answer boundary applies this on direct and follower delivery while preserving question/exclamation marks and ellipses. In-chat notices, headings, blocking alerts and explicit raw API payloads retain their own punctuation contracts.
+- Distinguish the two surfaces. An in-chat notice stays in the conversation (a sent message or an edited chooser/menu/card) and uses the bold, period-terminated form above. A callback toast is the client's fleeting tooltip that vanishes after a couple of seconds: concise plain text with no emoji and no terminal sentence period; question/exclamation marks and ellipses stay. Every toast follows this one form, so emoji meanings in the registry apply to messages, headings and buttons, never to toasts.
+- Write every notice and toast in its final form where it is used. No delivery boundary rewrites punctuation, so text shared by both surfaces is two separate strings, each in its own form; companion `ctx.answerCallback` text likewise reaches the client exactly as written.
+- Navigation answers silently: opening a submenu or going Back, in the main menu and in temporary routing tabs alike, edits the message and acknowledges the tap without a toast. The edited message is the feedback.
 - Setting detail cards may include an emoji in the heading, then a colon and the current value in `<code>`.
 - Explain what the setting does and what the options mean only as much as needed.
 - Order setting value descriptions exactly like the chooser: rows top-to-bottom and values in a shared row left-to-right. Keep `(default)` on the actual default wherever it falls; default status never changes order.

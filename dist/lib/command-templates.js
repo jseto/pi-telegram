@@ -6,17 +6,6 @@
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { extname, isAbsolute, normalize, resolve } from "node:path";
-const COMMAND_TEMPLATE_RISK_LABEL_ORDER = [
-    "risk.shell",
-    "risk.eval",
-    "risk.destructive_fs",
-    "risk.broad_fs_write",
-    "risk.external_side_effect",
-    "risk.secret_touching",
-    "risk.network",
-    "risk.long_running",
-    "risk.platform_specific",
-];
 function normalizeCommandTemplateArgs(value) {
     if (!Array.isArray(value))
         return [];
@@ -80,151 +69,6 @@ function resolveCommandTemplateRepeat(value, values = {}) {
     }
     throw new Error("Command template repeat must be a positive integer or {array.length}.");
 }
-function getExecutableName(command) {
-    if (!command)
-        return "";
-    return command.split(/[\\/]/).pop()?.toLowerCase() ?? "";
-}
-function matchesFlag(arg, flag) {
-    if (arg === flag)
-        return true;
-    if (/^-[A-Za-z]$/.test(flag) && /^-[A-Za-z]+$/.test(arg))
-        return arg.slice(1).includes(flag.slice(1));
-    return false;
-}
-function hasAnyFlag(args, flags) {
-    return args.some((arg) => flags.some((flag) => matchesFlag(arg, flag)));
-}
-function hasRiskyPathArg(args) {
-    return args.some((arg) => arg === "/" ||
-        arg === "~" ||
-        arg === "./" ||
-        arg === "../" ||
-        arg.includes("{") ||
-        arg.startsWith("~/") ||
-        arg.startsWith("/"));
-}
-function sortRiskLabels(labels) {
-    const unique = new Set(labels);
-    return COMMAND_TEMPLATE_RISK_LABEL_ORDER.filter((label) => unique.has(label));
-}
-function hasAnyArg(args, values) {
-    return args.some((arg) => values.includes(arg.toLowerCase()));
-}
-function hasSecretTouchingText(parts) {
-    return parts.some((part) => /(^|[{}._\-\s/])(?:secret|token|password|passwd|credential|api[_-]?key|private[_-]?key|\.env|ssh[_-]?key)(?:[{}._\-\s/]|$)/i.test(part));
-}
-function getLeafCommandTemplateRiskLabels(config) {
-    const parts = splitCommandTemplate(config.template);
-    const command = getExecutableName(parts[0]);
-    const args = parts.slice(1);
-    const labels = new Set();
-    if (["bash", "sh", "zsh", "fish"].includes(command)) {
-        labels.add("risk.shell");
-        if (hasAnyFlag(args, ["-c"]))
-            labels.add("risk.eval");
-    }
-    if (["node", "deno", "bun"].includes(command) &&
-        hasAnyFlag(args, ["-e", "--eval"])) {
-        labels.add("risk.eval");
-    }
-    if (["python", "python3", "perl", "ruby"].includes(command) &&
-        hasAnyFlag(args, ["-c", "-e"])) {
-        labels.add("risk.eval");
-    }
-    if (command === "rm" &&
-        (args.some((arg) => /^-[^-]*r/.test(arg) || /^-[^-]*f/.test(arg)) ||
-            hasRiskyPathArg(args))) {
-        labels.add("risk.destructive_fs");
-    }
-    if (["mv", "cp", "rsync"].includes(command) && hasRiskyPathArg(args)) {
-        labels.add("risk.broad_fs_write");
-    }
-    if ([
-        "curl",
-        "wget",
-        "ssh",
-        "scp",
-        "sftp",
-        "rsync",
-        "nc",
-        "ncat",
-        "telnet",
-        "ftp",
-    ].includes(command) ||
-        (command === "git" &&
-            hasAnyArg(args, ["clone", "fetch", "pull", "push", "ls-remote"])) ||
-        ["npm", "pnpm", "yarn", "pip", "cargo"].includes(command)) {
-        labels.add("risk.network");
-    }
-    if (["gh", "glab", "hub", "kubectl", "terraform"].includes(command) ||
-        (command === "git" && hasAnyArg(args, ["push"])) ||
-        (["npm", "pnpm", "yarn"].includes(command) &&
-            hasAnyArg(args, ["publish", "login", "logout", "deprecate"]))) {
-        labels.add("risk.external_side_effect");
-    }
-    if (command === "sleep" ||
-        command === "watch" ||
-        (command === "tail" && hasAnyFlag(args, ["-f"])) ||
-        hasAnyArg(args, ["--watch", "--serve", "serve"])) {
-        labels.add("risk.long_running");
-    }
-    if ([
-        "systemctl",
-        "launchctl",
-        "osascript",
-        "open",
-        "xdg-open",
-        "powershell",
-        "pwsh",
-        "cmd.exe",
-        "apt",
-        "apt-get",
-        "dnf",
-        "yum",
-        "brew",
-        "pacman",
-        "apk",
-        "xclip",
-        "wl-copy",
-    ].includes(command)) {
-        labels.add("risk.platform_specific");
-    }
-    if (["pass", "gpg", "ssh-add"].includes(command) ||
-        hasSecretTouchingText(parts)) {
-        labels.add("risk.secret_touching");
-    }
-    return sortRiskLabels(labels);
-}
-function getLeafCommandTemplateWarnings(config) {
-    const parts = splitCommandTemplate(config.template);
-    const command = getExecutableName(parts[0]);
-    const args = parts.slice(1);
-    const warnings = [];
-    if (["bash", "sh", "zsh", "fish"].includes(command)) {
-        const shellContent = hasAnyFlag(args, ["-c"])
-            ? "shell command strings"
-            : "shell scripts";
-        warnings.push(`${config.label ?? command}: invokes ${command}; ${shellContent} are trusted executable content and are not sandboxed by command-template argv splitting. Mitigation: keep scripts local, reviewed, and parameterized with explicit placeholders.`);
-    }
-    if (["node", "deno", "bun"].includes(command) &&
-        hasAnyFlag(args, ["-e", "--eval"])) {
-        warnings.push(`${config.label ?? command}: invokes ${command} eval mode; code strings are trusted executable content and are not sandboxed. Mitigation: prefer a checked-in script file or keep eval input fixed and reviewed.`);
-    }
-    if (["python", "python3", "perl", "ruby"].includes(command) &&
-        hasAnyFlag(args, ["-c", "-e"])) {
-        warnings.push(`${config.label ?? command}: invokes ${command} code-eval mode; code strings are trusted executable content and are not sandboxed. Mitigation: prefer a checked-in script file or keep eval input fixed and reviewed.`);
-    }
-    if (command === "rm" &&
-        (args.some((arg) => /^-[^-]*r/.test(arg) || /^-[^-]*f/.test(arg)) ||
-            hasRiskyPathArg(args))) {
-        warnings.push(`${config.label ?? command}: removes filesystem paths; verify placeholders and paths before running trusted destructive commands. Mitigation: constrain path placeholders and consider dry-run or explicit confirmation.`);
-    }
-    if (["mv", "cp", "rsync"].includes(command) && hasRiskyPathArg(args)) {
-        warnings.push(`${config.label ?? command}: mutates broad filesystem paths; verify placeholders and paths before running trusted commands. Mitigation: constrain path placeholders and prefer narrow source/destination paths.`);
-    }
-    return warnings;
-}
 function pad(value, width) {
     return String(value).padStart(width, "0");
 }
@@ -266,6 +110,9 @@ export function expandCommandTemplateConfigs(config, inherited = {}) {
     const inheritedDefaults = normalizeCommandTemplateDefaults(inherited.defaults);
     const ownDefaults = resolveInheritedDefaultReferences(normalizeCommandTemplateDefaults(normalizedConfig.defaults), inheritedDefaults);
     const context = {
+        ...(inherited.inheritedWhen?.length
+            ? { inheritedWhen: inherited.inheritedWhen }
+            : {}),
         ...(inherited.args !== undefined ? { args: inherited.args } : {}),
         ...(inheritedDefaults ? { defaults: inheritedDefaults } : {}),
         ...(normalizedConfig.args !== undefined
@@ -279,18 +126,21 @@ export function expandCommandTemplateConfigs(config, inherited = {}) {
     if (repeated) {
         return repeated.flatMap((step) => expandCommandTemplateConfigs(step, context));
     }
-    const recoverConfig = normalizeRecoverConfig(normalizedConfig.recover);
-    const recoverSteps = recoverConfig
-        ? expandCommandTemplateConfigs(recoverConfig, context)
-        : [];
+    // `recover` is cleanup between failed retries, never a sequence step; runners attach it per leaf.
     if (Array.isArray(normalizedConfig.template)) {
-        return [
-            ...normalizedConfig.template.flatMap((step) => expandCommandTemplateConfigs(step, context)),
-            ...recoverSteps,
-        ];
+        const childContext = normalizedConfig.when === undefined
+            ? context
+            : {
+                ...context,
+                inheritedWhen: [
+                    ...(context.inheritedWhen ?? []),
+                    normalizedConfig.when,
+                ],
+            };
+        return normalizedConfig.template.flatMap((step) => expandCommandTemplateConfigs(step, childContext));
     }
     if (typeof normalizedConfig.template !== "string")
-        return recoverSteps;
+        return [];
     return [
         {
             ...normalizedConfig,
@@ -298,16 +148,45 @@ export function expandCommandTemplateConfigs(config, inherited = {}) {
             template: normalizedConfig.template,
             retry: normalizedConfig.retry,
         },
-        ...recoverSteps,
     ];
 }
-export function getCommandTemplateWarnings(config) {
-    return [
-        ...new Set(expandCommandTemplateConfigs(config).flatMap((leaf) => getLeafCommandTemplateWarnings(leaf))),
-    ];
+/** Whether a node's own and enclosing `when` guards all pass for its resolved placeholder values. */
+export function shouldRunCommandTemplateConfig(config, values) {
+    if (typeof config === "string")
+        return true;
+    const inheritedWhen = "inheritedWhen" in config ? (config.inheritedWhen ?? []) : [];
+    if (config.when === undefined && inheritedWhen.length === 0)
+        return true;
+    const resolved = { ...getCommandTemplateDefaults(config), ...values };
+    return [...inheritedWhen, config.when].every((condition) => shouldRunCommandTemplateNode(condition, resolved));
 }
-export function getCommandTemplateRiskLabels(config) {
-    return sortRiskLabels(expandCommandTemplateConfigs(config).flatMap((leaf) => getLeafCommandTemplateRiskLabels(leaf)));
+/** A node's `recover` template as one cleanup run: output ignored, failure stops retries unless a leaf opts into `continue`. */
+export function createCommandTemplateRecovery(config, values, options) {
+    if (typeof config === "string")
+        return undefined;
+    const recoverConfig = normalizeRecoverConfig(config.recover);
+    if (!recoverConfig)
+        return undefined;
+    const steps = expandCommandTemplateConfigs(recoverConfig, {
+        ...(config.args !== undefined ? { args: config.args } : {}),
+        ...(config.defaults !== undefined ? { defaults: config.defaults } : {}),
+    });
+    return async () => {
+        for (const step of steps) {
+            if (!shouldRunCommandTemplateConfig(step, values))
+                continue;
+            const invocation = buildCommandTemplateInvocation(step, values, options.cwd, { missingLabel: "command template recover" });
+            const result = await options.execCommand(invocation.command, invocation.args, {
+                cwd: options.cwd,
+                ...(options.timeout !== undefined
+                    ? { timeout: options.timeout }
+                    : {}),
+            });
+            if (result.code !== 0 && step.failure !== "continue") {
+                throw new Error(`Command template recover exited with code ${result.code}${result.killed ? " (killed)" : ""}`);
+            }
+        }
+    };
 }
 function parseCommandTemplateArgToken(value) {
     const separatorIndex = value.indexOf("=");
@@ -597,7 +476,43 @@ function resolveCommandTemplateValue(content, values, missingLabel, depth = 0) {
         return expression;
     return undefined;
 }
-export function substituteCommandTemplateToken(token, values, missingLabel = "command template", depth = 0) {
+/** Resolve one optional non-negative numeric control field, substituting a template token when given as text. */
+export function resolveCommandTemplateNumericField(value, values, label) {
+    if (value === undefined)
+        return undefined;
+    const resolved = typeof value === "string"
+        ? substituteCommandTemplateToken(value, values, label)
+        : value;
+    if (resolved === "")
+        return undefined;
+    const numeric = Number(resolved);
+    if (!Number.isFinite(numeric) || numeric < 0)
+        throw new Error(`Command template ${label} must be a non-negative number.`);
+    return numeric;
+}
+/** A node's own `timeout`; string leaves carry none. */
+export function getCommandTemplateConfiguredTimeout(config) {
+    const timeout = typeof config === "string" ? undefined : config?.timeout;
+    return resolveCommandTemplateNumericField(timeout, {}, "timeout");
+}
+/**
+ * Bound one composed step by its own timeout and the handler budget left after `elapsedMs`.
+ * Without `elapsedMs` the step receives the full budget.
+ */
+export function getCommandTemplateStepTimeout(budgetMs, step, elapsedMs) {
+    const remaining = elapsedMs === undefined ? budgetMs : Math.max(1, budgetMs - elapsedMs);
+    const stepTimeout = getCommandTemplateConfiguredTimeout(step);
+    return stepTimeout === undefined
+        ? remaining
+        : Math.min(stepTimeout, remaining);
+}
+/** Array templates expand into ordered composition steps; single-command templates have none. */
+export function getCommandTemplateCompositionSteps(config) {
+    return Array.isArray(config.template)
+        ? expandCommandTemplateConfigs(config)
+        : [];
+}
+function substituteCommandTemplateToken(token, values, missingLabel = "command template", depth = 0) {
     return token.replace(/\{([^{}]+)\}/g, (_match, content) => {
         const resolved = resolveCommandTemplateValue(content, values, missingLabel, depth);
         if (resolved !== undefined)
@@ -618,6 +533,8 @@ export async function execCommandTemplate(command, args, options = {}) {
         if (result.code === 0)
             return result;
         lastResult = result;
+        if (attempt < maxAttempts)
+            await options.recover?.();
     }
     return lastResult;
 }
@@ -627,7 +544,7 @@ function escapeWindowsCommand(value) {
 }
 function escapeWindowsCommandArgument(value, doubleEscapeMetaChars) {
     let escaped = value
-        .replace(/(?=(\\+?)?)\1"/g, "$1$1\\\"")
+        .replace(/(?=(\\+?)?)\1"/g, '$1$1\\"')
         .replace(/(?=(\\+?)?)\1$/g, "$1$1");
     escaped = `"${escaped}"`.replace(WINDOWS_COMMAND_META_CHARS, "^$1");
     return doubleEscapeMetaChars
@@ -640,8 +557,7 @@ function resolveCommandTemplateSpawn(command, args) {
         return { command, args };
     }
     const normalizedCommand = normalize(command);
-    const isNodeModulesShim = /[\\/]node_modules[\\/]\.bin[\\/][^\\/]+\.cmd$/iu
-        .test(normalizedCommand);
+    const isNodeModulesShim = /[\\/]node_modules[\\/]\.bin[\\/][^\\/]+\.cmd$/iu.test(normalizedCommand);
     const shellCommand = [
         escapeWindowsCommand(normalizedCommand),
         ...args.map((arg) => escapeWindowsCommandArgument(arg, isNodeModulesShim)),

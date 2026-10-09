@@ -3,11 +3,12 @@
  * Zones: telegram ui, settings controls, menu composition
  * Owns hidden settings-menu rendering, settings callbacks, and persisted toggle wiring
  */
-import type { TelegramActivityVerbosity, TelegramAssistantRenderingMode, TelegramTimeMode, TelegramThreadDisplayMode } from "./config.ts";
+import type { TelegramActivityVerbosity, TelegramAssistantRenderingMode, TelegramThreadDisplayMode, TelegramTimeMode } from "./config.ts";
 import type { TelegramInlineKeyboardMarkup } from "./keyboard.ts";
-import type { TelegramModelMenuState } from "./menu-model.ts";
+import { type TelegramMenuMessageRuntimeDeps, type TelegramModelMenuState } from "./menu-model.ts";
 import type { MenuModel } from "./model.ts";
 import { type TelegramSectionRegistry } from "./sections.ts";
+import type { TelegramApiCallOptions } from "./telegram-api.ts";
 import type { TelegramVoiceReplyMode } from "./voice.ts";
 export type TelegramSettingsMenuReplyMarkup = TelegramInlineKeyboardMarkup;
 export interface TelegramSettingsStateDeps {
@@ -51,7 +52,7 @@ export interface TelegramSettingsMenuCallbackDeps extends TelegramSettingsMutati
     sectionRegistry?: TelegramSectionRegistry;
 }
 export interface TelegramSettingsMenuRuntime<TContext> {
-    openSettingsMenu: (chatId: number, replyToMessageId: number, ctx: TContext) => Promise<void>;
+    openSettingsMenu: (chatId: number, replyToMessageId: number, ctx: TContext, threadId?: number, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<void>;
     handleCallbackQuery: (query: {
         id: string;
         data?: string;
@@ -74,7 +75,7 @@ export interface TelegramSettingsMenuRuntimeDeps<TContext, TModel extends MenuMo
     getStoredModelMenuState: (messageId: number | undefined, chatId?: number) => TelegramModelMenuState<TModel> | undefined;
     storeModelMenuState: (state: TelegramModelMenuState<TModel>) => void;
     editInteractiveMessage: (chatId: number, messageId: number, text: string, mode: "markdown" | "html" | "plain", replyMarkup: TelegramSettingsMenuReplyMarkup) => Promise<void>;
-    sendInteractiveMessage: (chatId: number, text: string, mode: "markdown" | "html" | "plain", replyMarkup: TelegramSettingsMenuReplyMarkup) => Promise<number | undefined>;
+    sendInteractiveMessage: TelegramMenuMessageRuntimeDeps["sendInteractiveMessage"];
     answerCallbackQuery: (callbackQueryId: string, text?: string) => Promise<void>;
 }
 export declare function buildTelegramSettingsMenuText(): string;

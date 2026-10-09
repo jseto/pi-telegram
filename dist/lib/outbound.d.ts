@@ -4,12 +4,12 @@
  * Owns configured outbound handler execution, text transforms, public assistant-output reply composition and mutation fencing, voice-file generation/delivery, runtime-event bridge, and compatibility re-exports; assistant markup parsing lives in outbound-markup and button callback actions live in outbound-buttons
  */
 import type { TelegramAssistantSegmentEvent } from "./activity.ts";
-import * as Replies from "./replies.ts";
-import type { TelegramPreparedPreviewDelivery } from "./preview.ts";
-import type { TelegramEditMessageTextBody, TelegramSendMessageBody, TelegramSendRichMessageBody, TelegramSentMessage } from "./telegram-api.ts";
 import { type TelegramButtonActionStore, type TelegramOutboundButtonBinding, type TelegramOutboundButtonMarkup } from "./outbound-buttons.ts";
 import { type TelegramVoiceReplyItem } from "./outbound-markup.ts";
+import type { TelegramPreparedPreviewDelivery } from "./preview.ts";
+import * as Replies from "./replies.ts";
 import type { TelegramTarget } from "./target.ts";
+import type { TelegramEditMessageTextBody, TelegramSendMessageBody, TelegramSendRichMessageBody, TelegramSentMessage } from "./telegram-api.ts";
 import { type CommandTemplateObjectConfig } from "./command-templates.ts";
 /**
  * Record a runtime event that appears in `/telegram-status`.
@@ -27,13 +27,13 @@ export interface TelegramOutboundHandlerConfig extends CommandTemplateObjectConf
     output?: string;
     timeout?: number | string;
 }
-export { normalizeMarkdownAfterVoiceExtraction, planTelegramVoiceReply, stripTelegramCommentMarkupForDelivery, stripTelegramCommentMarkupForPreview, stripTelegramVoiceMarkupForPreview, type TelegramVoiceReplyItem, type TelegramVoiceReplyPlan, } from "./outbound-markup.ts";
 export interface TelegramVoiceExecOptions {
     cwd?: string;
     timeout?: number;
     signal?: AbortSignal;
     stdin?: string;
     retry?: number;
+    recover?: () => Promise<void>;
 }
 export interface TelegramVoiceExecResult {
     stdout: string;
@@ -74,11 +74,11 @@ export interface TelegramOutboundTextReplyRuntimeDeps<TReplyMarkup = unknown> {
     sendTextReply: (chatId: number, replyToMessageId: number | undefined, text: string, options?: {
         parseMode?: "HTML";
         target?: TelegramTarget;
-    }) => Promise<number | undefined>;
+    } & Pick<Replies.TelegramReplyTargetOptions, "assertAuthority">) => Promise<number | undefined>;
     sendMarkdownReply: (chatId: number, replyToMessageId: number | undefined, markdown: string, options?: {
         replyMarkup?: TReplyMarkup;
         target?: TelegramTarget;
-    }) => Promise<number | undefined>;
+    } & Pick<Replies.TelegramReplyTargetOptions, "assertAuthority">) => Promise<number | undefined>;
     cwd?: string;
     recordRuntimeEvent?: TelegramVoiceReplySenderDeps["recordRuntimeEvent"];
 }

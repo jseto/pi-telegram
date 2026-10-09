@@ -8,12 +8,52 @@ import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import type { MenuModel } from "../lib/model.ts";
+
+for (const name of ["status", "abort"] as const) for (const mode of ["current", "unavailable", "unsupported", "missing-command", "missing-menu", "recipient-port", "command-port", "availability-port", "command-name", "menu-port", "deliver-port", "wrong-context", "wrong-target", "wrong-recipient", "target-copy", "getter-command"] as const) {
+  test(`Selected command binding composes captured owners without activation or ordinary fallback (${name}/${mode})`, () => {
+    const ctx = { id: "ctx" }, target = { chatId: 7, threadId: 42 };
+    let active = mode !== "unavailable", preparations = 0, effects = 0, getterDrift = false;
+    const assertRecipientCurrent = () => { effects++; assert.fail("Preparation must not activate the future recipient"); };
+    const recipient = { isCurrent: () => { if (getterDrift) command.prepareHeldCommand = () => undefined; return active; }, assertRecipientCurrent };
+    const command = { canPrepareHeldCommand: () => mode !== "unsupported", prepareHeldCommand(...args: Parameters<Parameters<typeof createTelegramFollowerSelectedCommandBinding<typeof ctx, MenuModel>>[0]["command"]["prepareHeldCommand"]>) {
+      preparations++; assert.equal(args[0], name); assert.equal(args[2], ctx); assert.equal(args[3].assertRecipientCurrent, assertRecipientCurrent); assert.deepEqual(args[3].target, { chatId: 7, threadId: 42 });
+      assert.equal(typeof args[4]?.[name === "status" ? "showStatus" : "sendTextReply"], "function"); return undefined;
+    } };
+    const noEffect = () => { effects++; assert.fail("No rendering/state/transport during availability or preparation"); };
+    const deps = { name: name as string, ctx, operationId: "operation", registrationGeneration: "registration", target, recipient, command,
+      menu: { getModelMenuState: async () => noEffect(), getActiveModel: () => undefined, getThinkingLevel: () => "medium" as const,
+        buildStatusHtml: noEffect, storeModelMenuState: noEffect, isIdle: () => true, canOfferInFlightModelSwitch: () => false },
+      deliver: async () => noEffect(), recordOwnership: noEffect };
+    if (mode === "missing-command") Reflect.deleteProperty(command, "prepareHeldCommand");
+    if (mode === "missing-menu") Reflect.deleteProperty(deps.menu, "getModelMenuState");
+    const bound = createTelegramFollowerSelectedCommandBinding(deps);
+    if (["unavailable", "unsupported", "missing-command", "missing-menu"].includes(mode)) { assert.equal(bound, undefined); assert.equal(effects, 0); return; }
+    assert.ok(bound); assert.equal(bound.isCurrent(), true); assert.equal(bound.assertRecipientCurrent, assertRecipientCurrent);
+    if (mode === "target-copy") target.threadId = 99;
+    if (mode === "recipient-port") recipient.assertRecipientCurrent = () => noEffect();
+    if (mode === "command-port") command.prepareHeldCommand = () => undefined;
+    if (mode === "availability-port") command.canPrepareHeldCommand = () => true;
+    if (mode === "command-name") deps.name = "stop";
+    if (mode === "menu-port") deps.menu.getModelMenuState = async () => noEffect();
+    if (mode === "deliver-port") deps.deliver = async () => noEffect();
+    if (mode === "getter-command") getterDrift = true;
+    if (["recipient-port", "command-port", "availability-port", "command-name", "menu-port", "deliver-port", "getter-command"].includes(mode)) assert.equal(bound.isCurrent(), false);
+    bound.prepare(undefined as unknown as Parameters<typeof bound.prepare>[0], mode === "wrong-context" ? { id: "other" } : ctx,
+      { target: mode === "wrong-target" ? { chatId: 7, threadId: 99 } : { chatId: 7, threadId: 42 }, assertSourceCurrent: noEffect,
+        assertRecipientCurrent: mode === "wrong-recipient" ? noEffect : assertRecipientCurrent });
+    assert.equal(preparations, mode === "current" || mode === "target-copy" ? 1 : 0); assert.equal(effects, 0);
+    active = false; assert.equal(bound.isCurrent(), false);
+  });
+}
 
 import {
   createTelegramActivityBindingRuntime,
   createTelegramAgentMessageToolRoutingRuntime,
   createTelegramAssistantOutputBindingRuntime,
   createTelegramQueueBindingRuntime,
+  createTelegramLiveTargetWorkObserver,
+  createTelegramFollowerSelectedCommandBinding,
   createTelegramGenerativeAppBoundButtonActionInvoker,
   createTelegramGenerativeAppLiveSurfaceBinding,
   registerTelegramCommandsAndTools,
@@ -26,13 +66,125 @@ import * as BusApi from "../lib/bus-api.ts";
 import * as BusFollower from "../lib/bus-follower.ts";
 import * as BusLeader from "../lib/bus-leader.ts";
 import type { TelegramBridgeApiRuntime } from "../lib/telegram-api.ts";
+import { createTelegramApiTargetActivityRuntime } from "../lib/telegram-api.ts";
+import { createTelegramDeliveryLifecycleHooks, createTelegramDeliveryRuntime } from "../lib/delivery.ts";
 import * as Outbound from "../lib/outbound.ts";
 import * as OutboundAttachments from "../lib/outbound-attachments.ts";
 import * as Queue from "../lib/queue.ts";
 import * as Runtime from "../lib/runtime.ts";
+import * as Commands from "../lib/commands.ts";
+import * as Menu from "../lib/menu.ts";
+import * as Replies from "../lib/replies.ts";
+import * as Journal from "../lib/journal.ts";
+import * as Updates from "../lib/updates.ts";
+import { prepareLiveRebindThreadCleanup } from "../lib/thread-reconciler.ts";
 import * as GenerativeApps from "../lib/generative-apps.ts";
 import type { TelegramQueueAdmissionItemLike } from "../lib/updates.ts";
 import type { ExtensionAPI, ExtensionContext } from "../lib/pi.ts";
+
+test("Live target work projection observes existing work and pre-API delivery owners without mutation", async () => {
+  const old = { chatId: 7, threadId: 10 }, next = { chatId: 7, threadId: 42 }, ctx = {};
+  const lifecycle = Runtime.createTelegramBridgeRuntime().lifecycle;
+  const queue = Queue.createTelegramQueueStore(), activeTurn = Queue.createTelegramActiveTurnStore();
+  const publication = Activity.createTelegramActivityPublicationRuntime();
+  const activity = Activity.createTelegramActivityBridgeRuntime({ generation: "work" });
+  const api = createTelegramApiTargetActivityRuntime();
+  const started = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>();
+  let idle = true, pendingMessages = false, pendingControl = false;
+  const delivery = createTelegramDeliveryLifecycleHooks(() => createTelegramDeliveryRuntime({ generation: "work", getActiveTurnTarget: () => old,
+    getInstanceTarget: () => next, getAggregateTarget: () => next, isExplicitTargetAuthorized: () => true,
+    renderView: view => [{ text: view.text, parseMode: "markdown" }],
+    async sendChunk() { started.resolve(); await finish.promise; return 1; },
+    async editChunk() {}, async deleteMessage() {}, async sendChatAction() {},
+  }));
+  const observe = createTelegramLiveTargetWorkObserver({ queue, activeTurn, lifecycle, publication, activity, delivery, api,
+    isIdle: () => idle, hasPendingMessages: () => pendingMessages, hasPendingControl: () => pendingControl });
+  const clear = { sessionBusy: false, targetWork: false, deliveryPending: false, unknown: false };
+  const turn: Queue.PendingTelegramTurn = { kind: "prompt", chatId: 7, target: old, queueOrder: 1, queueLane: "default", laneOrder: 1,
+    statusSummary: "held", replyToMessageId: 1, sourceMessageIds: [1], queuedAttachments: [], content: [], historyText: "", reactionSuppressionEmoji: "💩" };
+  assert.equal(observe(old, ctx).unknown, true, "Unavailable activity/delivery owners are not settled");
+  activity.onSessionStart?.(); await delivery.onSessionStart();
+  try {
+    assert.deepEqual(observe(old, ctx), clear);
+    for (const flag of ["idle", "messages", "control", "dispatch", "compaction", "tools"] as const) {
+      if (flag === "idle") idle = false;
+      if (flag === "messages") pendingMessages = true;
+      if (flag === "control") pendingControl = true;
+      if (flag === "dispatch") lifecycle.setDispatchPending(true);
+      if (flag === "compaction") lifecycle.setCompactionInProgress(true);
+      if (flag === "tools") lifecycle.setActiveToolExecutions(1);
+      assert.deepEqual(observe(old, ctx), { ...clear, sessionBusy: true }, flag);
+      idle = true; pendingMessages = pendingControl = false; lifecycle.clearDispatchPending(); lifecycle.setCompactionInProgress(false); lifecycle.resetActiveToolExecutions();
+    }
+    activeTurn.set(turn); queue.setQueuedItems([turn]);
+    const queued = queue.getQueuedItems(), active = structuredClone(activeTurn.get());
+    assert.equal(observe(old, ctx).targetWork, true, "Skip/receipt-held work still owns its captured target");
+    assert.equal(observe(next, ctx).targetWork, false, "Local rebinding cannot move captured work to the new target");
+    assert.equal(queue.getQueuedItems(), queued); assert.deepEqual(activeTurn.get(), active);
+    activeTurn.clear(); assert.equal(observe(old, ctx).targetWork, true, "A skipped physical item still owns its receipt/delivery target");
+    queue.setQueuedItems([]);
+    const reservation = publication.reserve();
+    assert.deepEqual(observe(old, ctx), { ...clear, deliveryPending: true }, "A final reservation protects delivery before any API call");
+    await reservation.publish(async () => {}); assert.deepEqual(observe(old, ctx), clear);
+    const endApi = api.begin("editMessageText", { chat_id: 7, message_id: 1 });
+    assert.equal(observe(old, ctx).deliveryPending, true, "Unaddressed chat edits protect all Threads in that chat");
+    assert.equal(observe({ chatId: 8, threadId: 10 }, ctx).deliveryPending, false);
+    endApi(); assert.deepEqual(observe(old, ctx), clear);
+    // The logical Delivery queue is occupied before and between actual transport calls.
+    const { sendTelegramView } = await import("../lib/delivery.ts");
+    const sending = sendTelegramView({ text: "old reply" }, { scope: { kind: "target", target: old } });
+    await started.promise;
+    const second = sendTelegramView({ text: "queued reply" }, { scope: { kind: "target", target: old } });
+    assert.equal(api.hasPendingTarget(old), false, "No fake API request is needed to expose logical pending delivery");
+    assert.equal(observe(old, ctx).deliveryPending, true); assert.equal(observe(next, ctx).deliveryPending, false);
+    finish.resolve(); await Promise.all([sending, second]); assert.deepEqual(observe(old, ctx), clear);
+    queue.setQueuedItems([{ ...turn, target: undefined }]);
+    assert.equal(observe(old, ctx).unknown, true, "An unaddressed same-chat item is not known-clear");
+    queue.setQueuedItems([{ ...turn, target: { chatId: 8, threadId: 10 } }]);
+    assert.equal(observe(old, ctx).unknown, true, "Contradictory captured namespace is not known-clear");
+  } finally { finish.resolve(); activity.onSessionShutdown(); await delivery.onSessionShutdown(); }
+  assert.equal(observe(old, ctx).unknown, true);
+});
+
+for (const stopped of [false, true]) test(`Native disposed old-target command rendering remains protected through pre-API work and late uncertainty (${stopped ? "stopped" : "running"})`, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-command-work-")), old = { chatId: 7, threadId: 10 }, next = { chatId: 7, threadId: 42 }, ctx = {};
+  const publication = Activity.createTelegramActivityPublicationRuntime(), activity = Activity.createTelegramActivityBridgeRuntime({ generation: "command-work" });
+  const api = createTelegramApiTargetActivityRuntime(), lifecycle = Runtime.createTelegramBridgeRuntime().lifecycle;
+  const entered = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>(), renderedDone = Promise.withResolvers<void>();
+  const requests: Record<string, unknown>[] = [];
+  const delivery = createTelegramDeliveryLifecycleHooks(() => createTelegramDeliveryRuntime({ generation: "command-work", getActiveTurnTarget: () => old,
+    getInstanceTarget: () => next, getAggregateTarget: () => next, isExplicitTargetAuthorized: () => true, renderView: view => [{ text: view.text, parseMode: "markdown" }],
+    async sendChunk() { return 1; }, async editChunk() {}, async deleteMessage() {}, async sendChatAction() {} }));
+  const observe = createTelegramLiveTargetWorkObserver({ publication, activity, delivery, api, lifecycle, queue: Queue.createTelegramQueueStore(), activeTurn: Queue.createTelegramActiveTurnStore(),
+    isIdle: () => true, hasPendingMessages: () => false, hasPendingControl: () => false });
+  const rendered = Replies.createTelegramRenderedMessageDeliveryRuntime({ async sendMessage(body) {
+    const end = api.begin("sendMessage", body); requests.push(body as unknown as Record<string, unknown>); end(); return { message_id: 700 };
+  }, async sendRichMessage() { assert.fail("No rich fallback"); }, async editMessage() { assert.fail("No edit"); } });
+  const state: Menu.TelegramModelMenuState = { chatId: 7, threadId: 10, messageId: 0, mode: "model", scope: "all", page: 0, scopedModels: [], allModels: [] };
+  const menus = Menu.createTelegramMenuActionRuntime({ async getModelMenuState() { entered.resolve(); await finish.promise; return state; }, storeModelMenuState() { renderedDone.resolve(); },
+    buildStatusHtml: () => "<b>Old-target status</b>", getActiveModel: () => undefined, getThinkingLevel: () => "medium", isIdle: () => true, canOfferInFlightModelSwitch: () => false,
+    sendTextReply: rendered.sendTextReply, sendInteractiveMessage: rendered.sendInteractiveMessage, editInteractiveMessage: rendered.editInteractiveMessage });
+  const command = Commands.createTelegramCommandHandlerTargetRuntime<Commands.TelegramCommandRuntimeMessage, typeof ctx>({ getAllowedUserId: () => 7,
+    assertExecutionCurrent: Updates.assertTelegramUpdateExecutionCurrent, isContextActive: () => true, showStatus: menus.sendStatusMessage,
+    beginCommandEffectWork: publication.beginWork, recordRuntimeEvent() {} } as unknown as Parameters<typeof Commands.createTelegramCommandHandlerTargetRuntime<Commands.TelegramCommandRuntimeMessage, typeof ctx>>[0]);
+  const journal = Journal.createTelegramUpdateJournalStore({ path: join(dir, "source.json"), botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: "command-work-fixture" }) });
+  const worker = Updates.createTelegramUpdateAdmissionWorkerRuntime<Journal.TelegramJournaledUpdate, typeof ctx>({ journal, getJournalBindingKey: () => "command-work-source", hasAuthority: () => true,
+    isContextCurrent: () => true, getQueueOwnerIdentity: () => ({ instanceId: "leader", processId: process.pid, processBirthId: `${process.pid}:command-work`, sessionGeneration: 1 }),
+    async defaultHandle(update) { await command("status", update.message as Commands.TelegramCommandRuntimeMessage, ctx); } });
+  activity.onSessionStart?.(); await delivery.onSessionStart(); worker.start(ctx); await worker.waitForDrain();
+  const preparation = () => prepareLiveRebindThreadCleanup({ operationId: "command-work", oldTarget: old, recipientTarget: next, leaderEpoch: "epoch", targetProtected: false, work: observe(old, ctx) });
+  try {
+    journal.appendBatch([{ update_id: 100, message: { message_id: 100, message_thread_id: 10, text: "/status", chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false } } }]);
+    worker.signal(); await worker.waitForDrain(); await entered.promise; assert.equal(journal.read().entries.length, 0); if (stopped) await worker.stop();
+    assert.equal(requests.length, 0); assert.equal(api.hasPendingTarget(old), false); assert.equal(observe(old, ctx).deliveryPending, true); assert.equal(preparation(), undefined);
+    let ordered = false; await publication.enqueue(async () => { ordered = true; }); assert.equal(ordered, true, "No ordering or ordinary-send change");
+    finish.resolve(); await renderedDone.promise; await new Promise(resolve => setImmediate(resolve));
+    assert.equal(requests.length, 1); assert.equal(requests[0]!.message_thread_id, 10); assert.equal(state.messageId, 700);
+    assert.equal(publication.hasPending(), false); assert.equal(publication.hasUnconfirmed(), stopped, "Lost post-effect source authority is not known idle");
+    assert.equal(observe(old, ctx).unknown, stopped); assert.equal(!!preparation(), !stopped);
+    publication.reset(); assert.equal(observe(old, ctx).unknown, false); assert.equal(requests.length, 1, "Lifecycle reset never replays work");
+  } finally { finish.resolve(); await worker.stop(); activity.onSessionShutdown(); await delivery.onSessionShutdown(); await rm(dir, { recursive: true, force: true }); }
+});
 
 type RegisteredBindingHandler = (
   event: unknown,

@@ -3,13 +3,13 @@
  * Zones: Telegram bot reality mirror, demand-driven reconciliation, status diagnostics
  * Owns pure contracts for deciding when local Telegram mirror state should be refreshed without querying Telegram on every action
  */
-import { getTelegramApiErrorRequestTarget, isTelegramStaleTargetHttpError } from "./telegram-api.js";
 import { getTelegramTargetKey } from "./target.js";
+import { getTelegramApiErrorRequestTarget, isTelegramStaleTargetHttpError, } from "./telegram-api.js";
 import * as ThreadReconciler from "./thread-reconciler.js";
-import { TelegramWorkspaceSlotUnavailableError } from "./workspace-slots.js";
-import { normalizeTelegramWorkspacePath } from "./workspace-identity.js";
+import { commitTelegramWorkspaceProvisionBinding, createTelegramCleanupTargetProtection, getTelegramTargetFromApiBody, getTelegramThreadOwnerKey, isSameTelegramProcessInstance, isTelegramTopicTargetStaleError, provisionOwnBusTopic, } from "./threads.js";
 import { createTelegramWorkspaceAdmissionOperationId, runWithTelegramWorkspaceAdmissionsAsync, } from "./workspace-admission.js";
-import { createTelegramCleanupTargetProtection, commitTelegramWorkspaceProvisionBinding, getTelegramTargetFromApiBody, getTelegramThreadOwnerKey, isSameTelegramProcessInstance, isTelegramTopicTargetStaleError, provisionOwnBusTopic, } from "./threads.js";
+import { normalizeTelegramWorkspacePath } from "./workspace-identity.js";
+import { TelegramWorkspaceSlotUnavailableError } from "./workspace-slots.js";
 function markTelegramConfigSyncChange(state, action, options) {
     const nowMs = options?.nowMs ?? Date.now();
     let nextState = markTelegramSyncSliceFresh(state, "pairing", {
@@ -32,10 +32,13 @@ export function createTelegramPreservedLeaderQuitHandler(deps) {
         const profile = deps.getProfileName();
         if (epoch === undefined || !isSessionCurrent())
             return undefined;
-        const isCurrent = () => isSessionCurrent() && deps.getCurrentLeaderEpoch() === epoch &&
-            deps.getProfileName() === profile && deps.isPollingSuspended();
+        const isCurrent = () => isSessionCurrent() &&
+            deps.getCurrentLeaderEpoch() === epoch &&
+            deps.getProfileName() === profile &&
+            deps.isPollingSuspended();
         return async () => {
-            if (!isCurrent() || await deps.resolveAutomaticThreadCleanupEnabled() !== false)
+            if (!isCurrent() ||
+                (await deps.resolveAutomaticThreadCleanupEnabled()) !== false)
                 return;
             if (!isCurrent())
                 return;
@@ -49,13 +52,20 @@ export function createTelegramPreservedLeaderQuitHandler(deps) {
                 await deps.topicTargetStore.load();
                 if (!isCurrent())
                     return;
-                const records = deps.topicTargetStore.list().filter((record) => record.instanceId === deps.instanceId && (record.status === "active" || record.status === "starting"));
+                const records = deps.topicTargetStore
+                    .list()
+                    .filter((record) => record.instanceId === deps.instanceId &&
+                    (record.status === "active" || record.status === "starting"));
                 if (records.length !== 1)
                     return;
                 const record = records[0];
-                if (deps.topicTargetStore.listPendingCleanups().some((intent) => intent.target.chatId === record.target.chatId && intent.target.threadId === record.target.threadId))
+                if (deps.topicTargetStore
+                    .listPendingCleanups()
+                    .some((intent) => intent.target.chatId === record.target.chatId &&
+                    intent.target.threadId === record.target.threadId))
                     return;
-                if (!await deps.topicTargetStore.detachTargetOwner(record, isCurrent) && isCurrent()) {
+                if (!(await deps.topicTargetStore.detachTargetOwner(record, isCurrent)) &&
+                    isCurrent()) {
                     throw new Error("Telegram preserved leader detachment was not committed.");
                 }
             });
@@ -93,16 +103,22 @@ export function createTelegramThreadDisconnectAssembly(deps) {
             catch (error) {
                 // Never retry a stop whose teardown/release outcome may already have committed.
                 if (stopAttempted) {
-                    deps.recordRuntimeEvent("connection", error, { phase: "disconnect-stop" });
+                    deps.recordRuntimeEvent("connection", error, {
+                        phase: "disconnect-stop",
+                    });
                     throw error;
                 }
-                deps.recordRuntimeEvent("connection", error, { phase: "disconnect-cleanup" });
+                deps.recordRuntimeEvent("connection", error, {
+                    phase: "disconnect-cleanup",
+                });
                 let stopped;
                 try {
                     stopped = await stop();
                 }
                 catch (stopError) {
-                    deps.recordRuntimeEvent("connection", stopError, { phase: "disconnect-stop" });
+                    deps.recordRuntimeEvent("connection", stopError, {
+                        phase: "disconnect-stop",
+                    });
                     throw stopError;
                 }
                 const separator = /[.!?]$/u.test(stopped) ? " " : ". ";
@@ -153,8 +169,11 @@ export function createTelegramManualThreadDisconnectHandler(deps) {
                     target,
                     requestedAtMs: (deps.getNowMs ?? Date.now)(),
                 };
-                const departingRecord = deps.topicTargetStore.list().find((record) => record.instanceId === currentRecord.instanceId &&
-                    record.target.chatId === target.chatId && record.target.threadId === target.threadId);
+                const departingRecord = deps.topicTargetStore
+                    .list()
+                    .find((record) => record.instanceId === currentRecord.instanceId &&
+                    record.target.chatId === target.chatId &&
+                    record.target.threadId === target.threadId);
                 const isCleanupTargetProtected = createTelegramCleanupTargetProtection(deps.topicTargetStore, departingRecord);
                 deps.topicTargetStore.upsertPendingCleanup(intent);
                 await deps.topicTargetStore.persist();
@@ -312,23 +331,32 @@ export function captureTelegramStaleTargetRequestRecovery(body, deps) {
     if (!target || epoch === undefined)
         return undefined;
     const key = getTelegramTargetKey(target);
-    const record = deps.topicTargetStore.list().find((candidate) => getTelegramTargetKey(candidate.target) === key);
+    const record = deps.topicTargetStore
+        .list()
+        .find((candidate) => getTelegramTargetKey(candidate.target) === key);
     if (!record)
         return undefined;
     const generation = deps.getSessionGeneration();
     const profile = deps.getProfileName();
     const isAuthorityCurrent = () => deps.getCurrentLeaderEpoch() === epoch &&
-        deps.getSessionGeneration() === generation && deps.getProfileName() === profile;
+        deps.getSessionGeneration() === generation &&
+        deps.getProfileName() === profile;
     const isCurrent = () => {
-        const current = deps.topicTargetStore.list().find((candidate) => getTelegramTargetKey(candidate.target) === key);
-        return isAuthorityCurrent() &&
-            current?.instanceId === record.instanceId && current?.profileKey === record.profileKey &&
-            current?.updatedAtMs === record.updatedAtMs && current?.createdAtMs === record.createdAtMs;
+        const current = deps.topicTargetStore
+            .list()
+            .find((candidate) => getTelegramTargetKey(candidate.target) === key);
+        return (isAuthorityCurrent() &&
+            current?.instanceId === record.instanceId &&
+            current?.profileKey === record.profileKey &&
+            current?.updatedAtMs === record.updatedAtMs &&
+            current?.createdAtMs === record.createdAtMs);
     };
     return async (error) => {
         const requestTarget = getTelegramApiErrorRequestTarget(error);
-        if (!isTelegramStaleTargetHttpError(error) || !requestTarget ||
-            getTelegramTargetKey(requestTarget) !== key || !isCurrent())
+        if (!isTelegramStaleTargetHttpError(error) ||
+            !requestTarget ||
+            getTelegramTargetKey(requestTarget) !== key ||
+            !isCurrent())
             return;
         if (await recoverStaleTelegramTopicApiError({ chat_id: target.chatId, message_thread_id: target.threadId }, error, { ...deps, isCurrent, isAuthorityCurrent })) {
             deps.onRecovered();
@@ -354,7 +382,7 @@ export async function recoverStaleTelegramTopicApiError(apiBody, error, deps) {
     const recover = async () => {
         if (deps.isCurrent) {
             if (!deps.topicTargetStore.invalidateTarget ||
-                !await deps.topicTargetStore.invalidateTarget(target, deps.isCurrent, String(error)))
+                !(await deps.topicTargetStore.invalidateTarget(target, deps.isCurrent, String(error))))
                 return false;
             if (deps.isAuthorityCurrent?.() === false)
                 return false;
@@ -436,7 +464,12 @@ export async function ensureTelegramLeaderThreadBinding(deps) {
     const legacyLeaderRecord = deps.topicTargetStore.getByProfileKey(leaderProfileKey);
     let capacityUnavailable = false;
     const workspaceIdentity = normalizedLeaderCwd
-        ? deps.topicTargetStore.claimWorkspaceIdentity(normalizedLeaderCwd, deps.instanceId, legacyLeaderRecord?.instanceId, { sessionId: deps.sessionId, onCapacityUnavailable() { capacityUnavailable = true; } })
+        ? deps.topicTargetStore.claimWorkspaceIdentity(normalizedLeaderCwd, deps.instanceId, legacyLeaderRecord?.instanceId, {
+            sessionId: deps.sessionId,
+            onCapacityUnavailable() {
+                capacityUnavailable = true;
+            },
+        })
         : undefined;
     if (deps.cwd && !workspaceIdentity) {
         if (capacityUnavailable)
@@ -471,7 +504,9 @@ export async function ensureTelegramLeaderThreadBinding(deps) {
             target: { ...committed.target },
             slot: committed.slot ?? result.slot,
             ...(committed.threadName ? { threadName: committed.threadName } : {}),
-            ...(committed.displayTitle ? { displayTitle: committed.displayTitle } : {}),
+            ...(committed.displayTitle
+                ? { displayTitle: committed.displayTitle }
+                : {}),
         };
     };
     try {
@@ -512,7 +547,9 @@ export async function ensureTelegramLeaderThreadBinding(deps) {
                 ...(legacyLeaderRecord.threadName
                     ? { threadName: legacyLeaderRecord.threadName }
                     : {}),
-                ...(legacyLeaderRecord.slot ? { slot: legacyLeaderRecord.slot } : {}),
+                ...(legacyLeaderRecord.slot
+                    ? { slot: legacyLeaderRecord.slot }
+                    : {}),
                 updatedAtMs: legacyLeaderRecord.updatedAtMs,
             }
             : undefined;
@@ -600,7 +637,9 @@ export async function ensureTelegramLeaderThreadBinding(deps) {
         });
         // Legacy callers without session identity may reuse the active instance target.
         // Session-aware callers must resolve their exact Workspace binding instead.
-        if (deps.sessionId === undefined && !deps.forceFreshUnnamed && priorTargets.length > 0) {
+        if (deps.sessionId === undefined &&
+            !deps.forceFreshUnnamed &&
+            priorTargets.length > 0) {
             const record = priorTargets[0];
             deps.recordEvent("telegram", "Leader thread preserved after session lifecycle change", {
                 phase: "leader-thread-reused",
@@ -746,21 +785,6 @@ export function createTelegramProvisioningActivityRuntime() {
             activeCount = Math.max(0, activeCount - 1);
         },
     };
-}
-const RECONCILE_TRIGGERS = new Set([
-    "startup",
-    "reload",
-    "topic-lifecycle",
-    "stale-api-error",
-    "setup-change",
-    "pairing-change",
-    "follower-register",
-    "follower-prune",
-    "status-request",
-    "leader-health-tick",
-]);
-export function shouldReconcileTelegramSync(trigger) {
-    return RECONCILE_TRIGGERS.has(trigger);
 }
 export function markTelegramSyncSliceSuspect(state, slice, input) {
     return {

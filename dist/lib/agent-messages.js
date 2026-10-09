@@ -12,7 +12,10 @@ export function createTelegramAgentMessageRuntime(deps) {
         const leaderTarget = deps.getLeaderTarget();
         if (leaderTarget?.threadId) {
             targets.push({
-                target: { chatId: leaderTarget.chatId, threadId: leaderTarget.threadId },
+                target: {
+                    chatId: leaderTarget.chatId,
+                    threadId: leaderTarget.threadId,
+                },
                 threadName: deps.getDisplayTitle?.(leaderTarget) ?? deps.getLeaderThreadName(),
             });
         }
@@ -65,8 +68,9 @@ export function createTelegramAgentMessageRuntime(deps) {
             if (allowedChatId === undefined || !ctx) {
                 throw new Error("Telegram agent turn routing is unavailable.");
             }
-            const sourceTitle = (input.sourceTarget ? deps.getDisplayTitle?.(input.sourceTarget) : undefined)
-                ?? input.sourceThreadName;
+            const sourceTitle = (input.sourceTarget
+                ? deps.getDisplayTitle?.(input.sourceTarget)
+                : undefined) ?? input.sourceThreadName;
             const sourceLabel = sourceTitle
                 ?.replace(/[\r\n\[\]]+/g, " ")
                 .trim()

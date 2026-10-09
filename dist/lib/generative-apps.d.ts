@@ -174,11 +174,6 @@ export declare function installGenerativeApp(options: GenerativeAppRuntimeOption
     script: string;
 }): Promise<GenerativeAppInvocationResult>;
 export declare function parseGenerativeAppBoundAction(prompt: string): GenerativeAppBoundAction | undefined;
-export declare function invokeGenerativeAppBoundAction(options: GenerativeAppRuntimeOptions & {
-    expectedGeneration?: string;
-    expectedRevision?: number;
-    prompt: string;
-}): Promise<GenerativeAppInvocationResult | undefined>;
 export declare function bindGenerativeApp(options: GenerativeAppRuntimeOptions & {
     argument?: unknown;
     method?: string;

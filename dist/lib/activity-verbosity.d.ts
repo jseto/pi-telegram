@@ -4,8 +4,8 @@
  * Owns persistent bounded thinking and tool disclosures; excludes activity normalization, assistant answer rendering, and transport authority policy
  */
 import type { TelegramActivityEvent, TelegramActivityPublicationRuntime } from "./activity.ts";
-import type { TelegramEditMessageTextBody, TelegramInputRichMessage, TelegramSendMessageBody, TelegramSendRichMessageBody, TelegramSentMessage } from "./telegram-api.ts";
 import { type TelegramTarget } from "./target.ts";
+import type { TelegramEditMessageTextBody, TelegramInputRichMessage, TelegramSendMessageBody, TelegramSendRichMessageBody, TelegramSentMessage } from "./telegram-api.ts";
 export declare const TELEGRAM_ACTIVITY_MESSAGE_MAX_TOOLS = 6;
 export declare const TELEGRAM_REASONING_BUFFER_MAX_CHARS = 1200;
 export declare const TELEGRAM_TOOL_UPDATE_MAX_ENTRIES = 4;
@@ -28,10 +28,6 @@ export interface TelegramActivityVerbosityRuntime {
     stop: () => void;
     waitForIdle: () => Promise<void>;
 }
-export interface TelegramActivityVerbosityBinding extends TelegramActivityVerbosityRuntime {
-    bind: (runtime: TelegramActivityVerbosityRuntime) => void;
-}
-export declare function createTelegramActivityVerbosityBinding(): TelegramActivityVerbosityBinding;
 export declare function createTelegramActivityVerbosityRuntime<TAuthority>(deps: {
     enqueue?: TelegramActivityPublicationRuntime["enqueue"];
     getActivityMode: () => "quiet" | "thinking" | "tools" | "verbose";

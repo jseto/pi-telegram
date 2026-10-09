@@ -3,8 +3,8 @@
  * Zones: telegram outbound, native rich markdown drafts
  * Owns safe draft preview selection, runtime updates, and preview finalization
  */
-import { normalizeTelegramNativeMarkdown } from "./replies.js";
 import { stripTelegramCommentMarkupForPreview } from "./outbound-markup.js";
+import { isTelegramMarkdownFenceClosing, normalizeTelegramNativeMarkdown, parseTelegramMarkdownFenceOpening, } from "./replies.js";
 import { getTelegramTargetThreadParams, } from "./target.js";
 import { shouldSuppressPreviewForVoice } from "./voice.js";
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
@@ -73,9 +73,15 @@ export function createTelegramAssistantPreviewRuntime(deps) {
                 clearPreview: async (chatId, options) => {
                     if (controller.getState() !== state || !isDeliveryActive())
                         return;
-                    await controller.prepareClear(chatId, { ...options, isDeliveryActive })();
+                    await controller.prepareClear(chatId, {
+                        ...options,
+                        isDeliveryActive,
+                    })();
                 },
-                finalizeMarkdownPreview: prepareTelegramNativeMarkdownPreviewFinalizer({ ...finalizerDeps, isDeliveryActive }),
+                finalizeMarkdownPreview: prepareTelegramNativeMarkdownPreviewFinalizer({
+                    ...finalizerDeps,
+                    isDeliveryActive,
+                }),
             };
         },
         ...createTelegramAssistantMessagePreviewHooks({
@@ -130,7 +136,10 @@ export function createTelegramPreviewController(deps) {
         createState: () => createTelegramPreviewRuntimeState(),
         resetState: () => {
             generation += 1;
-            setState({ ...createTelegramPreviewRuntimeState(), nextDraftAt: state?.nextDraftAt });
+            setState({
+                ...createTelegramPreviewRuntimeState(),
+                nextDraftAt: state?.nextDraftAt,
+            });
         },
         invalidate: () => {
             generation += 1;
@@ -143,8 +152,15 @@ export function createTelegramPreviewController(deps) {
             sealTelegramPreviewState(state);
             const prior = state.publicationPromise ?? state.flushPromise ?? state.precedingFlush;
             let settle;
-            state.publicationPromise = new Promise((resolve) => { settle = resolve; });
-            return { wait: async () => { await prior?.catch(() => { }); }, settle };
+            state.publicationPromise = new Promise((resolve) => {
+                settle = resolve;
+            });
+            return {
+                wait: async () => {
+                    await prior?.catch(() => { });
+                },
+                settle,
+            };
         },
         prepareClear: (chatId, options) => {
             const admittedState = state;
@@ -154,7 +170,8 @@ export function createTelegramPreviewController(deps) {
                     return;
                 await clearTelegramPreview(chatId, runtime, {
                     ...options,
-                    isDeliveryActive: () => runtime.canSend?.() !== false && options?.isDeliveryActive?.() !== false,
+                    isDeliveryActive: () => runtime.canSend?.() !== false &&
+                        options?.isDeliveryActive?.() !== false,
                 });
             };
         },
@@ -208,7 +225,8 @@ async function handleTelegramAssistantMessagePreviewStart(message, deps) {
     // Carry the previous delivery boundary; permanent text remains with its publication owner.
     next.draftId = state?.draftId;
     next.nextDraftAt = state?.nextDraftAt;
-    next.precedingFlush = state?.publicationPromise ?? state?.flushPromise ?? state?.precedingFlush;
+    next.precedingFlush =
+        state?.publicationPromise ?? state?.flushPromise ?? state?.precedingFlush;
     deps.setState(next);
 }
 async function handleTelegramAssistantMessagePreviewUpdate(message, deps) {
@@ -280,7 +298,9 @@ export async function clearTelegramPreview(chatId, deps, options = {}) {
     if (options.isDeliveryActive?.() === false)
         return;
     deps.setState(undefined);
-    if (state.mode === "draft" && state.draftId !== undefined && deps.canSend?.() !== false) {
+    if (state.mode === "draft" &&
+        state.draftId !== undefined &&
+        deps.canSend?.() !== false) {
         try {
             await deps.sendDraft(chatId, state.draftId, undefined, {
                 ...getTelegramTargetThreadParams(options.target ?? { chatId }),
@@ -423,9 +443,8 @@ function updateTelegramDraftInlineStateForLine(line, state) {
     }
 }
 function updateTelegramDraftBlockStateForLine(line, state) {
-    const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})/);
     if (state.fence) {
-        if (new RegExp(`^ {0,3}${state.fence.marker}{${state.fence.length},}\\s*$`).test(line)) {
+        if (isTelegramMarkdownFenceClosing(line, state.fence)) {
             state.fence = undefined;
         }
         return true;
@@ -435,12 +454,9 @@ function updateTelegramDraftBlockStateForLine(line, state) {
             state.displayMath = false;
         return true;
     }
-    if (fenceMatch) {
-        const markerText = fenceMatch[1] ?? "```";
-        state.fence = {
-            marker: markerText[0],
-            length: markerText.length,
-        };
+    const openingFence = parseTelegramMarkdownFenceOpening(line);
+    if (openingFence) {
+        state.fence = openingFence;
         return true;
     }
     if (line.trim() === "$$") {
@@ -523,7 +539,9 @@ async function performTelegramPreviewFlush(chatId, state, deps, options = {}) {
         state.nextDraftAt = Date.now() + (deps.minDraftIntervalMs ?? 0);
         try {
             const delivered = await deps.sendDraft(chatId, draftId, normalizeTelegramNativeMarkdown(snapshot.text), { ...getTelegramTargetThreadParams(options.target ?? { chatId }) });
-            if (delivered === false || deps.getState() !== state || deps.canSend?.() === false)
+            if (delivered === false ||
+                deps.getState() !== state ||
+                deps.canSend?.() === false)
                 return;
             deps.setDraftSupport("supported");
             state.mode = "draft";
@@ -584,7 +602,9 @@ export async function flushTelegramPreview(chatId, deps, options = {}) {
                 });
                 break;
             }
-        } while (deps.getState() === state && !state.sealed && state.flushRequested);
+        } while (deps.getState() === state &&
+            !state.sealed &&
+            state.flushRequested);
     })();
     try {
         await state.flushPromise;

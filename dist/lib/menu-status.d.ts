@@ -3,9 +3,9 @@
  * Zones: telegram ui, status controls, menu composition
  * Owns status-menu payloads, status callback handling, and status-menu message rendering
  */
-import { type TelegramSectionRegistry } from "./sections.ts";
 import { type TelegramMenuMessageRuntimeDeps, type TelegramMenuRenderPayload, type TelegramModelMenuState, type TelegramReplyMarkup } from "./menu-model.ts";
 import { type MenuModel, type ThinkingLevel } from "./model.ts";
+import { type TelegramSectionRegistry } from "./sections.ts";
 export interface TelegramStatusMenuCallbackDeps {
     updateModelMenuMessage: () => Promise<void>;
     updateThinkingMenuMessage: () => Promise<void>;

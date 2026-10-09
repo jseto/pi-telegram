@@ -98,7 +98,7 @@ test("Thread display Settings offer all automatic modes and gate mutation", asyn
   assert.match(calls.at(-1)!, /not fully applied/);
   calls.length = 0;
   await handleTelegramSettingsMenuCallbackAction("q", "settings:set:thread-display:invalid", deps);
-  assert.deepEqual(calls, ["Unknown Thread display mode."]);
+  assert.deepEqual(calls, ["Unknown Thread display mode"]);
   calls.length = 0;
   await handleTelegramSettingsMenuCallbackAction("q", "settings:set:thread-display:letters", {
     ...deps, getThreadDisplayMode: () => undefined,
@@ -437,14 +437,14 @@ test("Settings callback action mutates live settings and retires stale proactive
     "update:<b>🔬 Activity:</b> <code>quiet</code>",
     "answer:Activity: verbose",
     "update:<b>⚙️ Settings:</b>",
-    "answer:Public assistant output is always delivered while Telegram is connected.",
+    "answer:Public assistant output is always delivered while Telegram is connected",
     "automatic-thread-cleanup:false",
     "update:<b>🧹 Thread cleanup:</b> <code>on</code>",
     "answer:Thread cleanup disabled",
     "update:<b>🔎 Inactive tabs review:</b>",
-    "answer:Review prepared. No tabs were deleted.",
+    "answer:Review prepared. No tabs were deleted",
     `clean:thread-cleanup:${"a".repeat(32)}`,
-    "answer:Deleted: 2. Outcome unknown: 0. Blocked: 1. Recovery: cleanup authority unavailable.",
+    "answer:Deleted: 2. Outcome unknown: 0. Blocked: 1. Recovery: cleanup authority unavailable",
   ]);
 });
 

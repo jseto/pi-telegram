@@ -6,7 +6,7 @@
 import { createHash } from "node:crypto";
 import { createConnection } from "node:net";
 import { isAbsolute, join, resolve } from "node:path";
-import { resolveTelegramTempDir, resolveTelegramRuntimeDir } from "./paths.js";
+import { resolveTelegramRuntimeDir, resolveTelegramTempDir } from "./paths.js";
 export const TELEGRAM_BUS_MAX_DIRECT_UNIX_ENDPOINT_BYTES = 80;
 function requireConsolidatedUnixEndpoint(path) {
     if (!isAbsolute(path) || resolve(path) !== path)
@@ -58,14 +58,24 @@ export function getTelegramBusTransportRetryPolicy(input) {
 function normalizeTelegramBusEndpointScope(value) {
     return value.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 80);
 }
+/** Consolidated endpoints hash their identity so profile/instance names never reach the path. */
+function getConsolidatedTelegramBusEndpoint(input, identity, pipePrefix, socketPrefix) {
+    const scope = createHash("sha256")
+        .update(JSON.stringify(identity))
+        .digest("hex")
+        .slice(0, 16);
+    return input.platform === "win32"
+        ? getTelegramBusPipePath({
+            agentDir: input.agentDir,
+            scope: `${pipePrefix}-${scope}`,
+        })
+        : requireConsolidatedUnixEndpoint(join(resolveTelegramRuntimeDir(input.agentDir), `${socketPrefix}.${scope}.sock`));
+}
 export function getTelegramBusLeaderEndpoint(input) {
     if (input.layout !== undefined && input.layout !== "consolidated")
         throw new Error("Telegram IPC layout is invalid.");
     if (input.layout === "consolidated") {
-        const scope = createHash("sha256").update(JSON.stringify([input.profileName ?? "default"])).digest("hex").slice(0, 16);
-        return input.platform === "win32"
-            ? getTelegramBusPipePath({ agentDir: input.agentDir, scope: `bus-${scope}` })
-            : requireConsolidatedUnixEndpoint(join(resolveTelegramRuntimeDir(input.agentDir), `bus.${scope}.sock`));
+        return getConsolidatedTelegramBusEndpoint(input, [input.profileName ?? "default"], "bus", "bus");
     }
     const profileScope = input.profileName
         ? normalizeTelegramBusEndpointScope(input.profileName)
@@ -81,10 +91,7 @@ export function getTelegramBusFollowerEndpoint(input) {
     if (input.layout !== undefined && input.layout !== "consolidated")
         throw new Error("Telegram IPC layout is invalid.");
     if (input.layout === "consolidated") {
-        const scope = createHash("sha256").update(JSON.stringify([input.profileName ?? "default", input.instanceId])).digest("hex").slice(0, 16);
-        return input.platform === "win32"
-            ? getTelegramBusPipePath({ agentDir: input.agentDir, scope: `follower-${scope}` })
-            : requireConsolidatedUnixEndpoint(join(resolveTelegramRuntimeDir(input.agentDir), `f.${scope}.sock`));
+        return getConsolidatedTelegramBusEndpoint(input, [input.profileName ?? "default", input.instanceId], "follower", "f");
     }
     const instanceScope = normalizeTelegramBusEndpointScope(input.instanceId);
     const profileScope = input.profileName
