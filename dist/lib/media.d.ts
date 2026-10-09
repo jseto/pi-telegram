@@ -180,7 +180,6 @@ export declare function guessMediaType(path: string): string | undefined;
 export declare function extractTelegramMessageText(message: TelegramMediaMessage): string;
 export declare function extractTelegramForwardContextText(message: TelegramMediaMessage, allowedUserId?: number): string;
 export declare function buildTelegramReplyContextBlock(message: TelegramMediaMessage, replyFiles?: Pick<DownloadedTelegramFile, "path">[], replyOutputs?: readonly string[]): string;
-export declare function extractTelegramMessagePromptText(message: TelegramMediaMessage): string;
 export declare function extractTelegramMessagesText(messages: TelegramMediaMessage[]): string;
 export declare function extractTelegramMessagesPromptText(messages: TelegramMediaMessage[]): string;
 export declare function extractFirstTelegramMessageText(messages: TelegramMediaMessage[]): string;
@@ -197,8 +196,30 @@ export declare function queueTelegramMediaGroupMessage<TMessage extends Telegram
     clearTimer: (timer: ReturnType<typeof setTimeout>) => void;
     dispatchMessages: (messages: TMessage[], ctx?: TContext) => unknown | Promise<unknown>;
 }): boolean;
+/** Timer and dispatch lifecycle shared by delayed media-group and text-group coalescing. */
+export interface TelegramPendingGroupState<TMessage, TContext> {
+    messages: TMessage[];
+    context?: TContext;
+    flushTimer?: ReturnType<typeof setTimeout>;
+    dispatching?: boolean;
+    suspended?: boolean;
+    reschedule?: () => void;
+    dispatchNow?: () => Promise<void>;
+}
+export interface TelegramPendingGroupLifecycle<TContext> {
+    flushMessage: (messageId: number) => Promise<boolean>;
+    suspend: () => void;
+    resume: (context: TContext) => void;
+    clear: () => void;
+}
+export declare function createTelegramPendingGroupLifecycle<TMessage extends {
+    message_id: number;
+}, TContext>(groups: Map<string, TelegramPendingGroupState<TMessage, TContext>>, clearTimer: (timer: ReturnType<typeof setTimeout>) => void): TelegramPendingGroupLifecycle<TContext>;
 export declare function createTelegramMediaGroupController<TMessage extends TelegramMediaGroupMessage, TContext = unknown>(options?: TelegramMediaGroupControllerOptions): TelegramMediaGroupController<TMessage, TContext>;
 export declare function createTelegramMediaGroupDispatchRuntime<TMessage extends TelegramMediaGroupMessage, TContext>(deps: TelegramMediaGroupDispatchRuntimeDeps<TMessage, TContext>): TelegramMediaGroupDispatchRuntime<TMessage, TContext>;
+/** Pure `[title]` bullet section appended after a blank line; empty items leave text unchanged. */
+export declare function appendTelegramListSection(text: string, title: string, items: string[]): string;
+export declare function appendTelegramAttachmentSection(text: string, files: Pick<DownloadedTelegramFile, "path">[]): string;
 export declare function formatTelegramHistoryText(rawText: string, files: DownloadedTelegramFile[], handlerOutputs?: string[]): string;
 export declare function downloadTelegramMessageFiles(messages: TelegramMediaMessage[], deps: DownloadTelegramMessageFilesDeps): Promise<DownloadedTelegramMessageFile[]>;
 export declare function collectTelegramFileInfos(messages: TelegramMediaMessage[]): TelegramFileInfo[];

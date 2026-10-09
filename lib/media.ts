@@ -428,15 +428,6 @@ function appendTelegramReplyContext(
   return text ? `${text}\n\n${replyContext}` : `_\n\n${replyContext}`;
 }
 
-export function extractTelegramMessagePromptText(
-  message: TelegramMediaMessage,
-): string {
-  return appendTelegramReplyContext(
-    extractTelegramMessageText(message),
-    buildTelegramReplyContextBlock(message),
-  );
-}
-
 export function extractTelegramMessagesText(
   messages: TelegramMediaMessage[],
 ): string {
@@ -601,35 +592,37 @@ export function queueTelegramMediaGroupMessage<
   return true;
 }
 
-export function createTelegramMediaGroupController<
-  TMessage extends TelegramMediaGroupMessage,
-  TContext = unknown,
+/** Timer and dispatch lifecycle shared by delayed media-group and text-group coalescing. */
+export interface TelegramPendingGroupState<TMessage, TContext> {
+  messages: TMessage[];
+  context?: TContext;
+  flushTimer?: ReturnType<typeof setTimeout>;
+  dispatching?: boolean;
+  suspended?: boolean;
+  reschedule?: () => void;
+  dispatchNow?: () => Promise<void>;
+}
+
+export interface TelegramPendingGroupLifecycle<TContext> {
+  flushMessage: (messageId: number) => Promise<boolean>;
+  suspend: () => void;
+  resume: (context: TContext) => void;
+  clear: () => void;
+}
+
+export function createTelegramPendingGroupLifecycle<
+  TMessage extends { message_id: number },
+  TContext,
 >(
-  options: TelegramMediaGroupControllerOptions = {},
-): TelegramMediaGroupController<TMessage, TContext> {
-  const groups = new Map<string, TelegramMediaGroupState<TMessage, TContext>>();
-  const debounceMs = options.debounceMs ?? TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS;
-  const setTimer =
-    options.setTimer ??
-    ((callback: () => void, ms: number): ReturnType<typeof setTimeout> =>
-      setTimeout(callback, ms));
-  const clearTimer = options.clearTimer ?? clearTimeout;
+  groups: Map<string, TelegramPendingGroupState<TMessage, TContext>>,
+  clearTimer: (timer: ReturnType<typeof setTimeout>) => void,
+): TelegramPendingGroupLifecycle<TContext> {
   return {
-    queueMessage: ({ message, context, dispatchMessages }) =>
-      queueTelegramMediaGroupMessage({
-        message,
-        context,
-        groups,
-        debounceMs,
-        setTimer,
-        clearTimer,
-        dispatchMessages,
-      }),
-    removeMessages: (messageIds) =>
-      removePendingTelegramMediaGroupMessages(groups, messageIds, clearTimer),
     async flushMessage(messageId) {
       for (const state of groups.values()) {
-        if (!state.messages.some((message) => message.message_id === messageId)) {
+        if (
+          !state.messages.some((message) => message.message_id === messageId)
+        ) {
           continue;
         }
         if (state.flushTimer) clearTimer(state.flushTimer);
@@ -668,6 +661,36 @@ export function createTelegramMediaGroupController<
   };
 }
 
+export function createTelegramMediaGroupController<
+  TMessage extends TelegramMediaGroupMessage,
+  TContext = unknown,
+>(
+  options: TelegramMediaGroupControllerOptions = {},
+): TelegramMediaGroupController<TMessage, TContext> {
+  const groups = new Map<string, TelegramMediaGroupState<TMessage, TContext>>();
+  const debounceMs = options.debounceMs ?? TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS;
+  const setTimer =
+    options.setTimer ??
+    ((callback: () => void, ms: number): ReturnType<typeof setTimeout> =>
+      setTimeout(callback, ms));
+  const clearTimer = options.clearTimer ?? clearTimeout;
+  return {
+    queueMessage: ({ message, context, dispatchMessages }) =>
+      queueTelegramMediaGroupMessage({
+        message,
+        context,
+        groups,
+        debounceMs,
+        setTimer,
+        clearTimer,
+        dispatchMessages,
+      }),
+    removeMessages: (messageIds) =>
+      removePendingTelegramMediaGroupMessages(groups, messageIds, clearTimer),
+    ...createTelegramPendingGroupLifecycle(groups, clearTimer),
+  };
+}
+
 export function createTelegramMediaGroupDispatchRuntime<
   TMessage extends TelegramMediaGroupMessage,
   TContext,
@@ -693,7 +716,8 @@ export function createTelegramMediaGroupDispatchRuntime<
   };
 }
 
-function appendTelegramListSection(
+/** Pure `[title]` bullet section appended after a blank line; empty items leave text unchanged. */
+export function appendTelegramListSection(
   text: string,
   title: string,
   items: string[],
@@ -703,7 +727,7 @@ function appendTelegramListSection(
   return `${prefix}[${title}]\n${items.map((item) => `- ${item}`).join("\n")}`;
 }
 
-function appendTelegramAttachmentSection(
+export function appendTelegramAttachmentSection(
   text: string,
   files: Pick<DownloadedTelegramFile, "path">[],
 ): string {
@@ -875,7 +899,9 @@ export function collectTelegramFileInfos(
       files.push({
         file_id: message.document.file_id,
         fileName,
-        ...(message.document.file_name ? { userFileName: message.document.file_name } : {}),
+        ...(message.document.file_name
+          ? { userFileName: message.document.file_name }
+          : {}),
         mimeType: message.document.mime_type,
         kind: "document",
         isImage: isImageMimeType(message.document.mime_type),
@@ -891,7 +917,9 @@ export function collectTelegramFileInfos(
       files.push({
         file_id: message.video.file_id,
         fileName,
-        ...(message.video.file_name ? { userFileName: message.video.file_name } : {}),
+        ...(message.video.file_name
+          ? { userFileName: message.video.file_name }
+          : {}),
         mimeType: message.video.mime_type,
         kind: "video",
         isImage: false,
@@ -908,7 +936,9 @@ export function collectTelegramFileInfos(
       files.push({
         file_id: message.audio.file_id,
         fileName,
-        ...(message.audio.file_name ? { userFileName: message.audio.file_name } : {}),
+        ...(message.audio.file_name
+          ? { userFileName: message.audio.file_name }
+          : {}),
         mimeType: message.audio.mime_type,
         kind: "audio",
         isImage: false,
@@ -938,7 +968,9 @@ export function collectTelegramFileInfos(
       files.push({
         file_id: message.animation.file_id,
         fileName,
-        ...(message.animation.file_name ? { userFileName: message.animation.file_name } : {}),
+        ...(message.animation.file_name
+          ? { userFileName: message.animation.file_name }
+          : {}),
         mimeType: message.animation.mime_type,
         kind: "animation",
         isImage: false,
@@ -952,16 +984,23 @@ export function collectTelegramFileInfos(
       files.push({
         file_id: message.sticker.file_id,
         fileName: `sticker-${message.message_id}${extension}`,
-        mimeType: video ? "video/webm" : animated ? "application/x-tgsticker" : "image/webp",
+        mimeType: video
+          ? "video/webm"
+          : animated
+            ? "application/x-tgsticker"
+            : "image/webp",
         kind: "sticker",
         isImage: !video && !animated,
       });
     }
     for (const file of files.slice(firstOfMessage)) {
-      file.source = { kind: file.kind, messageId: message.message_id,
+      file.source = {
+        kind: file.kind,
+        messageId: message.message_id,
         ...(file.index !== undefined ? { index: file.index } : {}),
         ...(file.userFileName ? { userFileName: file.userFileName } : {}),
-        ...(message.chat ? { chat: message.chat } : {}) };
+        ...(message.chat ? { chat: message.chat } : {}),
+      };
     }
   }
   const seenFileIds = new Set<string>();

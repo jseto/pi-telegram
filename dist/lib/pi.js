@@ -7,6 +7,12 @@ import { SettingsManager, } from "@earendil-works/pi-coding-agent";
 function isPiRunMode(value) {
     return (value === "tui" || value === "rpc" || value === "json" || value === "print");
 }
+/** Pi rejects a context captured before session replacement with a stale-context error; this is not a domain failure. */
+export function isPiStaleContextError(error) {
+    return (error instanceof Error &&
+        (error.message.includes("stale after session") ||
+            error.message.includes("stale ctx")));
+}
 export function getExtensionContextMode(ctx) {
     const mode = typeof ctx === "object" && ctx !== null
         ? ctx.mode
@@ -50,7 +56,8 @@ export function createExtensionApiRuntimePorts(api) {
 function readEnabledModels(value) {
     if (value === undefined)
         return undefined;
-    if (Array.isArray(value) && value.every((entry) => typeof entry === "string")) {
+    if (Array.isArray(value) &&
+        value.every((entry) => typeof entry === "string")) {
         return [...value];
     }
     throw new TypeError("Host settings enabledModels must be a string array or undefined.");

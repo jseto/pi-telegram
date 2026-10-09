@@ -8,6 +8,8 @@ import { appendFile, copyFile, lstat, mkdir, readFile, rename, rm, stat, writeFi
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { Worker } from "node:worker_threads";
 import { Type } from "@sinclair/typebox";
+import { renameTelegramPathWithRetry } from "./locks.js";
+import { isProcessAlive } from "./process-identity.js";
 const GENERATIVE_APP_NAME = /^[a-z][a-z0-9-]{0,31}$/u;
 const GENERATIVE_APP_METHOD = /^[a-z][a-z0-9_]{0,31}$/u;
 const GENERATIVE_APP_MAX_MODULE_BYTES = 1024 * 1024;
@@ -28,17 +30,6 @@ function byteLength(value) {
 }
 function wait(ms) {
     return new Promise((resolveWait) => setTimeout(resolveWait, ms));
-}
-function isProcessAlive(pid) {
-    if (!Number.isInteger(pid) || pid <= 0)
-        return false;
-    try {
-        process.kill(pid, 0);
-        return true;
-    }
-    catch (error) {
-        return error.code === "EPERM";
-    }
 }
 function assertAppName(app) {
     if (!GENERATIVE_APP_NAME.test(app)) {
@@ -102,7 +93,9 @@ async function writeFileAtomic(path, content) {
     await mkdir(dirname(path), { recursive: true });
     const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
     await writeFile(temporary, content, { encoding: "utf8", mode: 0o600 });
-    await rename(temporary, path);
+    // Windows may briefly deny replacing a file another reader or scanner holds; share the bounded retry.
+    if (!renameTelegramPathWithRetry(temporary, path))
+        throw new Error("Generative App staging file disappeared before publication.");
 }
 async function acquireGenerativeAppTransitionLock(appDir, waitMs = GENERATIVE_APP_LOCK_WAIT_MS) {
     const lockDir = `${appDir}.transition.lock`;
@@ -175,7 +168,8 @@ async function acquireGenerativeAppTransitionLock(appDir, waitMs = GENERATIVE_AP
                             .then((metadata) => Date.now() - metadata.mtimeMs > 1_000)
                             .catch(() => false)
                         : false;
-                    if ((currentOwnerPid !== undefined && !isProcessAlive(currentOwnerPid)) ||
+                    if ((currentOwnerPid !== undefined &&
+                        !isProcessAlive(currentOwnerPid)) ||
                         currentOwnerlessStale) {
                         await rm(lockDir, { recursive: true, force: true });
                     }
@@ -278,7 +272,9 @@ async function readStateTimeline(appDir) {
             envelopes.push(parsed);
         }
         catch {
-            const hasLaterContent = lines.slice(index + 1).some((entry) => entry.trim());
+            const hasLaterContent = lines
+                .slice(index + 1)
+                .some((entry) => entry.trim());
             if (!hasLaterContent) {
                 await writeFileAtomic(path, envelopes.map((envelope) => JSON.stringify(envelope)).join("\n") +
                     (envelopes.length > 0 ? "\n" : ""));
@@ -615,24 +611,6 @@ export function parseGenerativeAppBoundAction(prompt) {
         app,
     };
 }
-export async function invokeGenerativeAppBoundAction(options) {
-    const action = parseGenerativeAppBoundAction(options.prompt);
-    if (!action)
-        return undefined;
-    return await invokeGenerativeApp({
-        agentDir: options.agentDir,
-        ...(action.argument !== undefined ? { argument: action.argument } : {}),
-        ...(options.expectedGeneration !== undefined
-            ? { expectedGeneration: options.expectedGeneration }
-            : {}),
-        ...(options.expectedRevision !== undefined
-            ? { expectedRevision: options.expectedRevision }
-            : {}),
-        method: action.method,
-        methodTimeoutMs: options.methodTimeoutMs,
-        app: action.app,
-    });
-}
 export async function bindGenerativeApp(options) {
     const hasScript = typeof options.script === "string";
     const hasMethod = typeof options.method === "string";
@@ -645,7 +623,9 @@ export async function bindGenerativeApp(options) {
     return hasScript
         ? await installGenerativeApp({
             agentDir: options.agentDir,
-            ...(options.argument !== undefined ? { argument: options.argument } : {}),
+            ...(options.argument !== undefined
+                ? { argument: options.argument }
+                : {}),
             methodTimeoutMs: options.methodTimeoutMs,
             app: options.app,
             replace: options.replace,
@@ -653,7 +633,9 @@ export async function bindGenerativeApp(options) {
         })
         : await invokeGenerativeApp({
             agentDir: options.agentDir,
-            ...(options.argument !== undefined ? { argument: options.argument } : {}),
+            ...(options.argument !== undefined
+                ? { argument: options.argument }
+                : {}),
             method: options.method,
             methodTimeoutMs: options.methodTimeoutMs,
             app: options.app,
@@ -739,7 +721,9 @@ export function createGenerativeAppLiveSurfaceRuntime(deps) {
             schedule(record, result.refreshAfterMs);
         }
         catch (error) {
-            const classification = deps.classifyEditError?.(error) ?? { kind: "unknown" };
+            const classification = deps.classifyEditError?.(error) ?? {
+                kind: "unknown",
+            };
             if (!ownsRecord(key, record))
                 return;
             deps.recordRuntimeEvent?.("generative-app", error, {
@@ -785,7 +769,8 @@ export function createGenerativeAppLiveSurfaceRuntime(deps) {
             const handle = frame.digest === surface.initialDigest
                 ? surface.handle
                 : await deps.edit(frame);
-            if (result.refreshAfterMs === undefined || !deps.isCurrent({ ...surface, handle }))
+            if (result.refreshAfterMs === undefined ||
+                !deps.isCurrent({ ...surface, handle }))
                 return;
             open({
                 ...surface,
@@ -842,7 +827,9 @@ export function registerTelegramBindTool(pi, deps) {
         const view = {
             text: planned.markdown,
             parseMode: "markdown",
-            ...(planned.replyMarkup !== undefined ? { replyMarkup: planned.replyMarkup } : {}),
+            ...(planned.replyMarkup !== undefined
+                ? { replyMarkup: planned.replyMarkup }
+                : {}),
         };
         return {
             digest: createHash("sha256").update(JSON.stringify(view)).digest("hex"),
@@ -862,7 +849,9 @@ export function registerTelegramBindTool(pi, deps) {
                 if (!edited.ok)
                     throw Object.assign(new Error(edited.message), {
                         deliveryFailureReason: edited.reason,
-                        ...(edited.retryAfterMs === undefined ? {} : { retryAfterMs: edited.retryAfterMs }),
+                        ...(edited.retryAfterMs === undefined
+                            ? {}
+                            : { retryAfterMs: edited.retryAfterMs }),
                     });
                 return { delivery: edited.value, view };
             },
@@ -878,12 +867,18 @@ export function registerTelegramBindTool(pi, deps) {
                     return { kind: "unavailable" };
                 }
                 return {
-                    kind: failure.deliveryFailureReason === "commit-unknown" ? "unknown" : "terminal",
+                    kind: failure.deliveryFailureReason === "commit-unknown"
+                        ? "unknown"
+                        : "terminal",
                 };
             },
             recordRuntimeEvent: deps.recordRuntimeEvent,
-            ...(deps.liveSurfaceSetTimer ? { setTimer: deps.liveSurfaceSetTimer } : {}),
-            ...(deps.liveSurfaceClearTimer ? { clearTimer: deps.liveSurfaceClearTimer } : {}),
+            ...(deps.liveSurfaceSetTimer
+                ? { setTimer: deps.liveSurfaceSetTimer }
+                : {}),
+            ...(deps.liveSurfaceClearTimer
+                ? { clearTimer: deps.liveSurfaceClearTimer }
+                : {}),
         })
         : undefined;
     deps.setLiveSurfaceRuntime?.(liveSurfaces);
@@ -904,7 +899,9 @@ export function registerTelegramBindTool(pi, deps) {
             try {
                 const result = await bindGenerativeApp({
                     agentDir: deps.agentDir,
-                    ...(params.argument !== undefined ? { argument: params.argument } : {}),
+                    ...(params.argument !== undefined
+                        ? { argument: params.argument }
+                        : {}),
                     ...("method" in params && typeof params.method === "string"
                         ? { method: params.method }
                         : {}),
@@ -917,10 +914,10 @@ export function registerTelegramBindTool(pi, deps) {
                         : {}),
                     methodTimeoutMs: deps.methodTimeoutMs,
                 });
-                const activeTurn = params.display === false
-                    ? undefined
-                    : deps.getActiveTurn?.();
-                if (activeTurn && deps.planOutput && (deps.sendView || deps.sendMarkdownReply)) {
+                const activeTurn = params.display === false ? undefined : deps.getActiveTurn?.();
+                if (activeTurn &&
+                    deps.planOutput &&
+                    (deps.sendView || deps.sendMarkdownReply)) {
                     try {
                         const planned = deps.planOutput(result.output, {
                             binding: {
@@ -973,7 +970,12 @@ export function registerTelegramBindTool(pi, deps) {
                             });
                         }
                         return {
-                            content: [{ type: "text", text: formatDisplayedGenerativeAppToolOutput() }],
+                            content: [
+                                {
+                                    type: "text",
+                                    text: formatDisplayedGenerativeAppToolOutput(),
+                                },
+                            ],
                             details: { ...result, displayed: true, messageId },
                         };
                     }
@@ -984,13 +986,23 @@ export function registerTelegramBindTool(pi, deps) {
                             method: result.method,
                         });
                         return {
-                            content: [{ type: "text", text: formatGenerativeAppToolOutput(result.output) }],
+                            content: [
+                                {
+                                    type: "text",
+                                    text: formatGenerativeAppToolOutput(result.output),
+                                },
+                            ],
                             details: { ...result, displayed: false, displayFailed: true },
                         };
                     }
                 }
                 return {
-                    content: [{ type: "text", text: formatGenerativeAppToolOutput(result.output) }],
+                    content: [
+                        {
+                            type: "text",
+                            text: formatGenerativeAppToolOutput(result.output),
+                        },
+                    ],
                     details: { ...result, displayed: false },
                 };
             }

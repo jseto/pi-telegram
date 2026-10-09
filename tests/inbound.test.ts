@@ -732,3 +732,54 @@ test("Inbound handler composition: non-critical failure continues, critical stop
   assert.deepEqual(calls, ["step-a", "step-b"]);
   assert.deepEqual(result.handlerOutputs, []);
 });
+
+test("Inbound handlers skip when-guarded steps and fall through when a whole handler is guarded off", async () => {
+  const calls: string[] = [];
+  const execCommand = async (command: string, _args: string[], options?: { stdin?: string }) => {
+    calls.push(command);
+    return { stdout: `${command}(${options?.stdin ?? ""})`, stderr: "", code: 0, killed: false };
+  };
+  const text = await processTelegramInboundHandlers({
+    files: [],
+    rawText: "hi",
+    handlers: [
+      { type: "text", when: "{missing?yes:}", template: "/tools/never" },
+      { type: "text", template: ["/tools/a", { when: false, template: "/tools/skip" }, "/tools/b"] },
+    ],
+    cwd: "/work",
+    execCommand,
+  });
+  assert.deepEqual(calls, ["/tools/a", "/tools/b"]);
+  assert.equal(text.rawText, "/tools/b(/tools/a(hi))");
+  calls.length = 0;
+  const file = { path: "/tmp/voice.ogg", fileName: "voice.ogg", mimeType: "audio/ogg", kind: "voice", isImage: false };
+  const files = await processTelegramInboundHandlers({
+    files: [file],
+    rawText: "",
+    handlers: [
+      { type: "voice", when: false, template: "/tools/disabled {file}" },
+      { type: "voice", template: "/tools/stt {file}" },
+    ],
+    cwd: "/work",
+    execCommand,
+  });
+  assert.deepEqual(calls, ["/tools/stt"]);
+  assert.equal(files.handlerOutputs[0], "/tools/stt()");
+});
+
+test("Inbound handlers treat an unresolvable when guard as that handler's failure", async () => {
+  const events: string[] = [];
+  const result = await processTelegramInboundHandlers({
+    files: [],
+    rawText: "hi",
+    handlers: [
+      { type: "text", when: "{items[3]}", template: "/tools/never" },
+      { type: "text", template: "/tools/next" },
+    ],
+    cwd: "/work",
+    execCommand: async (command) => ({ stdout: `${command} ran`, stderr: "", code: 0, killed: false }),
+    recordRuntimeEvent: (category) => { events.push(category); },
+  });
+  assert.equal(result.rawText, "/tools/next ran");
+  assert.deepEqual(events, ["inbound-text-handler"]);
+});

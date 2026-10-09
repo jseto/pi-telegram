@@ -3,8 +3,8 @@
  * Zones: telegram activity, rich rendering, operational delivery
  * Owns persistent bounded thinking and tool disclosures; excludes activity normalization, assistant answer rendering, and transport authority policy
  */
-import { escapeHtml, renderTelegramInlineMarkdownHtml, } from "./rendering.js";
-import { areTelegramTargetsEqual as targetEquals } from "./target.js";
+import { escapeHtml, renderTelegramInlineMarkdownHtml } from "./rendering.js";
+import { areTelegramTargetsEqual as targetEquals, } from "./target.js";
 const TELEGRAM_ACTIVITY_DETAIL_MAX_CHARS = 1_200;
 const TELEGRAM_ACTIVITY_MESSAGE_MAX_CHARS = 3_900;
 export const TELEGRAM_ACTIVITY_MESSAGE_MAX_TOOLS = 6;
@@ -129,11 +129,7 @@ function renderToolActivityHtml(tool) {
     if (tool.complete && tool.result !== undefined) {
         evidence.push(`"${tool.isError ? "error" : "result"}": ${tool.result}`);
     }
-    const status = tool.complete
-        ? tool.isError
-            ? "failed"
-            : "done"
-        : "running";
+    const status = tool.complete ? (tool.isError ? "failed" : "done") : "running";
     return [
         `<b>${escapeHtml(formatToolActivityLabel(tool.name))}:</b> <code>${status}</code>`,
         `<blockquote expandable>${escapeActivityEvidenceHtml(evidence.join("\n\n"))}</blockquote>`,
@@ -151,11 +147,7 @@ function createToolActivityDetail(summary, text, isOpen = false) {
     };
 }
 function renderToolActivityRichBlocks(tool) {
-    const status = tool.complete
-        ? tool.isError
-            ? "failed"
-            : "done"
-        : "running";
+    const status = tool.complete ? (tool.isError ? "failed" : "done") : "running";
     const evidenceBlocks = [
         createToolActivityDetail("arguments", tool.args, true),
     ];
@@ -194,30 +186,10 @@ function toolMessageSize(tools) {
     return renderTelegramToolActivityHtml(tools).length;
 }
 function isKnownSafeRichActivityRejection(error) {
-    return error instanceof Error && /HTTP 400: Bad Request:/i.test(error.message);
+    return (error instanceof Error && /HTTP 400: Bad Request:/i.test(error.message));
 }
 export function renderTelegramThinkingActivityHtml(text) {
     return `<blockquote expandable>${renderThinkingActivityEvidenceHtml(text)}</blockquote>`;
-}
-export function createTelegramActivityVerbosityBinding() {
-    let runtime;
-    return {
-        bind(next) {
-            runtime = next;
-        },
-        accept(event) {
-            runtime?.accept(event);
-        },
-        reset() {
-            runtime?.reset();
-        },
-        stop() {
-            runtime?.stop();
-        },
-        waitForIdle() {
-            return runtime?.waitForIdle() ?? Promise.resolve();
-        },
-    };
 }
 export function createTelegramActivityVerbosityRuntime(deps) {
     let active = true;
@@ -261,7 +233,10 @@ export function createTelegramActivityVerbosityRuntime(deps) {
         toolOrder.length = 0;
     };
     const hasAuthority = () => authority !== undefined && deps.isAuthorityActive(authority);
-    const isCurrent = (acceptedGeneration, admittedAuthority) => active && generation === acceptedGeneration && admittedAuthority !== undefined && deps.isAuthorityActive(admittedAuthority);
+    const isCurrent = (acceptedGeneration, admittedAuthority) => active &&
+        generation === acceptedGeneration &&
+        admittedAuthority !== undefined &&
+        deps.isAuthorityActive(admittedAuthority);
     const ensureActivity = (event, admittedTarget, admittedAuthority) => {
         if (deps.getActivityMode() === "quiet")
             return false;
@@ -341,9 +316,7 @@ export function createTelegramActivityVerbosityRuntime(deps) {
     const scheduleReasoningPublish = (event, acceptedGeneration) => {
         if (reasoningFlushTimer || reasoningBlocked)
             return;
-        const elapsed = reasoningMessageFrames === 0
-            ? 0
-            : getNowMs() - lastReasoningPublishMs;
+        const elapsed = reasoningMessageFrames === 0 ? 0 : getNowMs() - lastReasoningPublishMs;
         const delayMs = Math.max(0, TELEGRAM_REASONING_MIN_INTERVAL_MS - elapsed);
         const schedule = deps.setReasoningTimeout ?? setTimeout;
         reasoningFlushTimer = schedule(() => {
@@ -580,8 +553,7 @@ export function createTelegramActivityVerbosityRuntime(deps) {
         }
         if (event.type === "agent-end" || event.type === "agent-settled") {
             clearReasoningFlushTimer();
-            if (reasoningChars > lastReasoningMessageChars &&
-                !reasoningBlocked) {
+            if (reasoningChars > lastReasoningMessageChars && !reasoningBlocked) {
                 await publishReasoning(event, acceptedGeneration);
             }
             if (!isCurrent(acceptedGeneration, admittedAuthority))
@@ -599,11 +571,12 @@ export function createTelegramActivityVerbosityRuntime(deps) {
             const admittedAuthority = deps.captureAuthority();
             const enqueue = deps.enqueue ?? ((task) => tail.then(task));
             tail = enqueue(async () => {
-                if (!active || generation !== acceptedGeneration || !deps.isAuthorityActive(admittedAuthority))
+                if (!active ||
+                    generation !== acceptedGeneration ||
+                    !deps.isAuthorityActive(admittedAuthority))
                     return;
                 await process(event, acceptedGeneration, admittedTarget, admittedAuthority);
-            })
-                .catch((error) => {
+            }).catch((error) => {
                 deps.recordFailure?.("tool-send", event, error);
             });
         },

@@ -52,12 +52,16 @@ export function createTelegramBusMessageOwnershipRuntime(deps) {
             const record = store.get(chatId, messageId);
             if (!record?.ownerGeneration || !record.recipientBindingKey)
                 return record;
-            const follower = deps.listFollowers().find((candidate) => candidate.instanceId === record.instanceId &&
+            const follower = deps
+                .listFollowers()
+                .find((candidate) => candidate.instanceId === record.instanceId &&
                 candidate.registrationGeneration === record.ownerGeneration &&
                 candidate.profileKey === record.recipientBindingKey);
             // Protocol is live registration authority, not message-cache history.
             // Keep an incomplete known owner foreign so the forwarder fails closed.
-            return follower?.protocol?.capabilities.includes(TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION) ? { ...record, protocolIdentity: follower.protocol } : record;
+            return follower?.protocol?.capabilities.includes(TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION)
+                ? { ...record, protocolIdentity: follower.protocol }
+                : record;
         },
         recordLocal(input) {
             return store.record({ ...input, instanceId: deps.instanceId });

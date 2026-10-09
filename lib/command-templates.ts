@@ -42,7 +42,14 @@ export type CommandTemplateConfig = string | CommandTemplateObjectConfig;
 
 export interface CommandTemplateLeafConfig extends CommandTemplateObjectConfig {
   template: string;
+  /** `when` guards of the composition nodes enclosing this leaf; every one must pass. */
+  inheritedWhen?: readonly (boolean | string)[];
 }
+
+type CommandTemplateExpansionContext = Pick<
+  CommandTemplateLeafConfig,
+  "args" | "defaults" | "inheritedWhen"
+>;
 
 export interface CommandTemplateInvocation {
   command: string;
@@ -56,6 +63,8 @@ export interface CommandTemplateExecOptions {
   stdin?: string;
   killGrace?: number;
   retry?: number;
+  /** Cleanup between a failed attempt and the next retry; a thrown error stops retries. */
+  recover?: () => Promise<void>;
 }
 
 export interface CommandTemplateExecResult {
@@ -64,29 +73,6 @@ export interface CommandTemplateExecResult {
   code: number;
   killed: boolean;
 }
-
-export type CommandTemplateRiskLabel =
-  | "risk.shell"
-  | "risk.eval"
-  | "risk.broad_fs_write"
-  | "risk.destructive_fs"
-  | "risk.network"
-  | "risk.external_side_effect"
-  | "risk.long_running"
-  | "risk.platform_specific"
-  | "risk.secret_touching";
-
-const COMMAND_TEMPLATE_RISK_LABEL_ORDER: CommandTemplateRiskLabel[] = [
-  "risk.shell",
-  "risk.eval",
-  "risk.destructive_fs",
-  "risk.broad_fs_write",
-  "risk.external_side_effect",
-  "risk.secret_touching",
-  "risk.network",
-  "risk.long_running",
-  "risk.platform_specific",
-];
 
 function normalizeCommandTemplateArgs(value: string[] | undefined): string[] {
   if (!Array.isArray(value)) return [];
@@ -167,202 +153,6 @@ function resolveCommandTemplateRepeat(
   );
 }
 
-function getExecutableName(command: string | undefined): string {
-  if (!command) return "";
-  return command.split(/[\\/]/).pop()?.toLowerCase() ?? "";
-}
-
-function matchesFlag(arg: string, flag: string): boolean {
-  if (arg === flag) return true;
-  if (/^-[A-Za-z]$/.test(flag) && /^-[A-Za-z]+$/.test(arg))
-    return arg.slice(1).includes(flag.slice(1));
-  return false;
-}
-
-function hasAnyFlag(args: string[], flags: string[]): boolean {
-  return args.some((arg) => flags.some((flag) => matchesFlag(arg, flag)));
-}
-
-function hasRiskyPathArg(args: string[]): boolean {
-  return args.some(
-    (arg) =>
-      arg === "/" ||
-      arg === "~" ||
-      arg === "./" ||
-      arg === "../" ||
-      arg.includes("{") ||
-      arg.startsWith("~/") ||
-      arg.startsWith("/"),
-  );
-}
-
-function sortRiskLabels(
-  labels: Iterable<CommandTemplateRiskLabel>,
-): CommandTemplateRiskLabel[] {
-  const unique = new Set(labels);
-  return COMMAND_TEMPLATE_RISK_LABEL_ORDER.filter((label) => unique.has(label));
-}
-
-function hasAnyArg(args: string[], values: string[]): boolean {
-  return args.some((arg) => values.includes(arg.toLowerCase()));
-}
-
-function hasSecretTouchingText(parts: string[]): boolean {
-  return parts.some((part) =>
-    /(^|[{}._\-\s/])(?:secret|token|password|passwd|credential|api[_-]?key|private[_-]?key|\.env|ssh[_-]?key)(?:[{}._\-\s/]|$)/i.test(
-      part,
-    ),
-  );
-}
-
-function getLeafCommandTemplateRiskLabels(
-  config: CommandTemplateLeafConfig,
-): CommandTemplateRiskLabel[] {
-  const parts = splitCommandTemplate(config.template);
-  const command = getExecutableName(parts[0]);
-  const args = parts.slice(1);
-  const labels = new Set<CommandTemplateRiskLabel>();
-  if (["bash", "sh", "zsh", "fish"].includes(command)) {
-    labels.add("risk.shell");
-    if (hasAnyFlag(args, ["-c"])) labels.add("risk.eval");
-  }
-  if (
-    ["node", "deno", "bun"].includes(command) &&
-    hasAnyFlag(args, ["-e", "--eval"])
-  ) {
-    labels.add("risk.eval");
-  }
-  if (
-    ["python", "python3", "perl", "ruby"].includes(command) &&
-    hasAnyFlag(args, ["-c", "-e"])
-  ) {
-    labels.add("risk.eval");
-  }
-  if (
-    command === "rm" &&
-    (args.some((arg) => /^-[^-]*r/.test(arg) || /^-[^-]*f/.test(arg)) ||
-      hasRiskyPathArg(args))
-  ) {
-    labels.add("risk.destructive_fs");
-  }
-  if (["mv", "cp", "rsync"].includes(command) && hasRiskyPathArg(args)) {
-    labels.add("risk.broad_fs_write");
-  }
-  if (
-    [
-      "curl",
-      "wget",
-      "ssh",
-      "scp",
-      "sftp",
-      "rsync",
-      "nc",
-      "ncat",
-      "telnet",
-      "ftp",
-    ].includes(command) ||
-    (command === "git" &&
-      hasAnyArg(args, ["clone", "fetch", "pull", "push", "ls-remote"])) ||
-    ["npm", "pnpm", "yarn", "pip", "cargo"].includes(command)
-  ) {
-    labels.add("risk.network");
-  }
-  if (
-    ["gh", "glab", "hub", "kubectl", "terraform"].includes(command) ||
-    (command === "git" && hasAnyArg(args, ["push"])) ||
-    (["npm", "pnpm", "yarn"].includes(command) &&
-      hasAnyArg(args, ["publish", "login", "logout", "deprecate"]))
-  ) {
-    labels.add("risk.external_side_effect");
-  }
-  if (
-    command === "sleep" ||
-    command === "watch" ||
-    (command === "tail" && hasAnyFlag(args, ["-f"])) ||
-    hasAnyArg(args, ["--watch", "--serve", "serve"])
-  ) {
-    labels.add("risk.long_running");
-  }
-  if (
-    [
-      "systemctl",
-      "launchctl",
-      "osascript",
-      "open",
-      "xdg-open",
-      "powershell",
-      "pwsh",
-      "cmd.exe",
-      "apt",
-      "apt-get",
-      "dnf",
-      "yum",
-      "brew",
-      "pacman",
-      "apk",
-      "xclip",
-      "wl-copy",
-    ].includes(command)
-  ) {
-    labels.add("risk.platform_specific");
-  }
-  if (
-    ["pass", "gpg", "ssh-add"].includes(command) ||
-    hasSecretTouchingText(parts)
-  ) {
-    labels.add("risk.secret_touching");
-  }
-  return sortRiskLabels(labels);
-}
-
-function getLeafCommandTemplateWarnings(
-  config: CommandTemplateLeafConfig,
-): string[] {
-  const parts = splitCommandTemplate(config.template);
-  const command = getExecutableName(parts[0]);
-  const args = parts.slice(1);
-  const warnings: string[] = [];
-  if (["bash", "sh", "zsh", "fish"].includes(command)) {
-    const shellContent = hasAnyFlag(args, ["-c"])
-      ? "shell command strings"
-      : "shell scripts";
-    warnings.push(
-      `${config.label ?? command}: invokes ${command}; ${shellContent} are trusted executable content and are not sandboxed by command-template argv splitting. Mitigation: keep scripts local, reviewed, and parameterized with explicit placeholders.`,
-    );
-  }
-  if (
-    ["node", "deno", "bun"].includes(command) &&
-    hasAnyFlag(args, ["-e", "--eval"])
-  ) {
-    warnings.push(
-      `${config.label ?? command}: invokes ${command} eval mode; code strings are trusted executable content and are not sandboxed. Mitigation: prefer a checked-in script file or keep eval input fixed and reviewed.`,
-    );
-  }
-  if (
-    ["python", "python3", "perl", "ruby"].includes(command) &&
-    hasAnyFlag(args, ["-c", "-e"])
-  ) {
-    warnings.push(
-      `${config.label ?? command}: invokes ${command} code-eval mode; code strings are trusted executable content and are not sandboxed. Mitigation: prefer a checked-in script file or keep eval input fixed and reviewed.`,
-    );
-  }
-  if (
-    command === "rm" &&
-    (args.some((arg) => /^-[^-]*r/.test(arg) || /^-[^-]*f/.test(arg)) ||
-      hasRiskyPathArg(args))
-  ) {
-    warnings.push(
-      `${config.label ?? command}: removes filesystem paths; verify placeholders and paths before running trusted destructive commands. Mitigation: constrain path placeholders and consider dry-run or explicit confirmation.`,
-    );
-  }
-  if (["mv", "cp", "rsync"].includes(command) && hasRiskyPathArg(args)) {
-    warnings.push(
-      `${config.label ?? command}: mutates broad filesystem paths; verify placeholders and paths before running trusted commands. Mitigation: constrain path placeholders and prefer narrow source/destination paths.`,
-    );
-  }
-  return warnings;
-}
-
 function pad(value: number, width: number): string {
   return String(value).padStart(width, "0");
 }
@@ -415,7 +205,7 @@ function expandRepeatConfig(
 
 export function expandCommandTemplateConfigs(
   config: CommandTemplateConfig,
-  inherited: Pick<CommandTemplateObjectConfig, "args" | "defaults"> = {},
+  inherited: CommandTemplateExpansionContext = {},
 ): CommandTemplateLeafConfig[] {
   const normalizedConfig = normalizeCommandTemplateConfig(config);
   const inheritedDefaults = normalizeCommandTemplateDefaults(
@@ -425,7 +215,10 @@ export function expandCommandTemplateConfigs(
     normalizeCommandTemplateDefaults(normalizedConfig.defaults),
     inheritedDefaults,
   );
-  const context = {
+  const context: CommandTemplateExpansionContext = {
+    ...(inherited.inheritedWhen?.length
+      ? { inheritedWhen: inherited.inheritedWhen }
+      : {}),
     ...(inherited.args !== undefined ? { args: inherited.args } : {}),
     ...(inheritedDefaults ? { defaults: inheritedDefaults } : {}),
     ...(normalizedConfig.args !== undefined
@@ -441,19 +234,23 @@ export function expandCommandTemplateConfigs(
       expandCommandTemplateConfigs(step, context),
     );
   }
-  const recoverConfig = normalizeRecoverConfig(normalizedConfig.recover);
-  const recoverSteps = recoverConfig
-    ? expandCommandTemplateConfigs(recoverConfig, context)
-    : [];
+  // `recover` is cleanup between failed retries, never a sequence step; runners attach it per leaf.
   if (Array.isArray(normalizedConfig.template)) {
-    return [
-      ...normalizedConfig.template.flatMap((step) =>
-        expandCommandTemplateConfigs(step, context),
-      ),
-      ...recoverSteps,
-    ];
+    const childContext: CommandTemplateExpansionContext =
+      normalizedConfig.when === undefined
+        ? context
+        : {
+            ...context,
+            inheritedWhen: [
+              ...(context.inheritedWhen ?? []),
+              normalizedConfig.when,
+            ],
+          };
+    return normalizedConfig.template.flatMap((step) =>
+      expandCommandTemplateConfigs(step, childContext),
+    );
   }
-  if (typeof normalizedConfig.template !== "string") return recoverSteps;
+  if (typeof normalizedConfig.template !== "string") return [];
   return [
     {
       ...normalizedConfig,
@@ -461,30 +258,71 @@ export function expandCommandTemplateConfigs(
       template: normalizedConfig.template,
       retry: normalizedConfig.retry,
     },
-    ...recoverSteps,
   ];
 }
 
-export function getCommandTemplateWarnings(
-  config: CommandTemplateConfig,
-): string[] {
-  return [
-    ...new Set(
-      expandCommandTemplateConfigs(config).flatMap((leaf) =>
-        getLeafCommandTemplateWarnings(leaf),
-      ),
-    ),
-  ];
-}
-
-export function getCommandTemplateRiskLabels(
-  config: CommandTemplateConfig,
-): CommandTemplateRiskLabel[] {
-  return sortRiskLabels(
-    expandCommandTemplateConfigs(config).flatMap((leaf) =>
-      getLeafCommandTemplateRiskLabels(leaf),
-    ),
+/** Whether a node's own and enclosing `when` guards all pass for its resolved placeholder values. */
+export function shouldRunCommandTemplateConfig(
+  config: CommandTemplateConfig | CommandTemplateLeafConfig,
+  values: Record<string, unknown>,
+): boolean {
+  if (typeof config === "string") return true;
+  const inheritedWhen =
+    "inheritedWhen" in config ? (config.inheritedWhen ?? []) : [];
+  if (config.when === undefined && inheritedWhen.length === 0) return true;
+  const resolved = { ...getCommandTemplateDefaults(config), ...values };
+  return [...inheritedWhen, config.when].every((condition) =>
+    shouldRunCommandTemplateNode(condition, resolved),
   );
+}
+
+/** A node's `recover` template as one cleanup run: output ignored, failure stops retries unless a leaf opts into `continue`. */
+export function createCommandTemplateRecovery(
+  config: CommandTemplateConfig,
+  values: Record<string, unknown>,
+  options: {
+    cwd: string;
+    timeout?: number;
+    execCommand: (
+      command: string,
+      args: string[],
+      options?: CommandTemplateExecOptions,
+    ) => Promise<CommandTemplateExecResult>;
+  },
+): (() => Promise<void>) | undefined {
+  if (typeof config === "string") return undefined;
+  const recoverConfig = normalizeRecoverConfig(config.recover);
+  if (!recoverConfig) return undefined;
+  const steps = expandCommandTemplateConfigs(recoverConfig, {
+    ...(config.args !== undefined ? { args: config.args } : {}),
+    ...(config.defaults !== undefined ? { defaults: config.defaults } : {}),
+  });
+  return async () => {
+    for (const step of steps) {
+      if (!shouldRunCommandTemplateConfig(step, values)) continue;
+      const invocation = buildCommandTemplateInvocation(
+        step,
+        values,
+        options.cwd,
+        { missingLabel: "command template recover" },
+      );
+      const result = await options.execCommand(
+        invocation.command,
+        invocation.args,
+        {
+          cwd: options.cwd,
+          ...(options.timeout !== undefined
+            ? { timeout: options.timeout }
+            : {}),
+        },
+      );
+      if (result.code !== 0 && step.failure !== "continue") {
+        throw new Error(
+          `Command template recover exited with code ${result.code}${result.killed ? " (killed)" : ""}`,
+        );
+      }
+    }
+  };
 }
 
 function parseCommandTemplateArgToken(value: string): {
@@ -551,10 +389,11 @@ export function splitCommandTemplate(input: string): string[] {
     }
     if (char === "\\" && quote !== "'") {
       const next = input[index + 1];
-      const escapesNext = quote === '"'
-        ? next === '"' || next === "\\"
-        : next !== undefined &&
-          (/\s/u.test(next) || next === "'" || next === '"' || next === "\\");
+      const escapesNext =
+        quote === '"'
+          ? next === '"' || next === "\\"
+          : next !== undefined &&
+            (/\s/u.test(next) || next === "'" || next === '"' || next === "\\");
       if (escapesNext) {
         escaped = true;
       } else {
@@ -588,10 +427,7 @@ export function splitCommandTemplate(input: string): string[] {
   return words;
 }
 
-function expandCommandTemplateExecutable(
-  command: string,
-  cwd: string,
-): string {
+function expandCommandTemplateExecutable(command: string, cwd: string): string {
   if (command === "~") return homedir();
   if (command.startsWith("~/")) return resolve(homedir(), command.slice(2));
   if (command.includes("/") && !isAbsolute(command))
@@ -816,7 +652,59 @@ function resolveCommandTemplateValue(
   return undefined;
 }
 
-export function substituteCommandTemplateToken(
+/** Resolve one optional non-negative numeric control field, substituting a template token when given as text. */
+export function resolveCommandTemplateNumericField(
+  value: number | string | undefined,
+  values: Record<string, unknown>,
+  label: string,
+): number | undefined {
+  if (value === undefined) return undefined;
+  const resolved =
+    typeof value === "string"
+      ? substituteCommandTemplateToken(value, values, label)
+      : value;
+  if (resolved === "") return undefined;
+  const numeric = Number(resolved);
+  if (!Number.isFinite(numeric) || numeric < 0)
+    throw new Error(`Command template ${label} must be a non-negative number.`);
+  return numeric;
+}
+
+/** A node's own `timeout`; string leaves carry none. */
+export function getCommandTemplateConfiguredTimeout(
+  config: CommandTemplateConfig | undefined,
+): number | undefined {
+  const timeout = typeof config === "string" ? undefined : config?.timeout;
+  return resolveCommandTemplateNumericField(timeout, {}, "timeout");
+}
+
+/**
+ * Bound one composed step by its own timeout and the handler budget left after `elapsedMs`.
+ * Without `elapsedMs` the step receives the full budget.
+ */
+export function getCommandTemplateStepTimeout(
+  budgetMs: number,
+  step: CommandTemplateConfig,
+  elapsedMs?: number,
+): number {
+  const remaining =
+    elapsedMs === undefined ? budgetMs : Math.max(1, budgetMs - elapsedMs);
+  const stepTimeout = getCommandTemplateConfiguredTimeout(step);
+  return stepTimeout === undefined
+    ? remaining
+    : Math.min(stepTimeout, remaining);
+}
+
+/** Array templates expand into ordered composition steps; single-command templates have none. */
+export function getCommandTemplateCompositionSteps(
+  config: CommandTemplateObjectConfig,
+): CommandTemplateLeafConfig[] {
+  return Array.isArray(config.template)
+    ? expandCommandTemplateConfigs(config)
+    : [];
+}
+
+function substituteCommandTemplateToken(
   token: string,
   values: Record<string, unknown>,
   missingLabel = "command template",
@@ -850,6 +738,7 @@ export async function execCommandTemplate(
     const result = await execCommandTemplateOnce(command, args, options);
     if (result.code === 0) return result;
     lastResult = result;
+    if (attempt < maxAttempts) await options.recover?.();
   }
   return lastResult;
 }
@@ -865,7 +754,7 @@ function escapeWindowsCommandArgument(
   doubleEscapeMetaChars: boolean,
 ): string {
   let escaped = value
-    .replace(/(?=(\\+?)?)\1"/g, "$1$1\\\"")
+    .replace(/(?=(\\+?)?)\1"/g, '$1$1\\"')
     .replace(/(?=(\\+?)?)\1$/g, "$1$1");
   escaped = `"${escaped}"`.replace(WINDOWS_COMMAND_META_CHARS, "^$1");
   return doubleEscapeMetaChars
@@ -888,13 +777,11 @@ function resolveCommandTemplateSpawn(
     return { command, args };
   }
   const normalizedCommand = normalize(command);
-  const isNodeModulesShim = /[\\/]node_modules[\\/]\.bin[\\/][^\\/]+\.cmd$/iu
-    .test(normalizedCommand);
+  const isNodeModulesShim =
+    /[\\/]node_modules[\\/]\.bin[\\/][^\\/]+\.cmd$/iu.test(normalizedCommand);
   const shellCommand = [
     escapeWindowsCommand(normalizedCommand),
-    ...args.map((arg) =>
-      escapeWindowsCommandArgument(arg, isNodeModulesShim)
-    ),
+    ...args.map((arg) => escapeWindowsCommandArgument(arg, isNodeModulesShim)),
   ].join(" ");
   return {
     command: process.env.ComSpec ?? process.env.COMSPEC ?? "cmd.exe",

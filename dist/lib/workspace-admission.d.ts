@@ -5,7 +5,7 @@
  * Excludes journal/API operations, retirement policy, and binding persistence
  */
 import { type PathLike } from "node:fs";
-import { type TelegramProcessLiveness } from "./bus.ts";
+import { type TelegramProcessLiveness } from "./process-identity.ts";
 import { type TelegramTarget } from "./target.ts";
 export interface TelegramWorkspaceAdmissionOwner {
     processId: number;
@@ -256,6 +256,8 @@ export declare function createTelegramWorkspaceAdmissionRuntimeBinding(input: {
     getStatePath: () => string;
     getPath?: never;
 })): TelegramWorkspaceAdmissionRuntimeBinding;
+/** Stable admission-scope identity used by leases and admission-gated journal operations. */
+export declare function getTelegramWorkspaceAdmissionScopeKey(scope: TelegramWorkspaceAdmissionScope): string;
 export declare function runWithTelegramWorkspaceAdmissions<T>(input: {
     ledger: Pick<TelegramWorkspaceAdmissionLedger, "acquireAdmission" | "releaseAdmission">;
     operationId: string;

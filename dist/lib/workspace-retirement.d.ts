@@ -7,7 +7,7 @@
 import type { TelegramJournalNamespaceInspection, TelegramUpdateJournalDeadQueueOwnerRecoveryInput, TelegramUpdateJournalDeadQueueOwnerRecoveryResult, TelegramUpdateJournalEntry, TelegramUpdateJournalQueueOwnerIdentity } from "./journal.ts";
 import { type TelegramTarget } from "./target.ts";
 import { type TelegramWorkspaceThreadDeletionTransport } from "./telegram-api.ts";
-import type { TelegramTopicTargetStore, TelegramWorkspaceJournalSource, TelegramWorkspaceExternalProtectionEvidence, TelegramWorkspaceRetirementIntent, TelegramWorkspaceProtectionState, TelegramWorkspaceThreadBinding } from "./threads.ts";
+import type { TelegramTopicTargetStore, TelegramWorkspaceExternalProtectionEvidence, TelegramWorkspaceJournalSource, TelegramWorkspaceProtectionState, TelegramWorkspaceRetirementIntent, TelegramWorkspaceThreadBinding } from "./threads.ts";
 import { type TelegramWorkspaceAdmissionLedger, type TelegramWorkspaceAdmissionScope, type TelegramWorkspaceDeletionPermit } from "./workspace-admission.ts";
 export interface TelegramWorkspaceOperationGate {
     runExclusive: <T>(operation: () => Promise<T>) => Promise<T>;

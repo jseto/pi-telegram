@@ -2,16 +2,11 @@
  * Telegram bridge path resolution for Pi-compatible runtimes
  * Zones: telemetry paths, filesystem, runtime identity
  * Owns agent-dir detection and extension-local path derivation
- *
- * This domain is path-only: it resolves directories and file paths from
- * environment and runtime identity. Its only filesystem read canonicalizes the
- * existing agent-dir prefix; it does not read config, manage state, or import
- * broader Telegram domains.
  */
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep, } from "node:path";
 export const TELEGRAM_DEFAULT_PROFILE_NAME = "default";
 /**
  * Resolve the agent data directory for the current Pi-compatible runtime.
@@ -41,9 +36,13 @@ export function resolveAgentDir(input = {}) {
  * Equality proves spelling only, not file identity, consumer closure or migration readiness.
  */
 export function requireTelegramStoragePathReference(path, expectedPath) {
-    if (typeof path !== "string" || typeof expectedPath !== "string" ||
-        !isAbsolute(path) || resolve(path) !== path ||
-        !isAbsolute(expectedPath) || resolve(expectedPath) !== expectedPath || path !== expectedPath) {
+    if (typeof path !== "string" ||
+        typeof expectedPath !== "string" ||
+        !isAbsolute(path) ||
+        resolve(path) !== path ||
+        !isAbsolute(expectedPath) ||
+        resolve(expectedPath) !== expectedPath ||
+        path !== expectedPath) {
         throw new Error("Telegram storage reference does not match its approved absolute path.");
     }
     return path;
@@ -55,11 +54,12 @@ export function resolveTelegramConfigPath() {
 /**
  * Resolve symlinks in the longest existing prefix of `path` and keep the missing suffix. Strict journal reads require
  * canonical anchors, so a symlinked agent directory (for example macOS `/var` → `/private/var`) must not leak in.
- * Relative input is returned unchanged so callers' exact-absolute-path guards still reject it. Windows keeps its
- * spelling: strict journal reads are POSIX-only there, and resolving a drive-less root would add a drive letter.
+ * Relative input is returned unchanged so callers' exact-absolute-path guards still reject it. On Windows only
+ * drive-letter and UNC paths resolve; resolving a drive-less root would add the current drive.
  */
 function canonicalizeExistingPrefix(path) {
-    if (!isAbsolute(path) || process.platform === "win32")
+    if (!isAbsolute(path) ||
+        (process.platform === "win32" && !/^(?:[a-zA-Z]:[\\/]|\\\\)/u.test(path)))
         return path;
     const absolute = resolve(path);
     const missing = [];
@@ -68,7 +68,8 @@ function canonicalizeExistingPrefix(path) {
             return join(realpathSync(current), ...missing.reverse());
         }
         catch (error) {
-            if (error.code !== "ENOENT" || dirname(current) === current)
+            if (error.code !== "ENOENT" ||
+                dirname(current) === current)
                 return absolute;
             missing.push(basename(current));
         }
@@ -140,7 +141,10 @@ export function getTelegramJournalPublicationPaths(path, runtimeDir) {
     requireTelegramStoragePathReference(runtimeDir, join(dirname(dirname(path)), "runtime"));
     if (basename(dirname(path)) !== "journals")
         throw new Error("Telegram service journal must use its journals namespace.");
-    return { transactionPath: join(runtimeDir, `${basename(path)}.transaction`), temporaryBasePath: join(runtimeDir, basename(path)) };
+    return {
+        transactionPath: join(runtimeDir, `${basename(path)}.transaction`),
+        temporaryBasePath: join(runtimeDir, basename(path)),
+    };
 }
 /** Durable inactive Thread cleanup work-set journal. */
 export function resolveTelegramThreadCleanupWorkPath(agentDir = resolveAgentDir(), profileName) {
@@ -186,12 +190,17 @@ export function encodeTelegramSessionDirectoryName(sessionId) {
     let name = "";
     bytes.forEach((byte, index) => {
         const char = String.fromCharCode(byte);
-        const safe = /[a-z0-9_-]/u.test(char) || (char === "." && index > 0 && index < bytes.length - 1);
-        name += safe ? char : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+        const safe = /[a-z0-9_-]/u.test(char) ||
+            (char === "." && index > 0 && index < bytes.length - 1);
+        name += safe
+            ? char
+            : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
     });
     if (WINDOWS_RESERVED_NAME.test(name))
         name = `%${name.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}${name.slice(1)}`;
-    return name.length <= TELEGRAM_SESSION_DIRECTORY_MAX_LENGTH ? name : undefined;
+    return name.length <= TELEGRAM_SESSION_DIRECTORY_MAX_LENGTH
+        ? name
+        : undefined;
 }
 /** Inverse of `encodeTelegramSessionDirectoryName`; undefined unless the name is exactly canonical. */
 export function decodeTelegramSessionDirectoryName(name) {
@@ -210,7 +219,9 @@ export function decodeTelegramSessionDirectoryName(name) {
             bytes.push(name.charCodeAt(index));
     }
     const decoded = Buffer.from(bytes).toString("utf8");
-    return encodeTelegramSessionDirectoryName(decoded) === name ? decoded : undefined;
+    return encodeTelegramSessionDirectoryName(decoded) === name
+        ? decoded
+        : undefined;
 }
 /** Root of every session folder (<agentDir>/tmp/pi-telegram/sessions). */
 export function resolveTelegramSessionsDir(agentDir = resolveAgentDir()) {
@@ -227,7 +238,10 @@ export function resolveTelegramSessionDir(sessionId, agentDir = resolveAgentDir(
 export function getTelegramRecipientJournalHash(recipientBindingKey) {
     if (!recipientBindingKey)
         throw new Error("Telegram session journal binding key is required.");
-    return createHash("sha256").update(recipientBindingKey).digest("hex").slice(0, 16);
+    return createHash("sha256")
+        .update(recipientBindingKey)
+        .digest("hex")
+        .slice(0, 16);
 }
 /** Durable per-session journal (`sessions/<session id>/journal.<hash>[.<profile>].json`); the name never reveals a role. */
 export function resolveTelegramSessionJournalPath(sessionId, recipientBindingKey, agentDir = resolveAgentDir(), profileName) {
@@ -240,8 +254,10 @@ export function resolveTelegramSessionPollingJournalPath(sessionId, agentDir = r
 /** Accept only a canonical `sessions/<id>/inbox[.<profile>].json` beneath this agent's runtime. */
 export function isTelegramSessionPollingJournalPath(path, agentDir = resolveAgentDir()) {
     const parts = relative(resolveTelegramSessionsDir(agentDir), path).split(sep);
-    return isAbsolute(path) && parts.length === 2 && decodeTelegramSessionDirectoryName(parts[0]) !== undefined &&
-        /^inbox(?:\.[a-zA-Z0-9._-]+)?\.json$/u.test(parts[1]);
+    return (isAbsolute(path) &&
+        parts.length === 2 &&
+        decodeTelegramSessionDirectoryName(parts[0]) !== undefined &&
+        /^inbox(?:\.[a-zA-Z0-9._-]+)?\.json$/u.test(parts[1]));
 }
 /** Runtime event log (<agentDir>/tmp/pi-telegram/logs.jsonl). */
 export function resolveTelegramRuntimeLogPath(agentDir = resolveAgentDir()) {

@@ -9,7 +9,8 @@ import test from "node:test";
 import {
   applyThreadReconciliationPlan,
   createThreadReconciliationRuntime,
-  planDisconnectedInstanceThreadCleanup,
+  issueLiveRebindThreadCleanup,
+  prepareLiveRebindThreadCleanup,
   planThreadReconciliation,
   type ThreadReconciliationAction,
 } from "../lib/thread-reconciler.ts";
@@ -19,6 +20,35 @@ import type {
   TelegramTopicSyncObservation,
   TelegramTopicTargetRecord,
 } from "../lib/threads.ts";
+
+for (const fault of ["clear", "busy", "queued", "delivery", "unknown", "missing-work", "malformed-work", "protected", "missing-protection", "same-target", "foreign-chat", "invalid-target", "missing-operation", "missing-epoch"] as const) {
+  test(`Live cleanup preparation is body-free evidence, never a destructive plan (${fault})`, () => {
+    const input = { operationId: "live", oldTarget: { chatId: 7, threadId: 10 }, recipientTarget: { chatId: 7, threadId: 42 }, leaderEpoch: "epoch",
+      targetProtected: false, work: { sessionBusy: false, targetWork: false, deliveryPending: false, unknown: false } as { sessionBusy: boolean; targetWork: boolean; deliveryPending: boolean; unknown: boolean } | undefined };
+    if (fault === "busy") input.work!.sessionBusy = true;
+    if (fault === "queued") input.work!.targetWork = true;
+    if (fault === "delivery") input.work!.deliveryPending = true;
+    if (fault === "unknown") input.work!.unknown = true;
+    if (fault === "missing-work") input.work = undefined;
+    if (fault === "malformed-work") input.work!.unknown = undefined!;
+    if (fault === "protected") input.targetProtected = true;
+    if (fault === "missing-protection") input.targetProtected = undefined!;
+    if (fault === "same-target") input.recipientTarget.threadId = 10;
+    if (fault === "foreign-chat") input.recipientTarget.chatId = 8;
+    if (fault === "invalid-target") input.oldTarget.threadId = NaN;
+    if (fault === "missing-operation") input.operationId = "";
+    if (fault === "missing-epoch") input.leaderEpoch = "";
+    const before = structuredClone(input), prepared = prepareLiveRebindThreadCleanup(input);
+    assert.deepEqual(input, before);
+    assert.equal(!!prepared, fault === "clear");
+    if (prepared) {
+      assert.deepEqual(prepared, { status: "prepared", operationId: "live", target: { chatId: 7, threadId: 10 }, recipientTarget: { chatId: 7, threadId: 42 }, leaderEpoch: "epoch" });
+      input.oldTarget.threadId = 99; input.recipientTarget.threadId = 77;
+      assert.equal(prepared.target.threadId, 10); assert.equal(prepared.recipientTarget.threadId, 42);
+      assert.equal("actions" in prepared, false); assert.equal("kind" in prepared, false);
+    }
+  });
+}
 
 test("Restore cleanup cancels target reuse before close, between close/delete, and on retry", async () => {
   for (const reuseAt of [0, 1, 2]) {
@@ -54,7 +84,6 @@ test("Every destructive cleanup origin preserves a target acquired before or dur
     { kind: "close-delete-reserved-topic", reason: "startup-reservation", target, observedAtMs: 1 },
     { kind: "close-delete-replaced-follower-topic", reason: "replaced-follower", target },
     { kind: "close-delete-previous-leader-topic", reason: "previous-leader", target },
-    { kind: "close-delete-disconnected-instance-topic", reason: "manual-disconnect", target },
     { kind: "close-delete-graceful-shutdown-topic", reason: "graceful-shutdown", target, instanceId: "old", runtimeGeneration: "old-generation", cleanupIntentId: "intent" },
     { kind: "close-delete-expired-pending-provision-topic", reason: "expired-pending-provision", target, pendingProvisionId: "provision" },
   ];
@@ -1181,64 +1210,6 @@ test("Thread reconciler fails closed when ownership probe returns undefined", as
   assert.deepEqual(calls, []);
 });
 
-test("Thread reconciler plans manual disconnect cleanup as a domain action", () => {
-  assert.deepEqual(
-    planDisconnectedInstanceThreadCleanup({
-      target: { chatId: 7, threadId: 42 },
-      instanceId: "inst:1",
-    }),
-    {
-      actions: [
-        {
-          kind: "close-delete-disconnected-instance-topic",
-          target: { chatId: 7, threadId: 42 },
-          reason: "manual-disconnect",
-          instanceId: "inst:1",
-        },
-      ],
-    },
-  );
-});
-
-test("Thread reconciler apply closes and deletes manual disconnect topics without marking stale", async () => {
-  const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
-  let staleCalled = false;
-  await applyThreadReconciliationPlan(
-    {
-      actions: [
-        {
-          kind: "close-delete-disconnected-instance-topic",
-          target: { chatId: 7, threadId: 91 },
-          reason: "manual-disconnect",
-          instanceId: "inst-a",
-        },
-      ],
-    },
-    {
-      async callApi<TResponse>(method: string, body: Record<string, unknown>) {
-        calls.push({ method, body });
-        return {} as TResponse;
-      },
-      markStaleByTarget() {
-        staleCalled = true;
-        return true;
-      },
-    },
-  );
-
-  assert.deepEqual(calls, [
-    {
-      method: "closeForumTopic",
-      body: { chat_id: 7, message_thread_id: 91 },
-    },
-    {
-      method: "deleteForumTopic",
-      body: { chat_id: 7, message_thread_id: 91 },
-    },
-  ]);
-  assert.equal(staleCalled, false);
-});
-
 test("Thread reconciler apply is the close/delete path for unbound cleanup actions", async () => {
   const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
   const staleTargets: unknown[] = [];
@@ -1284,4 +1255,27 @@ test("Thread reconciler apply is the close/delete path for unbound cleanup actio
     { target: { chatId: 7, threadId: 90 }, syncStatus: "deleted" },
   ]);
   assert.equal(persisted, true);
+});
+
+test("Live-rebind cleanup issues one unretried deletion and classifies its outcome honestly", async () => {
+  const prepared = { status: "prepared" as const, operationId: "live-op", target: { chatId: 7, threadId: 10 },
+    recipientTarget: { chatId: 7, threadId: 42 }, leaderEpoch: "epoch" };
+  for (const [name, behavior, failure, expected] of [
+    ["success", "ok", "unknown", "confirmed"], ["absent", "throw", "absent", "confirmed"],
+    ["rejected", "throw", "rejected", "failed"], ["lost", "throw", "unknown", "unknown"], ["stale", "stale", "unknown", "failed"],
+  ] as const) {
+    const calls: unknown[] = [], classified: unknown[] = [];
+    const outcome = await issueLiveRebindThreadCleanup(prepared, {
+      assertCurrent() { if (behavior === "stale") throw new Error("Recipient authority changed"); },
+      async deleteTopic(target) { calls.push(target); if (behavior === "throw") throw new Error(name); },
+      classifyFailure(error) { classified.push(error); return failure; },
+    });
+    assert.equal(outcome, expected, name);
+    assert.deepEqual(calls, behavior === "stale" ? [] : [{ chatId: 7, threadId: 10 }], `${name}: at most one deletion request, never repeated`);
+    assert.equal(classified.length, behavior === "throw" ? 1 : 0);
+  }
+  const target = { chatId: 7, threadId: 10 }, mutable = { ...prepared, target };
+  await issueLiveRebindThreadCleanup(mutable, { assertCurrent() {}, async deleteTopic(value) { (value as { threadId: number }).threadId = 99; },
+    classifyFailure: () => "unknown" });
+  assert.deepEqual(target, { chatId: 7, threadId: 10 }, "The prepared target is copied before issuance");
 });

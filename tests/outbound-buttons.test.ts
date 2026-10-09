@@ -53,7 +53,7 @@ test("Fenced button blocks use the shared grammar in place, independently of foo
     id: "ordinary", data: ordinaryData, message: { chat: { id: 7 }, message_id: 10, message_thread_id: 9 },
   }, undefined, {
     resolveAction: store.resolve,
-    answerCallbackQuery: async (_id, text) => { assert.equal(text, "Queued."); },
+    answerCallbackQuery: async (_id, text) => { assert.equal(text, "Queued"); },
     enqueueButtonPrompt: (query, action) => {
       assert.equal(query.message?.message_thread_id, 9);
       assert.equal(action.prompt, "Explain this section.");
@@ -598,7 +598,7 @@ test("Disabled stored actions cannot invoke an app or enqueue a prompt", async (
     invokeBoundAction: async () => assert.fail("Disabled method was invoked"),
     editMessageReplyMarkup: async () => assert.fail("Disabled button was selected"),
   }), true);
-  assert.deepEqual(answers, [["query", "Button action unavailable."]]);
+  assert.deepEqual(answers, [["query", "Button action unavailable"]]);
 });
 
 test("Button reply planner rejects payloads without a valid button shape", () => {
@@ -791,7 +791,7 @@ test("Button callback handler keeps successful bound actions successful when old
   );
   assert.equal(handled, true);
   assert.deepEqual(invoked, ["music::next"]);
-  assert.deepEqual(answered, ["Done."]);
+  assert.deepEqual(answered, ["Done"]);
   assert.equal(edited.length, 1);
 });
 
@@ -820,7 +820,7 @@ test("Button callback handler answers bound-action failures without queue fallba
     ),
     /app failed/,
   );
-  assert.deepEqual(answered, ["Generative App action failed."]);
+  assert.deepEqual(answered, ["Generative App action failed"]);
 });
 
 test("Button callback handler enqueues owned actions, marks the selected button, and consumes expired buttons", async () => {
@@ -864,7 +864,7 @@ test("Button callback handler enqueues owned actions, marks the selected button,
   );
 
   assert.equal(handled, true);
-  assert.deepEqual(answered, ["Queued."]);
+  assert.deepEqual(answered, ["Queued"]);
   assert.equal(enqueued.length, 1);
   assert.deepEqual(edited, [
     {
@@ -900,7 +900,7 @@ test("Button callback handler enqueues owned actions, marks the selected button,
   );
 
   assert.equal(expired, true);
-  assert.deepEqual(answered, ["Queued.", "Button action expired."]);
+  assert.deepEqual(answered, ["Queued", "Button action expired"]);
 
   const duplicate = await handleTelegramButtonCallbackQuery(
     {
@@ -930,8 +930,8 @@ test("Button callback handler enqueues owned actions, marks the selected button,
   );
   assert.equal(duplicate, true);
   assert.deepEqual(answered, [
-    "Queued.",
-    "Button action expired.",
-    "Already queued.",
+    "Queued",
+    "Button action expired",
+    "Already queued",
   ]);
 });

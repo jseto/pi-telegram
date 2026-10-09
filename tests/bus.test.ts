@@ -34,6 +34,7 @@ import {
   createTelegramBusFollowerRegistry,
   type TelegramBusEnvelope,
   createTelegramBusProtocolIdentity,
+  createTelegramBusLiveRebindController,
   createTelegramBusForeignOwnedUpdateForwarder,
   createTelegramFollowerApiCallAuthorizer,
   createTelegramBusLocalServer,
@@ -47,16 +48,15 @@ import {
   getTelegramInputCustodyPeerReadiness,
   getTelegramBusSocketPath,
   getTelegramFollowerTargetOwnership,
-  getTelegramProcessBirthIdentity,
-  getTelegramProcessBirthIdentityLiveness,
-  getTelegramProcessLiveness,
   hasTelegramBusCapability,
   isTelegramBusEnvelopeAuthorized,
   isTelegramBusForwardOwnershipCurrent,
   isTelegramFollowerApiCallAllowed,
+  isSameTelegramBusFollowerRegistration,
   markTelegramBusAggregateDelivery,
   markTelegramBusCrossTargetDelivery,
   parseTelegramBusEnvelope,
+  rejectTelegramBusRequest,
   resolveTelegramBusSocketPath,
   stripTelegramBusApiMetadata,
   sendTelegramBusLocalEnvelope,
@@ -66,11 +66,239 @@ import {
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
   TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT,
+  TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY,
 } from "../lib/bus.ts";
+import { getTelegramProcessBirthIdentityLiveness } from "../lib/process-identity.ts";
 import {
   getTelegramThreadOwnerFromProfileKey,
   getTelegramThreadOwnerKey,
 } from "../lib/threads.ts";
+
+function selectedCommandInputWire(kind: "leader.prepareLiveRebind" | "leader.applyLiveRebind" | "leader.settleLiveRebind", name = "status") {
+  return { kind, requestId: "status", auth: "secret", recipientInstanceId: "follower", recipientRegistrationGeneration: "registration",
+    recipientSessionId: "session", recipientBindingKey: "journal", operationId: "live", sentAtMs: 1000,
+    selectedCommand: { name, target: { chatId: 7, threadId: 42 } },
+    ...(kind === "leader.prepareLiveRebind" ? { updates: [{ update_id: 100, message: { text: `/${name}` } }] } : { sourceUpdateIds: [100], mode: kind === "leader.applyLiveRebind" ? "apply" : "release",
+      preparedSource: { journalBindingKey: "journal", updateId: 100, sourceSha256: "a".repeat(64) } }) };
+}
+
+for (const name of ["status", "abort"] as const) for (const kind of ["leader.prepareLiveRebind", "leader.applyLiveRebind", "leader.settleLiveRebind"] as const) {
+  for (const mode of ["current", "legacy", "null", "other", "extra", "callback", "no-target", "target-extra", "negative", "all", "group", "raw-method", "thread-zero", "thread-float"] as const) {
+    test(`Selected command input wire never downgrades branch/target into generic input (${name}/${kind}/${mode})`, () => {
+      const wire: Record<string, unknown> = selectedCommandInputWire(kind, name), descriptor = wire.selectedCommand as { name: string; target: Record<string, unknown> };
+      if (mode === "legacy") { delete wire.selectedCommand; delete wire.preparedSource; }
+      if (mode === "null") wire.selectedCommand = null;
+      if (mode === "other") descriptor.name = "generated-prompt";
+      if (mode === "extra") Object.assign(descriptor, { execute: "raw" });
+      if (mode === "callback") Object.assign(descriptor, { assertAuthority: "callback" });
+      if (mode === "no-target") Reflect.deleteProperty(descriptor, "target");
+      if (mode === "target-extra") descriptor.target.slot = "A";
+      if (mode === "negative") descriptor.target.chatId = -7;
+      if (mode === "all") Reflect.deleteProperty(descriptor.target, "threadId");
+      if (mode === "thread-zero") descriptor.target.threadId = 0;
+      if (mode === "thread-float") descriptor.target.threadId = 42.5;
+      if (mode === "group") { if (kind === "leader.prepareLiveRebind") (wire.updates as unknown[]).push({ update_id: 101 }); else (wire.sourceUpdateIds as number[]).push(101); }
+      if (mode === "raw-method") wire.method = "sendMessage";
+      const parsed = parseTelegramBusEnvelope(JSON.stringify(wire));
+      if (["current", "legacy"].includes(mode)) assert.deepEqual(parsed, wire); else assert.equal(parsed, undefined);
+    });
+  }
+}
+
+for (const kind of ["leader.prepareLiveRebind", "leader.applyLiveRebind", "leader.settleLiveRebind"] as const) for (const legacy of ["status-field", "abort-kind", "dual-marker", "status-mode"] as const) {
+  test(`Unified command wire refuses retired markers and observation mode without a shim (${kind}/${legacy})`, () => {
+    const wire: Record<string, unknown> = selectedCommandInputWire(kind, "abort");
+    if (legacy === "status-field" || legacy === "dual-marker") {
+      wire.selectedStatus = { kind: "status", target: { chatId: 7, threadId: 42 } };
+      if (legacy === "status-field") delete wire.selectedCommand;
+    }
+    if (legacy === "abort-kind") wire.selectedCommand = { kind: "abort", target: { chatId: 7, threadId: 42 } };
+    if (legacy === "status-mode") wire.mode = "observe-status";
+    assert.equal(parseTelegramBusEnvelope(JSON.stringify(wire)), undefined);
+  });
+}
+
+for (const kind of ["leader.applyLiveRebind", "leader.settleLiveRebind"] as const) for (const mode of ["missing", "id", "key", "hash", "extra", "unmarked"] as const) {
+  test(`Prepared status source wire is exact expected evidence, not a completion grant (${kind}/${mode})`, () => {
+    const wire: Record<string, unknown> = selectedCommandInputWire(kind), source = wire.preparedSource as Record<string, unknown>;
+    if (mode === "missing") delete wire.preparedSource;
+    if (mode === "id") source.updateId = 101;
+    if (mode === "key") source.journalBindingKey = "foreign";
+    if (mode === "hash") source.sourceSha256 = "not-a-digest";
+    if (mode === "extra") source.completionSha256 = "a".repeat(64);
+    if (mode === "unmarked") delete wire.selectedCommand;
+    assert.equal(parseTelegramBusEnvelope(JSON.stringify(wire)), undefined);
+  });
+}
+
+for (const mode of ["current", "generic", "legacy-mode", "without-branch", "old-target", "proof-missing"] as const) {
+  test(`Status completion observation wire has no generic release/work fallback (${mode})`, () => {
+    const wire: Record<string, unknown> = { ...selectedCommandInputWire("leader.settleLiveRebind"), mode: "observe-command" };
+    if (mode === "generic") wire.mode = "observe";
+    if (mode === "legacy-mode") wire.mode = "status-result";
+    if (mode === "without-branch") { delete wire.selectedCommand; delete wire.preparedSource; }
+    if (mode === "old-target") wire.oldTarget = { chatId: 7, threadId: 10 };
+    if (mode === "proof-missing") delete wire.preparedSource;
+    assert.deepEqual(parseTelegramBusEnvelope(JSON.stringify(wire)), mode === "current" ? wire : undefined);
+  });
+}
+
+for (const mode of ["completed", "unknown", "not-issued", "no-ack", "released", "wrong-source", "extra-source", "extra-result", "extra-recipient", "bad-command", "not-issued-ack", "wrong-key", "missing-proof", "lost-response"] as const) {
+  test(`Status completion controller observes exact expected source without issuing work (${mode})`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-status-observe-")), socketPath = getTelegramBusSocketPath(dir, process.platform, "observe", "consolidated");
+    const preparedSource = { journalBindingKey: "journal", updateId: 100, sourceSha256: "a".repeat(64) }, selectedCommand = { name: "status" as const, target: { chatId: 7, threadId: 42 } };
+    const protocol = createTelegramBusProtocolIdentity({ runtimeBuild: "fixture", capabilities: ["live-thread-rebind-save-v1", "live-thread-rebind-apply-v1", "live-thread-rebind-settle-v1", "live-thread-rebind-command-set-v1", "selected-menu-delivery-v1"] });
+    let calls = 0;
+    const server = createTelegramBusLocalServer({ socketPath, handleEnvelope(envelope) {
+      calls++; assert.equal(envelope.kind, "leader.settleLiveRebind"); assert.equal(Reflect.get(envelope, "mode"), "observe-command");
+      if (mode === "lost-response") return undefined;
+      const result = { operationId: "live", recipient: { instanceId: "follower", sessionId: "session", generation: "registration", bindingKey: "journal", ...(mode === "extra-recipient" ? { receipt: "borrowed" } : {}) },
+        sourceUpdateIds: [100], selectedCommand, preparedSource: mode === "missing-proof" ? undefined : preparedSource,
+        status: mode === "released" ? "released" : "command-observed", command: mode === "bad-command" ? "delivered" : mode === "unknown" ? "unknown" : mode === "not-issued" || mode === "not-issued-ack" ? "not-issued" : "completed",
+        ...(["not-issued", "no-ack"].includes(mode) ? {} : { sourceAck: mode === "wrong-source" ? { ...preparedSource, sourceSha256: "b".repeat(64) }
+          : mode === "wrong-key" ? { ...preparedSource, journalBindingKey: "foreign" } : mode === "extra-source" ? { ...preparedSource, completionSha256: "borrowed" } : preparedSource }),
+        ...(mode === "extra-result" ? { deliverySucceeded: true } : {}) };
+      return { kind: "bus.ack", requestId: envelope.requestId, ok: true, result };
+    } });
+    const run = createTelegramBusLiveRebindController({ getFollower: () => ({ instanceId: "follower", sessionId: "session", registrationGeneration: "registration", pid: process.pid, processBirthId: `${process.pid}:observe`,
+      cwd: dir, slot: "A", busSocketPath: socketPath, target: selectedCommand.target, protocol, connectedAtMs: 1, lastHeartbeatMs: 1 }), localProtocolIdentity: protocol, getAuthSecret: () => "secret", createRequestId: () => "observe",
+      // Only the lost reply waits out its deadline; every answered mode uses the production window.
+      ...(mode === "lost-response" ? { timeoutMs: 250 } : {}) });
+    try {
+      await server.start(); const query = { operationId: "live", instanceId: "follower", sessionId: "session", recipientBindingKey: "journal", isCurrent: () => true, mode: "observe-command" as const,
+        sourceUpdateIds: [100], slot: "A", target: selectedCommand.target, oldTarget: { chatId: 7, threadId: 10 }, selectedCommand, preparedSource };
+      if (mode === "lost-response") await assert.rejects(run(query), /Timed out|closed/);
+      else { const result = await run(query); assert.equal(!!result, ["completed", "unknown", "not-issued", "no-ack"].includes(mode));
+        if (result) assert.equal(result.status, "command-observed"); }
+      assert.equal(calls, 1);
+    } finally { await server.stop(); rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
+for (const phase of ["save", "apply", "release"] as const) {
+  for (const mode of ["current", "generic-ack", "wrong-target", "wrong-name", "extra-ack", "lost-ack", "missing-local", "missing-peer", "legacy-local", "legacy-peer", "delivery-missing", "target-mismatch", "late-protocol", "mutated-input", "missing-source", "source-key", "source-id", "source-hash", "source-extra", "input-source-bad"] as const) {
+    test(`Selected status controller binds exact singleton branch across one IPC attempt (${phase}/${mode})`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "pi-status-input-wire-")), socketPath = getTelegramBusSocketPath(dir, process.platform, "status", "consolidated");
+      const caps = ["live-thread-rebind-save-v1", "live-thread-rebind-apply-v1", "live-thread-rebind-settle-v1", "selected-menu-delivery-v1", "live-thread-rebind-command-set-v1"];
+      const local = createTelegramBusProtocolIdentity({ runtimeBuild: "fixture", capabilities: mode === "missing-local" ? caps.slice(0, -1) : mode === "legacy-local" ? caps.map(cap => cap === "live-thread-rebind-command-set-v1" ? "live-thread-rebind-status-v1" : cap) : caps });
+      const follower = { instanceId: "follower", sessionId: "session", slot: "A", cwd: dir, pid: process.pid, processBirthId: `${process.pid}:status-wire`, sessionGeneration: 1,
+        registrationGeneration: "registration", busSocketPath: socketPath, connectedAtMs: 1, lastHeartbeatMs: 1, target: { chatId: 7, threadId: 10 }, protocol: createTelegramBusProtocolIdentity({ runtimeBuild: "fixture",
+          capabilities: mode === "missing-peer" ? caps.slice(0, -1) : mode === "legacy-peer" ? caps.map(cap => cap === "live-thread-rebind-command-set-v1" ? "live-thread-rebind-held-command-v1" : cap) : mode === "delivery-missing" ? caps.filter(cap => cap !== "selected-menu-delivery-v1") : caps }) };
+      let calls = 0;
+      const preparedSource = { journalBindingKey: "journal", updateId: 100, sourceSha256: "a".repeat(64) };
+      const descriptor = { name: "status" as const, target: { chatId: 7, threadId: mode === "target-mismatch" ? 99 : 42 } }, expectedDescriptor = structuredClone(descriptor);
+      const server = createTelegramBusLocalServer({ socketPath, handleEnvelope(envelope) {
+        calls++; assert.ok(["leader.prepareLiveRebind", "leader.applyLiveRebind", "leader.settleLiveRebind"].includes(envelope.kind));
+        assert.deepEqual(Reflect.get(envelope, "selectedCommand"), expectedDescriptor);
+        if (mode === "mutated-input") descriptor.target.threadId = 99;
+        if (mode === "lost-ack") return undefined;
+        if (mode === "late-protocol") follower.protocol = createTelegramBusProtocolIdentity({ runtimeBuild: "replacement", capabilities: caps });
+        const result = { operationId: "live", recipient: { instanceId: "follower", sessionId: "session", generation: "registration", bindingKey: "journal" }, sourceUpdateIds: [100],
+          ...(mode === "missing-source" ? {} : { preparedSource: mode === "source-key" ? { ...preparedSource, journalBindingKey: "other" }
+            : mode === "source-id" ? { ...preparedSource, updateId: 101 } : mode === "source-hash" ? { ...preparedSource, sourceSha256: "b".repeat(64) }
+            : mode === "source-extra" ? { ...preparedSource, completionSha256: "borrowed" } : preparedSource }),
+          status: phase === "save" ? "saved" : phase === "apply" ? "applied" : "released", ...(phase === "apply" ? { target: { chatId: 7, threadId: 42 }, slot: "A" } : {}),
+          ...(phase === "release" ? { action: "release" } : {}), ...(mode === "generic-ack" ? {} : { selectedCommand: mode === "wrong-target" ? { name: "status", target: { chatId: 7, threadId: 99 } }
+            : mode === "wrong-name" ? { ...expectedDescriptor, name: "abort" } : mode === "extra-ack" ? { ...expectedDescriptor, receipt: "borrowed" } : expectedDescriptor }) };
+        return { kind: "bus.ack", requestId: envelope.requestId, ok: true, result };
+      } });
+      try {
+        await server.start();
+        const run = createTelegramBusLiveRebindController({ getFollower: () => follower, localProtocolIdentity: local, getAuthSecret: () => "secret", createRequestId: () => "status", timeoutMs: 250 });
+        const task = run({ operationId: "live", instanceId: "follower", sessionId: "session", recipientBindingKey: "journal", isCurrent: () => true, selectedCommand: descriptor, preparedSource: mode === "input-source-bad" ? { ...preparedSource, sourceSha256: "bad" } : preparedSource,
+          ...(phase === "save" ? { updates: [{ update_id: 100, message: { text: "/status" } }] } : { mode: phase, sourceUpdateIds: [100], slot: "A", target: { chatId: 7, threadId: 42 }, oldTarget: { chatId: 7, threadId: 10 } }) });
+        let result: Awaited<typeof task>;
+        if (mode === "lost-ack" || mode === "late-protocol") await assert.rejects(task, error => error instanceof Error &&
+          (mode === "lost-ack" ? /Timed out|closed/.test(error.message) : Reflect.get(error, "requestIssued") === true));
+        else result = await task;
+        const beforeIPC = ["missing-local", "missing-peer", "legacy-local", "legacy-peer", "delivery-missing", "input-source-bad"].includes(mode) || mode === "target-mismatch" && phase !== "save";
+        assert.equal(calls, beforeIPC ? 0 : 1); assert.equal(!!result, mode === "current" || mode === "mutated-input" || phase === "save" && mode === "target-mismatch");
+        if (result) { assert.deepEqual(Reflect.get(result, "selectedCommand"), expectedDescriptor); assert.deepEqual(Reflect.get(result, "preparedSource"), preparedSource); }
+      } finally { await server.stop(); rmSync(dir, { recursive: true, force: true }); }
+    });
+  }
+}
+
+function selectedMenuWire(kind: "send-text" | "edit-text" = "send-text") {
+  return { kind: "follower.deliverSelectedMenu" as const, requestId: "effect", auth: "secret", instanceId: "follower", registrationGeneration: "registration",
+    operationId: "live", recipient: { sessionId: "session", sessionGeneration: 1, processId: 123, processBirthId: "123:birth", profileKey: "manual:follower",
+      journalBindingKey: "session-journal", target: { chatId: 7, threadId: 42 } }, executor: { instanceId: "leader", leaderEpoch: "epoch" }, operatorUserId: 7,
+    effect: { kind, text: "Status", parseMode: "HTML", ...(kind === "send-text" ? { replyToMessageId: 11 } : { messageId: 11 }),
+      replyMarkup: { inline_keyboard: [[{ text: "Queue", callback_data: "menu:queue" }]] } }, sentAtMs: 1000 };
+}
+
+for (const kind of ["send-text", "edit-text"] as const) {
+  test(`Selected follower menu wire is distinct closed copied evidence, not ordinary API admission (${kind})`, () => {
+    const wire = selectedMenuWire(kind), parsed = parseTelegramBusEnvelope(JSON.stringify(wire));
+    assert.equal(parsed?.kind, "follower.deliverSelectedMenu");
+    assert.deepEqual(parsed, wire);
+    assert.equal(getTelegramBusEnvelopeTrafficClass(parsed!), "generation-fenced");
+    wire.recipient.target.threadId = 99; wire.effect.text = "changed"; wire.effect.replyMarkup.inline_keyboard[0]![0]!.callback_data = "changed";
+    if (parsed?.kind !== "follower.deliverSelectedMenu") assert.fail("Wrong contract");
+    assert.equal(parsed.recipient.target.threadId, 42); assert.equal(parsed.effect.text, "Status");
+    const local = createTelegramBusProtocolIdentity({ runtimeBuild: "candidate", capabilities: [TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY] });
+    const old = createTelegramBusProtocolIdentity({ runtimeBuild: "old", capabilities: [] });
+    assert.equal(hasTelegramBusCapability(local, TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY), true);
+    assert.equal(hasTelegramBusCapability(old, TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY), false);
+    assert.deepEqual(parseTelegramBusEnvelope(encodeTelegramBusEnvelope(parsed)), parsed);
+  });
+}
+
+for (const fault of ["missing-generation", "missing-operation", "missing-session", "invalid-generation", "invalid-pid", "missing-birth", "missing-profile", "missing-journal",
+  "profile-alias", "foreign-chat", "missing-thread", "invalid-thread", "unknown-recipient", "unknown-executor", "missing-epoch", "foreign-operator", "missing-request",
+  "blank-text", "oversized-text", "unsupported-effect", "send-with-edit-id", "edit-with-reply", "missing-edit-id", "unknown-effect", "parse-mode", "negative-time",
+  "infinite-time", "raw-method", "callback", "reply-url", "oversized-callback", "empty-keyboard-row"] as const) {
+  test(`Selected follower menu wire refuses unsupported or malformed effect without ordinary fallback (${fault})`, () => {
+    const value: Record<string, unknown> = selectedMenuWire(fault === "edit-with-reply" || fault === "missing-edit-id" ? "edit-text" : "send-text");
+    const recipient = value.recipient as Record<string, unknown>, target = recipient.target as Record<string, unknown>;
+    const executor = value.executor as Record<string, unknown>, effect = value.effect as Record<string, unknown>;
+    const markup = effect.replyMarkup as { inline_keyboard: Record<string, unknown>[][] }, button = markup.inline_keyboard[0]![0]!;
+    if (fault === "missing-generation") value.registrationGeneration = "";
+    if (fault === "missing-operation") value.operationId = "";
+    if (fault === "missing-session") recipient.sessionId = "";
+    if (fault === "invalid-generation") recipient.sessionGeneration = -1;
+    if (fault === "invalid-pid") recipient.processId = 1.5;
+    if (fault === "missing-birth") recipient.processBirthId = "";
+    if (fault === "missing-profile") recipient.profileKey = "";
+    if (fault === "missing-journal") recipient.journalBindingKey = "";
+    if (fault === "profile-alias") recipient.journalBindingKey = recipient.profileKey;
+    if (fault === "foreign-chat") target.chatId = -7;
+    if (fault === "missing-thread") delete target.threadId;
+    if (fault === "invalid-thread") target.threadId = 0;
+    if (fault === "unknown-recipient") recipient.callback = "not-wire-authority";
+    if (fault === "unknown-executor") executor.callback = "not-wire-authority";
+    if (fault === "missing-epoch") executor.leaderEpoch = "";
+    if (fault === "foreign-operator") value.operatorUserId = 8;
+    if (fault === "missing-request") value.requestId = "";
+    if (fault === "blank-text") effect.text = " ";
+    if (fault === "oversized-text") effect.text = "x".repeat(4097);
+    if (fault === "unsupported-effect") effect.kind = "delete-message";
+    if (fault === "send-with-edit-id") effect.messageId = 99;
+    if (fault === "edit-with-reply") effect.replyToMessageId = 99;
+    if (fault === "missing-edit-id") delete effect.messageId;
+    if (fault === "unknown-effect") effect.extra = true;
+    if (fault === "parse-mode") effect.parseMode = "MarkdownV2";
+    if (fault === "negative-time") value.sentAtMs = -1;
+    if (fault === "infinite-time") value.sentAtMs = Infinity;
+    if (fault === "raw-method") value.method = "sendMessage";
+    if (fault === "callback") value.assertAuthority = "callback-placeholder";
+    if (fault === "reply-url") button.url = "https://example.invalid";
+    if (fault === "oversized-callback") button.callback_data = "я".repeat(33);
+    if (fault === "empty-keyboard-row") markup.inline_keyboard = [[]];
+    assert.equal(parseTelegramBusEnvelope(JSON.stringify(value)), undefined);
+  });
+}
+
+test("Selected menu wire decoding does not reinterpret ordinary follower API or mint callback authority", () => {
+  const ordinary = { kind: "follower.callApi", requestId: "legacy", instanceId: "follower", registrationGeneration: "registration", method: "call",
+    args: ["sendMessage", { chat_id: 7, text: "ordinary" }], sentAtMs: 1000 };
+  assert.deepEqual(parseTelegramBusEnvelope(JSON.stringify(ordinary)), ordinary);
+  const parsed = parseTelegramBusEnvelope(JSON.stringify(selectedMenuWire()));
+  assert.equal(parsed?.kind, "follower.deliverSelectedMenu");
+  assert.equal("assertAuthority" in parsed!, false);
+  assert.equal("method" in parsed!, false); assert.equal("args" in parsed!, false);
+  assert.equal(hasTelegramBusCapability(createTelegramBusProtocolIdentity({ runtimeBuild: "root-default" }), TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY), false);
+});
 
 test("Bus envelope auth compares the exact secret in constant time", () => {
   const secret = "leader-minted-secret";
@@ -259,84 +487,6 @@ test("Current bus process runtime owns process identity defaults", () => {
   assert.match(runtime.manualFollowerOwnerId, /^7:/u);
 });
 
-test("Darwin process birth identity survives extension generations", () => {
-  const options = {
-    platform: "darwin" as const,
-    readDarwinProcessStart: () => "Wed Jul 29 16:19:07 2026",
-  };
-  const first = getTelegramProcessBirthIdentity(75433, 1000, options);
-  const reloaded = getTelegramProcessBirthIdentity(75433, 2000, options);
-
-  assert.equal(reloaded, first);
-  assert.match(first, /^75433:start:[a-f0-9]{16}$/u);
-});
-
-test(
-  "Current Darwin process birth identity survives extension generations",
-  { skip: process.platform !== "darwin" },
-  () => {
-    const first = getTelegramProcessBirthIdentity(process.pid, 1000);
-    const reloaded = getTelegramProcessBirthIdentity(process.pid, 2000);
-
-    assert.equal(reloaded, first);
-    assert.match(first, new RegExp(`^${process.pid}:start:[a-f0-9]{16}$`, "u"));
-  },
-);
-
-test("Process liveness requires a stable platform birth proof", () => {
-  const linuxStat = (ticks: string) =>
-    `(worker name) S ${Array(18).fill("0").join(" ")} ${ticks}`;
-  assert.equal(
-    getTelegramProcessLiveness(
-      { processId: 42, processBirthId: "42:start:12345" },
-      {
-        platform: "linux",
-        isProcessAlive: () => true,
-        readProcStat: () => linuxStat("12345"),
-      },
-    ),
-    "alive",
-  );
-  assert.equal(
-    getTelegramProcessLiveness(
-      { processId: 42, processBirthId: "42:start:old" },
-      {
-        platform: "linux",
-        isProcessAlive: () => true,
-        readProcStat: () => linuxStat("new"),
-      },
-    ),
-    "dead",
-  );
-  assert.equal(
-    getTelegramProcessLiveness(
-      { processId: 42, processBirthId: "42:generation:owner" },
-      { platform: "win32", isProcessAlive: () => true },
-    ),
-    "unverifiable",
-  );
-  assert.equal(
-    getTelegramProcessLiveness(
-      { processId: 42, processBirthId: "42:start:any" },
-      { platform: "win32", isProcessAlive: () => false },
-    ),
-    "dead",
-  );
-  assert.equal(
-    getTelegramProcessLiveness(
-      { processId: 42, processBirthId: "42:start:any" },
-      {
-        platform: "darwin",
-        isProcessAlive: () => true,
-        readDarwinProcessStart: () => {
-          throw new Error("inaccessible");
-        },
-      },
-    ),
-    "unverifiable",
-  );
-});
-
 test("Wrapped follower owner keys expose their raw process-birth identity", () => {
   for (const telegramProfile of [undefined, "work"]) {
     const key = getTelegramThreadOwnerKey({ kind: "manual-follower",
@@ -349,37 +499,6 @@ test("Wrapped follower owner keys expose their raw process-birth identity", () =
       platform: "linux", isProcessAlive: () => false,
     }), "dead");
   }
-});
-
-test("Process birth identity liveness fails closed for opaque and live fallback identities", () => {
-  const stat = `(worker) S ${Array(18).fill("0").join(" ")} 12345`;
-  const options = { platform: "linux" as const, isProcessAlive: () => true,
-    readProcStat: () => stat };
-  assert.equal(getTelegramProcessBirthIdentityLiveness("42:start:12345", options), "alive");
-  assert.equal(getTelegramProcessBirthIdentityLiveness("42:start:999", options), "dead");
-  assert.equal(getTelegramProcessBirthIdentityLiveness("42:generation:fallback", options), "unverifiable");
-  assert.equal(getTelegramProcessBirthIdentityLiveness("opaque", options), "unverifiable");
-  assert.equal(getTelegramProcessBirthIdentityLiveness("42:start:12345", {
-    ...options, isProcessAlive: () => false,
-  }), "dead");
-});
-
-test("Process birth identity preserves Linux start ticks and fallback", () => {
-  const stat = `(worker name) S ${Array(18).fill("0").join(" ")} 12345`;
-  assert.equal(
-    getTelegramProcessBirthIdentity(42, 1000, {
-      platform: "linux",
-      readProcStat: () => stat,
-    }),
-    "42:start:12345",
-  );
-  assert.equal(
-    getTelegramProcessBirthIdentity(42, 1000, {
-      platform: "darwin",
-      readDarwinProcessStart: () => "",
-    }),
-    "42:generation:1000",
-  );
 });
 
 test("Bus process runtime resolves live profile endpoints", () => {
@@ -2912,4 +3031,22 @@ test("Bus follower registry returns defensive copies", () => {
     chatId: 1,
     threadId: 2,
   });
+});
+
+test("Bus follower registration identity ignores liveness and target but not process, endpoint or protocol", () => {
+  const protocol = createTelegramBusProtocolIdentity({ runtimeBuild: "fixture", capabilities: [] });
+  const captured = { instanceId: "follower", profileKey: "work", sessionId: "session", registrationGeneration: "generation",
+    pid: 42, processBirthId: "42:birth", sessionGeneration: 3, cwd: "/workspace", slot: "B", busSocketPath: "/tmp/follower.sock",
+    protocol, connectedAtMs: 1, target: { chatId: 7, threadId: 10 } };
+  assert.equal(isSameTelegramBusFollowerRegistration(
+    { ...captured, connectedAtMs: 99, target: { chatId: 7, threadId: 11 }, protocol: structuredClone(protocol) }, captured), true);
+  for (const change of [{ registrationGeneration: "next" }, { processBirthId: "42:other" }, { busSocketPath: "/tmp/other.sock" },
+    { slot: "C" }, { protocol: createTelegramBusProtocolIdentity({ runtimeBuild: "other", capabilities: [] }) }]) {
+    assert.equal(isSameTelegramBusFollowerRegistration({ ...captured, ...change }, captured), false, JSON.stringify(change));
+  }
+});
+
+test("Bus rejection acknowledgements carry only the request and diagnostic", () => {
+  assert.deepEqual(rejectTelegramBusRequest("request", "Refused."),
+    { kind: "bus.ack", requestId: "request", ok: false, message: "Refused." });
 });

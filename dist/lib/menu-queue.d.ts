@@ -4,9 +4,10 @@
  * Owns queue-menu rendering, queue item callbacks, and queue-menu runtime adapters while core queue mechanics stay in queue
  */
 import type { TelegramInlineKeyboardMarkup } from "./keyboard.ts";
-import type { TelegramModelMenuState } from "./menu.ts";
+import { type TelegramMenuMessageRuntimeDeps, type TelegramModelMenuState } from "./menu-model.ts";
 import type { MenuModel } from "./model.ts";
 import * as Queue from "./queue.ts";
+import type { TelegramApiCallOptions } from "./telegram-api.ts";
 type TelegramQueueMenuReplyMarkup = TelegramInlineKeyboardMarkup;
 interface TelegramQueueMenuCallbackQuery {
     id: string;
@@ -19,16 +20,16 @@ interface TelegramQueueMenuCallbackQuery {
     };
 }
 interface TelegramQueueMenuRuntime<Context> {
-    openQueueMenu: (chatId: number, replyToMessageId: number, ctx: Context) => Promise<void>;
+    openQueueMenu: (chatId: number, replyToMessageId: number, ctx: Context, threadId?: number, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<void>;
     handleCallbackQuery: (query: TelegramQueueMenuCallbackQuery, ctx: Context) => Promise<boolean>;
 }
 export declare function createTelegramQueueMenuRuntime<Context, TModel extends MenuModel = MenuModel>(deps: {
     telegramQueueStore: Queue.TelegramQueueStateStore<Context>;
     queueMutationRuntime: Queue.TelegramQueueMutationController<Context>;
-    sendInteractiveMessage: (chatId: number, text: string, mode: "html", replyMarkup: TelegramQueueMenuReplyMarkup) => Promise<number | undefined>;
+    sendInteractiveMessage: TelegramMenuMessageRuntimeDeps["sendInteractiveMessage"];
     editInteractiveMessage: (chatId: number, messageId: number, text: string, mode: "html", replyMarkup: TelegramQueueMenuReplyMarkup) => Promise<void>;
     answerCallbackQuery: (callbackQueryId: string, text?: string) => Promise<void>;
-    getModelMenuState: (chatId: number, ctx: Context) => Promise<TelegramModelMenuState<TModel>>;
+    getModelMenuState: (chatId: number, ctx: Context, threadId?: number) => Promise<TelegramModelMenuState<TModel>>;
     getStoredModelMenuState: (messageId: number | undefined, chatId?: number) => TelegramModelMenuState<TModel> | undefined;
     storeModelMenuState: (state: TelegramModelMenuState<TModel>) => void;
     updateStatusMessage: (state: TelegramModelMenuState<TModel>, ctx: Context) => Promise<void>;

@@ -13,6 +13,8 @@ import {
   getTelegramTargetKey,
   getTelegramTargetThreadParams,
   isTelegramThreadTarget,
+  parseTelegramIntegerId,
+  parseTelegramTarget,
 } from "../lib/target.ts";
 
 test("Telegram target helpers model private chat targets", () => {
@@ -57,4 +59,13 @@ test("Telegram target equality is exact address-value equality without normaliza
   assert.equal(areTelegramTargetsEqual(invalid, invalid), false, "reference identity cannot bypass field equality");
   assert.equal(getTelegramTargetKey({ chatId: 1, threadId: undefined }), "1:private");
   assert.equal(getTelegramTargetKey({ chatId: -1, threadId: 0 }), "-1:0");
+});
+
+test("Target wire parsers keep only exact address fields and integer ids", () => {
+  assert.deepEqual(parseTelegramTarget({ chatId: 7, threadId: 42, extra: true }), { chatId: 7, threadId: 42 });
+  assert.deepEqual(parseTelegramTarget({ chatId: 7, threadId: "42" }), { chatId: 7 });
+  for (const value of [undefined, null, [], "7", { chatId: "7" }]) assert.equal(parseTelegramTarget(value), undefined);
+  assert.equal(parseTelegramIntegerId(42), 42);
+  assert.equal(parseTelegramIntegerId("-100"), -100);
+  for (const value of [1.5, "", " ", "1.5", "x", null, undefined]) assert.equal(parseTelegramIntegerId(value), undefined);
 });

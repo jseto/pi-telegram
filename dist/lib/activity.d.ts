@@ -95,6 +95,7 @@ export declare function registerTelegramActivityHandler(registration: TelegramAc
 export declare function clearTelegramActivityHandlers(): void;
 /** @internal */
 export interface TelegramActivityDispatcher {
+    hasPending?: () => boolean;
     dispatch: (event: TelegramActivityEvent) => void;
     stop: () => void;
 }
@@ -151,6 +152,7 @@ export type TelegramAssistantStreamEvent = {
 };
 /** @internal */
 export interface TelegramActivityRuntime {
+    hasPending?: () => boolean | undefined;
     onSessionStart?: () => void;
     recordInputSource: (source: TelegramActivityInputSource) => void;
     onAgentStart: (activeTelegramTarget?: TelegramActivityTarget, replyToMessageId?: number) => void;
@@ -193,9 +195,16 @@ export interface TelegramActivityPublicationReservation {
     publish: (task: () => Promise<void>) => Promise<void>;
     cancel: () => void;
 }
+export interface TelegramActivityPublicationWork {
+    settle(outcome: "settled" | "unconfirmed"): void;
+}
 export interface TelegramActivityPublicationRuntime {
     enqueue: (task: () => Promise<void>) => Promise<void>;
     reserve: () => TelegramActivityPublicationReservation;
+    hasPending: () => boolean;
+    /** Observation only; detached work never occupies the ordered publication tail. */
+    beginWork: () => TelegramActivityPublicationWork;
+    hasUnconfirmed: () => boolean;
     reset: () => void;
 }
 export declare function createTelegramActivityPublicationRuntime(): TelegramActivityPublicationRuntime;

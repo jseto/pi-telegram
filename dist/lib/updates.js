@@ -5,11 +5,12 @@
  */
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { isWireRecord as isTelegramUpdateAdmissionRecord, isNonEmptyWireString as isTelegramUpdateAdmissionString, } from "./wire.js";
-import { createTelegramPrivateTarget, createTelegramThreadTarget, } from "./target.js";
-import { TELEGRAM_UPDATE_JOURNAL_VERSION, TELEGRAM_UPDATE_JOURNAL_EXCLUSION_VERSION, TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION, isTelegramUpdateJournalLegacyFamilyVersion, TELEGRAM_UPDATE_JOURNAL_FAILURE_CLASS_MAX_LENGTH, TELEGRAM_UPDATE_JOURNAL_FAILURE_SUMMARY_MAX_LENGTH, TELEGRAM_UPDATE_JOURNAL_QUEUE_OWNER_ID_MAX_LENGTH, areTelegramUpdateJournalQueueOwnersEqual, createTelegramUpdateJournalEntryDigest, getTelegramUpdateJournalBindingPath, isTelegramUpdateJournalQueueOwnerProcess, parseTelegramUpdateJournalQueueOwner, } from "./journal.js";
-import { areTelegramQueueAdmissionReceiptsEqual, createTelegramQueueHandoff, removeTelegramQueueItemByReceipt, } from "./queue.js";
 import { createTelegramUserPairingRuntime, getTelegramAuthorizationState, } from "./config.js";
+import { TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION, TELEGRAM_UPDATE_JOURNAL_EXCLUSION_VERSION, TELEGRAM_UPDATE_JOURNAL_FAILURE_CLASS_MAX_LENGTH, TELEGRAM_UPDATE_JOURNAL_FAILURE_SUMMARY_MAX_LENGTH, TELEGRAM_UPDATE_JOURNAL_QUEUE_OWNER_ID_MAX_LENGTH, TELEGRAM_UPDATE_JOURNAL_VERSION, areTelegramUpdateJournalQueueOwnersEqual, createTelegramUpdateJournalEntryDigest, doesTelegramJournalUpdateNameThread, isTelegramJournalLoneCallbackUpdate, getTelegramUpdateJournalBindingPath, isTelegramUpdateJournalLegacyFamilyVersion, isTelegramUpdateJournalQueueOwnerProcess, parseTelegramUpdateJournalQueueOwner, } from "./journal.js";
+import { isPiStaleContextError } from "./pi.js";
+import { areTelegramQueueAdmissionReceiptsEqual, createTelegramQueueHandoff, removeTelegramQueueItemByReceipt, } from "./queue.js";
+import { createTelegramPrivateTarget, createTelegramThreadTarget, } from "./target.js";
+import { isWireRecord as isTelegramUpdateAdmissionRecord, isNonEmptyWireString as isTelegramUpdateAdmissionString, } from "./wire.js";
 export const TELEGRAM_PRIORITY_REACTIONS = [
     { id: 10, name: "like", emoji: "👍" },
     { id: 11, name: "lightning", emoji: "⚡" },
@@ -26,9 +27,6 @@ export const TELEGRAM_REMOVAL_REACTIONS = [
 ];
 export const TELEGRAM_PRIORITY_REACTION_EMOJIS = TELEGRAM_PRIORITY_REACTIONS.map((reaction) => reaction.emoji);
 export const TELEGRAM_REMOVAL_REACTION_EMOJIS = TELEGRAM_REMOVAL_REACTIONS.map((reaction) => reaction.emoji);
-function isTelegramMessageIdList(value) {
-    return Array.isArray(value) && value.every((item) => Number.isInteger(item));
-}
 export function normalizeTelegramReactionEmoji(emoji) {
     return emoji.replace(/\uFE0F/g, "");
 }
@@ -64,13 +62,6 @@ function getTelegramQueueReactionTransition(oldReactions, newReactions) {
         transition.suppressionEmoji = newSuppressionEmoji ?? null;
     }
     return transition;
-}
-export function extractDeletedTelegramMessageIds(update) {
-    const deletedBusinessMessageIds = update.deleted_business_messages?.message_ids;
-    if (isTelegramMessageIdList(deletedBusinessMessageIds)) {
-        return deletedBusinessMessageIds;
-    }
-    return [];
 }
 export function getTelegramTopicLifecycleUpdate(message) {
     if (!message ||
@@ -111,21 +102,18 @@ export function getAuthorizedTelegramCallbackQuery(update, allowedUserId) {
         return query;
     return query.from.id === allowedUserId ? query : undefined;
 }
-export function getAuthorizedTelegramMessage(update, allowedUserId) {
-    const message = update.message;
+function authorizeTelegramHumanMessage(message, allowedUserId) {
     if (!message || !message.from || message.from.is_bot)
         return undefined;
     if (message.chat.type === "private")
         return message;
     return message.from.id === allowedUserId ? message : undefined;
 }
+export function getAuthorizedTelegramMessage(update, allowedUserId) {
+    return authorizeTelegramHumanMessage(update.message, allowedUserId);
+}
 export function getAuthorizedTelegramEditedMessage(update, allowedUserId) {
-    const message = update.edited_message;
-    if (!message || !message.from || message.from.is_bot)
-        return undefined;
-    if (message.chat.type === "private")
-        return message;
-    return message.from.id === allowedUserId ? message : undefined;
+    return authorizeTelegramHumanMessage(update.edited_message, allowedUserId);
 }
 export function getAuthorizedTelegramGuestMessage(update) {
     const guestMessage = update.guest_message;
@@ -221,21 +209,15 @@ export function bindTelegramUpdateAdmissionSource(update, report, controls) {
 }
 /**
  * Conservative read-only census: any retained entry naming this Thread, in any nested Telegram object or state,
- * is unresolved custody. It cannot see updates still in transit before journal append.
+ * is unresolved custody, except a lone button tap, which carries no input (the in-flight Cancel itself).
+ * It cannot see updates still in transit before journal append.
  */
 export function collectTelegramJournalThreadUpdateIds(entries, target) {
-    const matches = (value, depth) => {
-        if (depth > 8 || !value || typeof value !== "object")
-            return false;
-        const record = value;
-        if (record.message_thread_id === target.threadId) {
-            const chat = record.chat;
-            if (!chat || typeof chat !== "object" || chat.id === target.chatId)
-                return true;
-        }
-        return Object.values(record).some(child => matches(child, depth + 1));
-    };
-    return entries.filter(entry => matches(entry.update, 0)).map(entry => entry.updateId).sort((left, right) => left - right);
+    return entries
+        .filter((entry) => doesTelegramJournalUpdateNameThread(entry.update, target) &&
+        !isTelegramJournalLoneCallbackUpdate(entry.update))
+        .map((entry) => entry.updateId)
+        .sort((left, right) => left - right);
 }
 export function collectTelegramAdmissionSourceUpdateIds(values) {
     const sourceUpdateIds = new Set();
@@ -253,15 +235,62 @@ export function inspectTelegramDeferredSource(value) {
         return undefined;
     return getTelegramUpdateAdmissionBinding(value)?.inspectSource?.();
 }
+/** Read an exact current original for peer preparation without another payload authority. */
+export function inspectTelegramDeferredSourceSnapshot(value) {
+    const execution = getTelegramUpdateExecutionFence(value);
+    if (execution?.isCurrent() !== true)
+        return undefined;
+    const snapshot = getTelegramUpdateAdmissionBinding(value)?.inspectSourceSnapshot?.();
+    return execution.isCurrent() ? snapshot : undefined;
+}
+/** Exact warm removal ACK only; reporting, source absence and a replaced worker cannot supply it. */
+export function inspectTelegramDeferredSourceCompletion(value) {
+    const execution = getTelegramUpdateExecutionFence(value);
+    if (execution?.isCurrent() !== true)
+        return undefined;
+    const source = getTelegramUpdateAdmissionBinding(value)?.inspectCompletion?.();
+    return execution.isCurrent() && source ? { ...source } : undefined;
+}
+/** Reuse only live bound deferred originals; raw IDs or cold/adopted input cannot mint this carrier. */
+export function prepareTelegramLiveDeferredInput(values, isCurrent) {
+    const carriers = [...values], first = carriers[0], execution = getTelegramUpdateExecutionFence(first);
+    const ids = collectTelegramAdmissionSourceUpdateIds(carriers);
+    if (!execution ||
+        ids.length !== carriers.length ||
+        !ids.length ||
+        !isCurrent() ||
+        carriers.some((value) => getTelegramUpdateExecutionFence(value)?.signal !== execution.signal ||
+            getTelegramUpdateExecutionFence(value)?.isCurrent() !== true))
+        return undefined;
+    const unsettled = () => carriers.every((value) => getTelegramUpdateAdmissionBinding(value)?.isSourceUnsettled?.() ===
+        true);
+    if (!unsettled())
+        return undefined;
+    const prepared = getTelegramUpdateAdmissionBinding(first)?.prepareLiveInput?.(ids, () => isCurrent() &&
+        carriers.every((value) => getTelegramUpdateExecutionFence(value)?.isCurrent() === true));
+    return (prepared && {
+        ...prepared,
+        isCurrent: () => unsettled() && prepared.isCurrent(),
+        confirmSaved: () => unsettled() && prepared.confirmSaved(),
+        beginRelease: (canRelease) => unsettled() && prepared.beginRelease(() => unsettled() && canRelease()),
+        settleTransferred: (canSettle) => unsettled()
+            ? prepared.settleTransferred(() => unsettled() && canSettle())
+            : "protected",
+        cancel: () => unsettled() && prepared.cancel(),
+    });
+}
 /** A route-owned pre-disposition acceptance publisher; wraps only this carrier, never the shared worker binding. */
 export function bindTelegramUpdateCompletionAcceptance(value, publish) {
     const binding = getTelegramUpdateAdmissionBinding(value);
-    if (!binding || getTelegramUpdateExecutionFence(value)?.isCurrent() !== true) {
+    if (!binding ||
+        getTelegramUpdateExecutionFence(value)?.isCurrent() !== true) {
         throw new TelegramUpdateAdmissionOutcomeError("Telegram completion acceptance requires a live source carrier.");
     }
     let retained;
     let queued = false;
-    const scoped = { ...binding, report(outcome) {
+    const scoped = {
+        ...binding,
+        report(outcome) {
             if (outcome.kind !== "complete") {
                 if (outcome.kind === "queued")
                     queued = true;
@@ -277,19 +306,26 @@ export function bindTelegramUpdateCompletionAcceptance(value, publish) {
             }
             if (!retained) {
                 const published = validateTelegramUpdateAdmissionOutcome({ kind: "complete", expectedSource: publish() }, binding.sourceUpdateId, new Set([binding.sourceUpdateId]));
-                if (published.kind !== "complete" || !published.expectedSource?.completionSha256) {
+                if (published.kind !== "complete" ||
+                    !published.expectedSource?.completionSha256) {
                     throw new TelegramUpdateAdmissionOutcomeError("Telegram completion acceptance lacks its scoped journal proof.");
                 }
                 retained = published.expectedSource;
             }
             assertTelegramUpdateExecutionCurrent(value);
-            if (outcome.expectedSource && (outcome.expectedSource.updateId !== retained.updateId ||
-                outcome.expectedSource.journalBindingKey !== retained.journalBindingKey || outcome.expectedSource.sourceSha256 !== retained.sourceSha256 ||
-                outcome.expectedSource.completionSha256 !== undefined && outcome.expectedSource.completionSha256 !== retained.completionSha256)) {
+            if (outcome.expectedSource &&
+                (outcome.expectedSource.updateId !== retained.updateId ||
+                    outcome.expectedSource.journalBindingKey !==
+                        retained.journalBindingKey ||
+                    outcome.expectedSource.sourceSha256 !== retained.sourceSha256 ||
+                    (outcome.expectedSource.completionSha256 !== undefined &&
+                        outcome.expectedSource.completionSha256 !==
+                            retained.completionSha256))) {
                 throw new TelegramUpdateAdmissionOutcomeError("Telegram completion acceptance conflicts with its reported source.");
             }
             binding.report({ kind: "complete", expectedSource: { ...retained } });
-        } };
+        },
+    };
     return carryTelegramUpdateExecutionFence(value, bindTelegramUpdateAdmissionCarrier(value, scoped));
 }
 /** Report source completion; true means reported, not a durable settlement acknowledgement. */
@@ -300,7 +336,10 @@ export function reportTelegramUpdateCompleted(value, expectedSource) {
     const execution = getTelegramUpdateExecutionFence(value);
     if (execution && !execution.isCurrent())
         return false;
-    binding.report(validateTelegramUpdateAdmissionOutcome({ kind: "complete", ...(expectedSource !== undefined ? { expectedSource } : {}) }, binding.sourceUpdateId, new Set([binding.sourceUpdateId])));
+    binding.report(validateTelegramUpdateAdmissionOutcome({
+        kind: "complete",
+        ...(expectedSource !== undefined ? { expectedSource } : {}),
+    }, binding.sourceUpdateId, new Set([binding.sourceUpdateId])));
     return true;
 }
 export function reportTelegramUpdateDeferred(value) {
@@ -319,7 +358,7 @@ export function abandonTelegramDeferredUpdate(value, authority) {
 }
 /** Capability for chooser publication; the eventual action still requires exact deferred authority. */
 export function supportsTelegramDeferredAbandonment(value, journalBindingKey) {
-    return getTelegramUpdateAdmissionBinding(value)?.supportsAbandonment?.(journalBindingKey) === true;
+    return (getTelegramUpdateAdmissionBinding(value)?.supportsAbandonment?.(journalBindingKey) === true);
 }
 /** Observe protected attempts through a current carrier; the UI still owns human authorization. */
 export function inspectTelegramAbandoningUpdates(value, request) {
@@ -330,31 +369,97 @@ export function inspectTelegramHistoricalInputs(value, request) {
     return getTelegramUpdateAdmissionBinding(value)?.inspectHistorical?.(request);
 }
 export function isTelegramHistoricalInput(value, matchesOriginal) {
-    return getTelegramUpdateAdmissionBinding(value)?.isHistorical?.(matchesOriginal) === true;
+    return (getTelegramUpdateAdmissionBinding(value)?.isHistorical?.(matchesOriginal) === true);
 }
 /** Routing's last-boundary hold when ownership changed after early classification. */
 export function reportTelegramHistoricalRoutingReview(value) {
-    if (!isTelegramHistoricalInput(value) || getTelegramUpdateExecutionFence(value)?.isCurrent() !== true)
+    if (!isTelegramHistoricalInput(value) ||
+        getTelegramUpdateExecutionFence(value)?.isCurrent() !== true)
         return false;
-    getTelegramUpdateAdmissionBinding(value).report({ kind: "deferred", routingReview: true });
+    getTelegramUpdateAdmissionBinding(value).report({
+        kind: "deferred",
+        routingReview: true,
+    });
     return true;
 }
 /** Arm only a positively published chooser; the journal owns the immutable hour deadline. */
-export function armTelegramRoutingInputs(values, operatorUserId) {
+export function armTelegramRoutingInputs(values, operatorUserId, chooser) {
     const first = values[0], execution = getTelegramUpdateExecutionFence(first);
-    if (!execution || values.some(value => getTelegramUpdateExecutionFence(value)?.signal !== execution.signal))
+    if (!execution ||
+        values.some((value) => getTelegramUpdateExecutionFence(value)?.signal !== execution.signal))
         return undefined;
     for (const value of values)
         assertTelegramUpdateExecutionCurrent(value);
     const ids = collectTelegramAdmissionSourceUpdateIds(values);
     if (!ids.length)
         return undefined;
-    return getTelegramUpdateAdmissionBinding(first)?.armRoutingInput?.(operatorUserId, ids);
+    return getTelegramUpdateAdmissionBinding(first)?.armRoutingInput?.(operatorUserId, ids, chooser);
+}
+/** A routed carrier's saved routing clock; a revived chooser reuses its recorded message. */
+export function getTelegramUpdateRoutingInput(value) {
+    return getTelegramUpdateAdmissionBinding(value)?.getRoutingInput?.();
 }
 /** Reserve source execution; an actual choice must also freeze its durable TTL before any effect. */
 export function acquireTelegramUpdateRouting(value, select = false, sourceUpdateIds) {
     assertTelegramUpdateExecutionCurrent(value);
-    return getTelegramUpdateAdmissionBinding(value)?.acquireRouting?.(select, sourceUpdateIds) ?? (() => { });
+    return (getTelegramUpdateAdmissionBinding(value)?.acquireRouting?.(select, sourceUpdateIds) ?? (() => { }));
+}
+/** Capture existing warm completion authority; only explicit reporting may dispose this exact original. */
+export function prepareTelegramDeferredSourceCompletion(value) {
+    const execution = getTelegramUpdateExecutionFence(value), binding = getTelegramUpdateAdmissionBinding(value);
+    if (!execution ||
+        execution.isCurrent() !== true ||
+        !binding?.prepareSourceCompletion ||
+        !binding.inspectCompletion ||
+        !binding.inspectSource)
+        return undefined;
+    const prepare = binding.prepareSourceCompletion, inspect = binding.inspectCompletion, readSource = binding.inspectSource, report = binding.report;
+    const available = prepare(), source = available && { ...available.source };
+    const current = () => !!available &&
+        available.isCurrent() &&
+        execution.isCurrent() &&
+        getTelegramUpdateExecutionFence(value) === execution &&
+        getTelegramUpdateAdmissionBinding(value) === binding &&
+        binding.prepareSourceCompletion === prepare &&
+        binding.inspectCompletion === inspect &&
+        binding.inspectSource === readSource &&
+        binding.report === report;
+    if (!source ||
+        !current() ||
+        !isDeepStrictEqual(readSource(), source) ||
+        !current())
+        return undefined;
+    let attempted = false, reported = false;
+    return {
+        get source() {
+            return { ...source };
+        },
+        isCurrent: current,
+        reportCompleted() {
+            if (attempted)
+                return false;
+            attempted = true;
+            if (!current() || !isDeepStrictEqual(readSource(), source) || !current())
+                return false;
+            reported = true;
+            // Acceptance remains separate from the asynchronously issued worker removal ACK, including after a lost report.
+            return reportTelegramUpdateCompleted(value, { ...source });
+        },
+        inspectCompletion() {
+            if (!reported || !current())
+                return undefined;
+            const completed = inspect();
+            return current() && isDeepStrictEqual(completed, source)
+                ? { ...source }
+                : undefined;
+        },
+    };
+}
+/** Read-only warm owner availability; no source freeze, admission, report or receipt reconstruction. */
+export function prepareTelegramDeferredQueueAdmission(value) {
+    if (getTelegramUpdateExecutionFence(value)?.isCurrent() !== true)
+        return undefined;
+    return getTelegramUpdateAdmissionBinding(value)?.prepareQueueAdmission?.();
 }
 export function reportTelegramQueueAdmission(values, receipts) {
     const bindings = new Map();
@@ -492,12 +597,9 @@ export function buildTelegramUpdateExecutionPlan(action) {
 export function buildTelegramUpdateExecutionPlanFromUpdate(update, allowedUserId) {
     return buildTelegramUpdateExecutionPlan(buildTelegramUpdateFlowAction(update, allowedUserId));
 }
-const TELEGRAM_UNAUTHORIZED_DENIAL_COPY = "Access denied.";
-function formatTelegramUnauthorizedDenial(format) {
-    return format === "html"
-        ? `<b>🚫 ${TELEGRAM_UNAUTHORIZED_DENIAL_COPY}</b>`
-        : `🚫 ${TELEGRAM_UNAUTHORIZED_DENIAL_COPY}`;
-}
+/** The fleeting toast and the in-chat notice are separate copy, each written in its own form. */
+const TELEGRAM_UNAUTHORIZED_DENIAL_TOAST = "Access denied";
+const TELEGRAM_UNAUTHORIZED_DENIAL_NOTICE = "<b>🚫 Access denied.</b>";
 function getTelegramCallbackQueryId(query) {
     return typeof query.id === "string" ? query.id : undefined;
 }
@@ -529,7 +631,8 @@ function getForeignTelegramMessageOwnership(target, deps) {
 function getForeignTelegramCallbackOwnership(query, deps) {
     const messageTarget = getTelegramCallbackMessageTarget(query);
     const currentInstanceId = deps.getCurrentInstanceId?.();
-    const knownOwner = messageTarget && deps.getMessageOwnership?.(messageTarget.chatId, messageTarget.messageId);
+    const knownOwner = messageTarget &&
+        deps.getMessageOwnership?.(messageTarget.chatId, messageTarget.messageId);
     // A locally published chooser stays local when Restore moves its Thread to a follower.
     if (currentInstanceId && knownOwner?.instanceId === currentInstanceId)
         return undefined;
@@ -644,8 +747,12 @@ export function createTelegramUpdateRuntime(deps) {
 export async function handleAuthorizedTelegramReactionUpdate(reactionUpdate, deps) {
     const reactionUser = reactionUpdate.user;
     const allowedUserId = deps.allowedUserId;
-    if (allowedUserId === undefined || !Number.isSafeInteger(allowedUserId) || allowedUserId <= 0 ||
-        !reactionUser || reactionUser.is_bot || reactionUser.id !== allowedUserId ||
+    if (allowedUserId === undefined ||
+        !Number.isSafeInteger(allowedUserId) ||
+        allowedUserId <= 0 ||
+        !reactionUser ||
+        reactionUser.is_bot ||
+        reactionUser.id !== allowedUserId ||
         reactionUpdate.actor_chat !== undefined)
         return;
     const foreignOwnership = getForeignTelegramMessageOwnership(getTelegramReactionMessageTarget(reactionUpdate), deps);
@@ -674,11 +781,6 @@ export async function handleAuthorizedTelegramReactionUpdate(reactionUpdate, dep
     await deps.flushPendingTextGroupMessage?.(reactionUpdate.message_id);
     deps.assertExecutionCurrent?.();
     deps.applyQueuedTelegramTurnReactionByMessageId(reactionUpdate.message_id, reactionTransition, deps.ctx, reactionScope);
-}
-function isTelegramStaleContextError(error) {
-    return (error instanceof Error &&
-        (error.message.includes("stale after session") ||
-            error.message.includes("stale ctx")));
 }
 export async function executeTelegramUpdatePlan(plan, deps) {
     try {
@@ -712,7 +814,7 @@ export async function executeTelegramUpdatePlan(plan, deps) {
                 const callbackQueryId = getTelegramCallbackQueryId(plan.query);
                 if (callbackQueryId) {
                     assertExecutionCurrent();
-                    await deps.answerCallbackQuery(callbackQueryId, formatTelegramUnauthorizedDenial("plain"));
+                    await deps.answerCallbackQuery(callbackQueryId, TELEGRAM_UNAUTHORIZED_DENIAL_TOAST);
                 }
                 return;
             }
@@ -729,7 +831,7 @@ export async function executeTelegramUpdatePlan(plan, deps) {
                     try {
                         if (callbackQueryId) {
                             assertExecutionCurrent();
-                            await deps.answerCallbackQuery(callbackQueryId, "This Telegram message belongs to another Pi instance.");
+                            await deps.answerCallbackQuery(callbackQueryId, "This Telegram message belongs to another Pi instance");
                         }
                     }
                     finally {
@@ -747,7 +849,7 @@ export async function executeTelegramUpdatePlan(plan, deps) {
         if (plan.kind === "guest") {
             if (plan.shouldDeny) {
                 assertExecutionCurrent();
-                await deps.answerGuestQuery(plan.guestMessage.guest_query_id, formatTelegramUnauthorizedDenial("html"), { parseMode: "HTML" });
+                await deps.answerGuestQuery(plan.guestMessage.guest_query_id, TELEGRAM_UNAUTHORIZED_DENIAL_NOTICE, { parseMode: "HTML" });
                 return;
             }
             if (deps.handleAuthorizedTelegramGuestMessage) {
@@ -766,7 +868,7 @@ export async function executeTelegramUpdatePlan(plan, deps) {
         if (plan.shouldDeny || (plan.shouldPair && !pairedNow)) {
             if (replyTarget) {
                 assertExecutionCurrent();
-                await deps.sendTextReply(replyTarget.chatId, replyTarget.messageId, formatTelegramUnauthorizedDenial("html"), { parseMode: "HTML", target: replyTarget });
+                await deps.sendTextReply(replyTarget.chatId, replyTarget.messageId, TELEGRAM_UNAUTHORIZED_DENIAL_NOTICE, { parseMode: "HTML", target: replyTarget });
             }
             return;
         }
@@ -851,7 +953,7 @@ export async function executeTelegramUpdatePlan(plan, deps) {
         assertExecutionCurrent();
     }
     catch (error) {
-        if (!isTelegramStaleContextError(error))
+        if (!isPiStaleContextError(error))
             throw error;
     }
 }
@@ -860,22 +962,35 @@ const TELEGRAM_UPDATE_RETRY_BASE_DELAY_MS = 1_000;
 const TELEGRAM_UPDATE_RETRY_MAX_DELAY_MS = 60_000;
 const TELEGRAM_UPDATE_WORKER_BATCH_SIZE = 64;
 function normalizeTelegramQueueSourceCompletions(value, sourceUpdateIds, journalBindingKey, full = true) {
-    if (!Array.isArray(value) || (full ? value.length !== sourceUpdateIds.size : value.length > sourceUpdateIds.size) || value.length === 0)
+    if (!Array.isArray(value) ||
+        (full
+            ? value.length !== sourceUpdateIds.size
+            : value.length > sourceUpdateIds.size) ||
+        value.length === 0)
         throw new Error("Telegram scoped queue completion requires full source coverage.");
     const seen = new Set(), scopes = new Set();
-    return value.map(source => {
-        if (!Number.isSafeInteger(source?.updateId) || !sourceUpdateIds.has(source.updateId) || seen.has(source.updateId)) {
+    return value
+        .map((source) => {
+        if (!Number.isSafeInteger(source?.updateId) ||
+            !sourceUpdateIds.has(source.updateId) ||
+            seen.has(source.updateId)) {
             throw new Error("Telegram scoped queue completion has invalid source membership.");
         }
         const normalized = validateTelegramUpdateAdmissionOutcome({ kind: "complete", expectedSource: source }, source.updateId, sourceUpdateIds);
-        if (normalized.kind !== "complete" || !normalized.expectedSource?.completionSha256 ||
-            normalized.expectedSource.journalBindingKey !== journalBindingKey || scopes.has(normalized.expectedSource.completionSha256)) {
+        if (normalized.kind !== "complete" ||
+            !normalized.expectedSource?.completionSha256 ||
+            normalized.expectedSource.journalBindingKey !== journalBindingKey ||
+            scopes.has(normalized.expectedSource.completionSha256)) {
             throw new Error("Telegram scoped queue completion has invalid source scope.");
         }
         seen.add(source.updateId);
         scopes.add(normalized.expectedSource.completionSha256);
-        return { ...normalized.expectedSource, completionSha256: normalized.expectedSource.completionSha256 };
-    }).sort((a, b) => a.updateId - b.updateId);
+        return {
+            ...normalized.expectedSource,
+            completionSha256: normalized.expectedSource.completionSha256,
+        };
+    })
+        .sort((a, b) => a.updateId - b.updateId);
 }
 class TelegramUpdateAdmissionOutcomeError extends Error {
     constructor(message) {
@@ -884,6 +999,30 @@ class TelegramUpdateAdmissionOutcomeError extends Error {
     }
 }
 const TELEGRAM_UPDATE_WORKER_EXECUTION_ABORTED = Symbol("telegram.update-worker.execution-aborted");
+/** The receipt's only journal entry when it is exactly this prompt update, queued unchanged under this owner. */
+function findExactQueuedPromptEntry(snapshot, receiptId, updateId, queueOwner, update) {
+    if (!isTelegramUpdateJournalLegacyFamilyVersion(snapshot.version))
+        return undefined;
+    const entries = snapshot.entries.filter((entry) => entry.queueReceiptId === receiptId);
+    const entry = entries[0];
+    return entries.length === 1 &&
+        entry?.updateId === updateId &&
+        entry.state === "queued" &&
+        entry.queueKind === "prompt" &&
+        !entry.queueHandoff &&
+        isDeepStrictEqual(entry.queueOwner, queueOwner) &&
+        isDeepStrictEqual(entry.update, update)
+        ? entry
+        : undefined;
+}
+/** A saved chooser clock that proves an untouched, unexpired choice whose chooser message can be revived. */
+export function isRevivableTelegramRoutingInput(entry, nowMs) {
+    const lifetime = entry.routingInput;
+    return (entry.state === "pending" &&
+        lifetime?.phase === "waiting" &&
+        lifetime.chooser !== undefined &&
+        nowMs < lifetime.expiresAtMs);
+}
 function getTelegramUpdateWorkerStateSnapshot(state) {
     return { ...state };
 }
@@ -895,20 +1034,41 @@ function validateTelegramUpdateAdmissionOutcome(value, currentUpdateId, claimabl
         if (value.expectedSource === undefined)
             return { kind: "complete" };
         const source = value.expectedSource;
-        if (!isTelegramUpdateAdmissionRecord(source) || Object.keys(source).some(key => !["journalBindingKey", "updateId", "sourceSha256", "completionSha256"].includes(key)) ||
-            source.updateId !== currentUpdateId || !isTelegramUpdateAdmissionString(source.journalBindingKey) ||
-            typeof source.sourceSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(source.sourceSha256) ||
-            source.completionSha256 !== undefined && (typeof source.completionSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(source.completionSha256))) {
+        if (!isTelegramUpdateAdmissionRecord(source) ||
+            Object.keys(source).some((key) => ![
+                "journalBindingKey",
+                "updateId",
+                "sourceSha256",
+                "completionSha256",
+            ].includes(key)) ||
+            source.updateId !== currentUpdateId ||
+            !isTelegramUpdateAdmissionString(source.journalBindingKey) ||
+            typeof source.sourceSha256 !== "string" ||
+            !/^[a-f0-9]{64}$/u.test(source.sourceSha256) ||
+            (source.completionSha256 !== undefined &&
+                (typeof source.completionSha256 !== "string" ||
+                    !/^[a-f0-9]{64}$/u.test(source.completionSha256)))) {
             throw new TelegramUpdateAdmissionOutcomeError(`Telegram update ${currentUpdateId} returned an invalid completion source.`);
         }
-        return { kind: "complete", expectedSource: { journalBindingKey: source.journalBindingKey,
-                updateId: currentUpdateId, sourceSha256: source.sourceSha256,
-                ...(source.completionSha256 !== undefined ? { completionSha256: source.completionSha256 } : {}) } };
+        return {
+            kind: "complete",
+            expectedSource: {
+                journalBindingKey: source.journalBindingKey,
+                updateId: currentUpdateId,
+                sourceSha256: source.sourceSha256,
+                ...(source.completionSha256 !== undefined
+                    ? { completionSha256: source.completionSha256 }
+                    : {}),
+            },
+        };
     }
     if (value.kind === "deferred") {
         if (value.routingReview !== undefined && value.routingReview !== true)
             throw new TelegramUpdateAdmissionOutcomeError("Invalid historical review outcome.");
-        return { kind: "deferred", ...(value.routingReview === true ? { routingReview: true } : {}) };
+        return {
+            kind: "deferred",
+            ...(value.routingReview === true ? { routingReview: true } : {}),
+        };
     }
     if (value.kind === "queued") {
         if ((value.queueKind !== "prompt" && value.queueKind !== "control") ||
@@ -1002,9 +1162,30 @@ function normalizeTelegramUpdateQueueOwnerIdentity(value) {
     }
     return { ...value };
 }
+/** Clear claim, retry and failure projections after the worker forgets its local claims. */
+function clearTelegramUpdateWorkerClaimState(state, unsettledExecutionCount) {
+    state.deferredClaimCount = 0;
+    delete state.abandoningClaimCount;
+    delete state.historicalClaimCount;
+    state.queuedClaimCount = 0;
+    state.foreignQueuedCount = 0;
+    delete state.foreignQueuedOwner;
+    state.retryWaitCount = 0;
+    state.failedCount = 0;
+    state.nextRetryUpdateId = undefined;
+    state.nextRetryAtMs = undefined;
+    state.nextRetryAttemptCount = undefined;
+    state.nextRetryFailureClass = undefined;
+    state.failedUpdateId = undefined;
+    state.failedFailureId = undefined;
+    state.failedAttemptCount = undefined;
+    state.failedClass = undefined;
+    state.failedSummary = undefined;
+    state.terminalFailureAtMs = undefined;
+    state.unsettledExecutionCount = unsettledExecutionCount;
+}
 export function createTelegramUpdateWorkerRuntime(deps) {
-    if ((deps.scheduleRetry === undefined) !==
-        (deps.cancelRetry === undefined)) {
+    if ((deps.scheduleRetry === undefined) !== (deps.cancelRetry === undefined)) {
         throw new Error("Telegram update retry scheduling requires matching schedule and cancel ports.");
     }
     const getNowMs = deps.getNowMs ?? Date.now;
@@ -1021,9 +1202,11 @@ export function createTelegramUpdateWorkerRuntime(deps) {
     }
     const yieldToEventLoop = deps.yieldToEventLoop ??
         (() => new Promise((resolve) => setTimeout(resolve, 0)));
-    const completeQueuedExact = deps.journal.completeQueuedExact?.bind(deps.journal);
+    const queueCompletionPort = deps.journal.completeQueuedExact;
+    const completionReaderPort = deps.journal.inspectSourceCompletion;
+    const completeQueuedExact = queueCompletionPort?.bind(deps.journal);
     const completeExact = deps.journal.removeCompletedExact?.bind(deps.journal);
-    const inspectCompletion = deps.journal.inspectSourceCompletion?.bind(deps.journal);
+    const inspectCompletion = completionReaderPort?.bind(deps.journal);
     const observeQueuedCompletion = deps.onQueueReceiptCompleted;
     const fallbackQueueOwnerInstanceId = `worker-${randomUUID()}`;
     const fallbackQueueOwnerProcessId = process.pid > 0 ? process.pid : 1;
@@ -1042,8 +1225,11 @@ export function createTelegramUpdateWorkerRuntime(deps) {
         if (!deps.getQueueOwnerIdentity)
             return true;
         const live = deps.getQueueOwnerIdentity(expected.ctx), captured = expected.queueOwnerIdentity;
-        return !!live && live.instanceId === captured.instanceId && live.processId === captured.processId &&
-            live.processBirthId === captured.processBirthId && live.sessionGeneration === captured.sessionGeneration;
+        return (!!live &&
+            live.instanceId === captured.instanceId &&
+            live.processId === captured.processId &&
+            live.processBirthId === captured.processBirthId &&
+            live.sessionGeneration === captured.sessionGeneration);
     };
     const state = {
         phase: "stopped",
@@ -1065,6 +1251,7 @@ export function createTelegramUpdateWorkerRuntime(deps) {
     const scopedQueueCompletionAttempts = new Map();
     const unsettledExecutions = new Set();
     let owner;
+    let livePreparation;
     let drainPromise;
     let pendingSignal = false;
     let blocked = false;
@@ -1091,6 +1278,14 @@ export function createTelegramUpdateWorkerRuntime(deps) {
             recordRuntimeEvent(error, { phase: "state-observer" });
         }
     };
+    /** Fresh live input this generation admitted itself: not startup history, no live release issued, not executing. */
+    const isFreshLiveSource = (sourceOwner, updateId) => {
+        const source = deferredSources.get(updateId);
+        return (!sourceOwner.startupUpdateIds?.has(updateId) &&
+            !source?.historical &&
+            !source?.liveReleaseIssued &&
+            !unsettledExecutionsByUpdateId.has(updateId));
+    };
     const updateClaimCounts = () => {
         let deferredClaimCount = 0;
         let queuedClaimCount = 0;
@@ -1116,6 +1311,10 @@ export function createTelegramUpdateWorkerRuntime(deps) {
             state.historicalClaimCount = historicalClaimCount;
         else
             delete state.historicalClaimCount;
+        if (livePreparation && !livePreparation.released)
+            state.preparedInputCount = livePreparation.ids.size;
+        else
+            delete state.preparedInputCount;
     };
     const releaseDeferredClaims = (updateIds) => {
         let changed = false;
@@ -1167,7 +1366,10 @@ export function createTelegramUpdateWorkerRuntime(deps) {
             ? { journalBindingKey: deps.getJournalBindingKey() }
             : {}),
     });
-    const inspectQueueReceipt = deps.journal.isQueueReceiptCurrent?.bind(deps.journal);
+    const queueAdmissionJournal = deps.journal;
+    const queueAdmissionRead = queueAdmissionJournal.read, queueAdmissionCommit = queueAdmissionJournal.markQueued;
+    const queueAdmissionInspect = deps.journal.isQueueReceiptCurrent;
+    const inspectQueueReceipt = queueAdmissionInspect?.bind(deps.journal);
     const inspectQueuedSources = deps.journal.inspectQueuedReceipt?.bind(deps.journal);
     const prepareQueueReceipt = deps.beforeQueueReceiptPublished;
     const pendingQueuePublications = new Map();
@@ -1186,7 +1388,8 @@ export function createTelegramUpdateWorkerRuntime(deps) {
         if (prepareQueueReceipt) {
             const pending = pendingQueuePublications.get(normalized.receiptId);
             if (pending) {
-                if (pending.owner !== expectedOwner || !areTelegramQueueAdmissionReceiptsEqual(pending.receipt, normalized) ||
+                if (pending.owner !== expectedOwner ||
+                    !areTelegramQueueAdmissionReceiptsEqual(pending.receipt, normalized) ||
                     !areTelegramUpdateJournalQueueOwnersEqual(pending.queueOwner, queueOwner)) {
                     throw new TelegramUpdateAdmissionOutcomeError("Telegram queue publication has conflicting in-flight authority.");
                 }
@@ -1194,13 +1397,23 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                 return false;
             }
             const journalBindingKey = deps.getJournalBindingKey?.();
-            const current = () => owner === expectedOwner && !expectedOwner.controller.signal.aborted && deps.hasAuthority(ctx) && deps.isContextCurrent?.(ctx) !== false &&
-                isQueueOwnerIdentityCurrent(expectedOwner) && deps.getJournalBindingKey?.() === journalBindingKey;
-            if (!journalBindingKey || !current() || !inspectQueueReceipt ||
-                inspectQueueReceipt(normalizeQueueReceipt(normalized), { ...queueOwner }) !== true || !current()) {
+            const current = () => owner === expectedOwner &&
+                !expectedOwner.controller.signal.aborted &&
+                deps.hasAuthority(ctx) &&
+                deps.isContextCurrent?.(ctx) !== false &&
+                isQueueOwnerIdentityCurrent(expectedOwner) &&
+                deps.getJournalBindingKey?.() === journalBindingKey;
+            if (!journalBindingKey ||
+                !current() ||
+                !inspectQueueReceipt ||
+                inspectQueueReceipt(normalizeQueueReceipt(normalized), {
+                    ...queueOwner,
+                }) !== true ||
+                !current()) {
                 throw new TelegramUpdateAdmissionOutcomeError("Telegram queue publication requires exact current receipt inspection.");
             }
-            const task = Promise.resolve().then(async () => {
+            const task = Promise.resolve()
+                .then(async () => {
                 if (!current())
                     throw new TelegramUpdateAdmissionOutcomeError("Telegram queue publication authority ended before acceptance.");
                 const prepared = await prepareQueueReceipt(normalizeQueueReceipt(normalized), { ...queueOwner }, ctx, current);
@@ -1211,29 +1424,52 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                     if (sourceCompletions.length !== normalized.sourceUpdateIds.length) {
                         if (!current() || !inspectQueuedSources)
                             throw new Error("Telegram partial queue scopes require strict current whole-receipt origin inspection.");
-                        const expected = { queueKind: normalized.queueKind, receiptId: normalized.receiptId,
-                            sourceUpdateIds: [...normalized.sourceUpdateIds], queueOwner: { ...queueOwner } };
+                        const expected = {
+                            queueKind: normalized.queueKind,
+                            receiptId: normalized.receiptId,
+                            sourceUpdateIds: [...normalized.sourceUpdateIds],
+                            queueOwner: { ...queueOwner },
+                        };
                         const proof = inspectQueuedSources(structuredClone(expected));
-                        if (!current() || !proof || !isDeepStrictEqual(proof.receipt, expected) ||
-                            !Array.isArray(proof.sources) || proof.sources.length !== expected.sourceUpdateIds.length ||
-                            proof.sources.some((source, index) => source.updateId !== expected.sourceUpdateIds[index] || typeof source.sourceSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(source.sourceSha256)) ||
-                            sourceCompletions.some(scope => proof.sources.find(source => source.updateId === scope.updateId)?.sourceSha256 !== scope.sourceSha256)) {
+                        if (!current() ||
+                            !proof ||
+                            !isDeepStrictEqual(proof.receipt, expected) ||
+                            !Array.isArray(proof.sources) ||
+                            proof.sources.length !== expected.sourceUpdateIds.length ||
+                            proof.sources.some((source, index) => source.updateId !== expected.sourceUpdateIds[index] ||
+                                typeof source.sourceSha256 !== "string" ||
+                                !/^[a-f0-9]{64}$/u.test(source.sourceSha256)) ||
+                            sourceCompletions.some((scope) => proof.sources.find((source) => source.updateId === scope.updateId)?.sourceSha256 !== scope.sourceSha256)) {
                             throw new Error("Telegram partial queue scope origin was not confirmed under whole-receipt authority.");
                         }
                     }
                     for (const { journalBindingKey: _binding, ...completion } of sourceCompletions) {
-                        if (!current() || inspectCompletion({ ...completion }) !== undefined || !current()) {
+                        if (!current() ||
+                            inspectCompletion({ ...completion }) !== undefined ||
+                            !current()) {
                             throw new Error("Telegram queued source completion authority is contradictory.");
                         }
                     }
                 }
-                if (!current() || inspectQueueReceipt(normalizeQueueReceipt(normalized), { ...queueOwner }) !== true || !current()) {
+                if (!current() ||
+                    inspectQueueReceipt(normalizeQueueReceipt(normalized), {
+                        ...queueOwner,
+                    }) !== true ||
+                    !current()) {
                     throw new TelegramUpdateAdmissionOutcomeError("Telegram queue publication authority changed after acceptance.");
                 }
                 publishReady();
-            }).finally(() => { if (pendingQueuePublications.get(normalized.receiptId)?.task === task)
-                pendingQueuePublications.delete(normalized.receiptId); });
-            pendingQueuePublications.set(normalized.receiptId, { receipt: normalizeQueueReceipt(normalized), queueOwner: { ...queueOwner }, owner: expectedOwner, task });
+            })
+                .finally(() => {
+                if (pendingQueuePublications.get(normalized.receiptId)?.task === task)
+                    pendingQueuePublications.delete(normalized.receiptId);
+            });
+            pendingQueuePublications.set(normalized.receiptId, {
+                receipt: normalizeQueueReceipt(normalized),
+                queueOwner: { ...queueOwner },
+                owner: expectedOwner,
+                task,
+            });
             await task;
             return true;
         }
@@ -1243,7 +1479,13 @@ export function createTelegramUpdateWorkerRuntime(deps) {
             committedQueueReceipts.set(receipt.receiptId, {
                 receipt: normalized,
                 queueOwner: { ...queueOwner },
-                ...(sourceCompletions ? { sourceCompletions: sourceCompletions.map(value => ({ ...value })) } : {}),
+                ...(sourceCompletions
+                    ? {
+                        sourceCompletions: sourceCompletions.map((value) => ({
+                            ...value,
+                        })),
+                    }
+                    : {}),
             });
             if (sourceCompletions)
                 requiredScopedQueueReceipts.add(receipt.receiptId);
@@ -1262,11 +1504,14 @@ export function createTelegramUpdateWorkerRuntime(deps) {
         if (scopedQueueCompletionAttempts.has(receipt.receiptId))
             return undefined;
         const committed = committedQueueReceipts.get(receipt.receiptId);
-        if (!committed || !areTelegramQueueAdmissionReceiptsEqual(committed.receipt, normalizeQueueReceipt(receipt)))
+        if (!committed ||
+            !areTelegramQueueAdmissionReceiptsEqual(committed.receipt, normalizeQueueReceipt(receipt)))
             return undefined;
         try {
             if (inspectQueueReceipt &&
-                inspectQueueReceipt(normalizeQueueReceipt(committed.receipt), { ...committed.queueOwner }) !== true) {
+                inspectQueueReceipt(normalizeQueueReceipt(committed.receipt), {
+                    ...committed.queueOwner,
+                }) !== true) {
                 return undefined;
             }
         }
@@ -1316,7 +1561,8 @@ export function createTelegramUpdateWorkerRuntime(deps) {
             snapshot.version !== TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION) ||
             (snapshot.version === TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION &&
                 !deps.executeCustodiedUpdate) ||
-            snapshot.entries.some((entry) => ((snapshot.version === TELEGRAM_UPDATE_JOURNAL_EXCLUSION_VERSION || entry.preApprovalExcluded !== undefined) &&
+            snapshot.entries.some((entry) => ((snapshot.version === TELEGRAM_UPDATE_JOURNAL_EXCLUSION_VERSION ||
+                entry.preApprovalExcluded !== undefined) &&
                 typeof entry.preApprovalExcluded !== "boolean") ||
                 (entry.preApprovalExcluded === true && entry.state === "queued"))) {
             throw new TelegramUpdateAdmissionOutcomeError("Telegram journal snapshot has invalid pairing exclusion evidence.");
@@ -1338,7 +1584,9 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                 oldestAdmittedAtMs === undefined
                     ? entry.admittedAtMs
                     : Math.min(oldestAdmittedAtMs, entry.admittedAtMs);
-            if (entry.state === "retry-wait" && entry.nextRetryAtMs !== undefined && !claims.has(entry.updateId)) {
+            if (entry.state === "retry-wait" &&
+                entry.nextRetryAtMs !== undefined &&
+                !claims.has(entry.updateId)) {
                 scheduledRetryAtMs =
                     scheduledRetryAtMs === undefined
                         ? entry.nextRetryAtMs
@@ -1406,10 +1654,15 @@ export function createTelegramUpdateWorkerRuntime(deps) {
         }
         for (const updateId of deferredSources.keys()) {
             const claim = claims.get(updateId);
-            if (claim !== "deferred" && claim !== "abandoning" && claim !== "historical" && claim !== "retained")
+            if (claim !== "deferred" &&
+                claim !== "abandoning" &&
+                claim !== "historical" &&
+                claim !== "retained")
                 deferredSources.delete(updateId);
         }
         for (const [receiptId, receipt] of queuedReceiptEntries) {
+            if (receipt.sourceUpdateIds.some((id) => livePreparation?.ids.has(id)))
+                continue;
             await publishCommittedQueueReceipt({
                 queueKind: receipt.queueKind,
                 receiptId,
@@ -1461,17 +1714,23 @@ export function createTelegramUpdateWorkerRuntime(deps) {
         transition("blocked", currentUpdateId, "authority-lost");
         return "blocked";
     };
-    const executeWithinOwner = async (expectedOwner, update) => {
+    const executeWithinOwner = async (expectedOwner, update, preparedExecute) => {
         if (expectedOwner.controller.signal.aborted) {
             return TELEGRAM_UPDATE_WORKER_EXECUTION_ABORTED;
         }
         const custodied = deps.executeCustodiedUpdate !== undefined;
-        const execution = Promise.resolve().then(async () => deps.executeCustodiedUpdate
-            ? deps.executeCustodiedUpdate(update, expectedOwner.ctx, expectedOwner.controller.signal)
-            : deps.executeUpdate(update, expectedOwner.ctx, expectedOwner.controller.signal));
+        const execution = Promise.resolve().then(async () => preparedExecute
+            ? preparedExecute(update, expectedOwner.ctx, expectedOwner.controller.signal)
+            : deps.executeCustodiedUpdate
+                ? deps.executeCustodiedUpdate(update, expectedOwner.ctx, expectedOwner.controller.signal)
+                : deps.executeUpdate(update, expectedOwner.ctx, expectedOwner.controller.signal));
         const settlement = execution.then((outcome) => custodied
-            ? ({ ok: true, outcome: outcome, custodied: true })
-            : ({ ok: true, outcome: outcome }), (error) => ({ ok: false, error }));
+            ? {
+                ok: true,
+                outcome: outcome,
+                custodied: true,
+            }
+            : { ok: true, outcome: outcome }, (error) => ({ ok: false, error }));
         unsettledExecutions.add(settlement);
         const updateExecutions = unsettledExecutionsByUpdateId.get(update.update_id) ?? new Set();
         updateExecutions.add(settlement);
@@ -1555,7 +1814,7 @@ export function createTelegramUpdateWorkerRuntime(deps) {
         for (const sourceUpdateId of normalized.sourceUpdateIds) {
             claims.set(sourceUpdateId, "queued");
         }
-        return publishCommittedQueueReceipt(normalized, queueOwner, expectedOwner).then(() => "committed", error => blockWithFailure("invalid-outcome", "queue-receipt-publish", error, currentUpdateId));
+        return publishCommittedQueueReceipt(normalized, queueOwner, expectedOwner).then(() => "committed", (error) => blockWithFailure("invalid-outcome", "queue-receipt-publish", error, currentUpdateId));
     };
     const persistExecutionFailure = (expectedOwner, entry, error) => {
         const authorityResult = checkAuthority(expectedOwner, entry.updateId);
@@ -1614,8 +1873,8 @@ export function createTelegramUpdateWorkerRuntime(deps) {
         transition(disposition, entry.updateId);
         return disposition;
     };
-    const commitCompletedBatch = (expectedOwner, completions) => {
-        const updateIds = completions.map(value => value.updateId);
+    const commitCompletedBatch = (expectedOwner, completions, isCurrent) => {
+        const updateIds = completions.map((value) => value.updateId);
         if (updateIds.length === 0)
             return undefined;
         const commitAuthority = checkAuthority(expectedOwner, updateIds[updateIds.length - 1]);
@@ -1623,28 +1882,43 @@ export function createTelegramUpdateWorkerRuntime(deps) {
             return commitAuthority;
         const journalBindingKey = deps.getJournalBindingKey?.();
         try {
-            const expectedSources = completions.flatMap(value => value.expectedSource ? [value.expectedSource] : []);
-            if (expectedSources.some(value => value.journalBindingKey !== journalBindingKey) ||
-                (expectedSources.length > 0 && (deps.isContextCurrent?.(expectedOwner.ctx) === false || !isQueueOwnerIdentityCurrent(expectedOwner)))) {
+            if (isCurrent?.() === false)
+                throw new Error("Telegram exact completion authority changed.");
+            const expectedSources = completions.flatMap((value) => value.expectedSource ? [value.expectedSource] : []);
+            if (expectedSources.some((value) => value.journalBindingKey !== journalBindingKey) ||
+                (expectedSources.length > 0 &&
+                    (deps.isContextCurrent?.(expectedOwner.ctx) === false ||
+                        !isQueueOwnerIdentityCurrent(expectedOwner)))) {
                 throw new Error("Telegram guarded completion source authority changed.");
             }
-            const scoped = expectedSources.flatMap(({ updateId, sourceSha256, completionSha256 }) => completionSha256 !== undefined
-                ? [{ updateId, sourceSha256, completionSha256 }] : []).sort((a, b) => a.updateId - b.updateId);
+            const scoped = expectedSources
+                .flatMap(({ updateId, sourceSha256, completionSha256 }) => completionSha256 !== undefined
+                ? [{ updateId, sourceSha256, completionSha256 }]
+                : [])
+                .sort((a, b) => a.updateId - b.updateId);
             if (scoped.length > 0 && !inspectCompletion)
                 throw new Error("Telegram source completion inspection is unavailable.");
             let removed;
             if (expectedSources.length > 0) {
                 if (!completeExact)
                     throw new Error("Telegram exact source completion is unavailable.");
-                removed = completeExact(updateIds, expectedSources.map(({ updateId, sourceSha256 }) => ({ updateId, sourceSha256 })), scoped.length > 0 ? scoped.map(completion => ({ ...completion })) : undefined);
+                removed = completeExact(updateIds, expectedSources.map(({ updateId, sourceSha256 }) => ({
+                    updateId,
+                    sourceSha256,
+                })), scoped.length > 0
+                    ? scoped.map((completion) => ({ ...completion }))
+                    : undefined, isCurrent);
             }
             else
                 removed = deps.journal.removeCompleted(updateIds);
+            if (isCurrent?.() === false)
+                throw new Error("Telegram exact completion ACK authority changed.");
             if (scoped.length > 0) {
                 const afterCommit = checkAuthority(expectedOwner, updateIds.at(-1));
                 if (afterCommit)
                     return afterCommit;
-                if (deps.isContextCurrent?.(expectedOwner.ctx) === false || !isQueueOwnerIdentityCurrent(expectedOwner) ||
+                if (deps.isContextCurrent?.(expectedOwner.ctx) === false ||
+                    !isQueueOwnerIdentityCurrent(expectedOwner) ||
                     deps.getJournalBindingKey?.() !== journalBindingKey)
                     throw new Error("Telegram source completion ACK authority changed.");
                 if (!isDeepStrictEqual(removed.sourceCompletions, scoped))
@@ -1655,7 +1929,8 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                     const afterRead = checkAuthority(expectedOwner, completion.updateId);
                     if (afterRead)
                         return afterRead;
-                    if (deps.isContextCurrent?.(expectedOwner.ctx) === false || !isQueueOwnerIdentityCurrent(expectedOwner) ||
+                    if (deps.isContextCurrent?.(expectedOwner.ctx) === false ||
+                        !isQueueOwnerIdentityCurrent(expectedOwner) ||
                         deps.getJournalBindingKey?.() !== journalBindingKey)
                         throw new Error("Telegram source completion ACK authority changed.");
                 }
@@ -1697,21 +1972,32 @@ export function createTelegramUpdateWorkerRuntime(deps) {
     };
     const reconcileRoutingInputs = async (snapshot, expectedOwner) => {
         clearRoutingTimer();
-        if (!isTelegramUpdateJournalLegacyFamilyVersion(snapshot.version) || !expireRouting || !expireRoutingObserver)
+        if (!isTelegramUpdateJournalLegacyFamilyVersion(snapshot.version) ||
+            !expireRouting ||
+            !expireRoutingObserver)
             return false;
         let nextAtMs, changed = false;
-        const binding = deps.getJournalBindingKey?.(), snapshotIds = new Set(snapshot.entries.map(entry => entry.updateId));
+        const binding = deps.getJournalBindingKey?.(), snapshotIds = new Set(snapshot.entries.map((entry) => entry.updateId));
         // Lost expiry ACKs reconcile the exact held original against its body-free discard tombstone.
-        const candidates = [...snapshot.entries, ...[...deferredSources.values()]
-                .filter(source => source.journalBindingKey === binding && !snapshotIds.has(source.entry.updateId))
-                .map(source => source.entry)];
+        const candidates = [
+            ...snapshot.entries,
+            ...[...deferredSources.values()]
+                .filter((source) => source.journalBindingKey === binding &&
+                !snapshotIds.has(source.entry.updateId))
+                .map((source) => source.entry),
+        ];
         for (const entry of candidates) {
             const lifetime = entry.routingInput;
-            if (!lifetime || entry.state !== "pending" || !binding || claims.get(entry.updateId) === "queued" ||
+            if (!lifetime ||
+                entry.state !== "pending" ||
+                !binding ||
+                claims.get(entry.updateId) === "queued" ||
                 unsettledExecutionsByUpdateId.get(entry.updateId)?.size)
                 continue;
             // Classify the first startup snapshot before constructing any historical expiry carrier.
-            if (expectedOwner.startupUpdateIds?.has(entry.updateId) && !claims.has(entry.updateId) && deps.shouldReviewHistoricalInput) {
+            if (expectedOwner.startupUpdateIds?.has(entry.updateId) &&
+                !claims.has(entry.updateId) &&
+                deps.shouldReviewHistoricalInput) {
                 nextAtMs = Math.min(nextAtMs ?? Infinity, Math.max(getNowMs() + 1, lifetime.expiresAtMs));
                 continue;
             }
@@ -1724,30 +2010,48 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                 // Lost clock/selection ACKs may leave only this immutable metadata behind its exact source; reconciliation grants expiry, never another dispatch.
                 const previous = existing.entry.routingInput;
                 if (!isDeepStrictEqual({ ...existing.entry, routingInput: lifetime }, entry) ||
-                    (previous && (!isDeepStrictEqual({ ...previous, phase: lifetime.phase }, lifetime) ||
-                        (previous.phase === "selected" && lifetime.phase !== "selected"))))
+                    (previous &&
+                        (!isDeepStrictEqual({ ...previous, phase: lifetime.phase }, lifetime) ||
+                            (previous.phase === "selected" && lifetime.phase !== "selected"))))
                     continue;
                 existing.entry = structuredClone(entry);
             }
-            const source = existing ?? { entry: structuredClone(entry), journalBindingKey: binding, historical: true };
+            const source = existing ?? {
+                entry: structuredClone(entry),
+                journalBindingKey: binding,
+                historical: true,
+            };
             deferredSources.set(entry.updateId, source);
             if (!claims.has(entry.updateId))
                 claims.set(entry.updateId, "historical");
-            const current = () => owner === expectedOwner && !expectedOwner.controller.signal.aborted &&
-                deps.isContextCurrent?.(expectedOwner.ctx) !== false && deps.getJournalBindingKey?.() === binding &&
-                deps.hasAuthority(expectedOwner.ctx) && isQueueOwnerIdentityCurrent(expectedOwner) && deferredSources.get(entry.updateId) === source &&
-                isDeepStrictEqual(source.entry, entry) && claims.get(entry.updateId) !== "queued";
+            const current = () => owner === expectedOwner &&
+                !expectedOwner.controller.signal.aborted &&
+                deps.isContextCurrent?.(expectedOwner.ctx) !== false &&
+                deps.getJournalBindingKey?.() === binding &&
+                deps.hasAuthority(expectedOwner.ctx) &&
+                isQueueOwnerIdentityCurrent(expectedOwner) &&
+                deferredSources.get(entry.updateId) === source &&
+                isDeepStrictEqual(source.entry, entry) &&
+                claims.get(entry.updateId) !== "queued";
             let committed;
             try {
                 if (current())
-                    await expireRoutingObserver({ original: structuredClone(entry), journalBindingKey: binding, isCurrent: current,
+                    await expireRoutingObserver({
+                        original: structuredClone(entry),
+                        journalBindingKey: binding,
+                        isCurrent: current,
                         expire() {
                             if (!current())
                                 return undefined;
                             if (committed)
                                 return { ...committed, duplicate: true };
                             claims.set(entry.updateId, "abandoning");
-                            committed = expireRouting({ entry: source.entry, journalBindingKey: binding, operatorUserId: lifetime.operatorUserId, isCurrent: current });
+                            committed = expireRouting({
+                                entry: source.entry,
+                                journalBindingKey: binding,
+                                operatorUserId: lifetime.operatorUserId,
+                                isCurrent: current,
+                            });
                             // Source expiry is terminal before chooser/cleanup awaits; later failures must not retain a deferred/retry source.
                             claims.delete(entry.updateId);
                             deferredSources.delete(entry.updateId);
@@ -1757,19 +2061,27 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                             notifyStateChange();
                             changed ||= !committed.duplicate;
                             return committed;
-                        } }, expectedOwner.ctx, expectedOwner.controller.signal);
+                        },
+                    }, expectedOwner.ctx, expectedOwner.controller.signal);
             }
             catch (error) {
-                recordRuntimeEvent(error, { phase: "routing-input-expiry", updateId: entry.updateId });
+                recordRuntimeEvent(error, {
+                    phase: "routing-input-expiry",
+                    updateId: entry.updateId,
+                });
             }
             if (!committed)
                 nextAtMs = Math.min(nextAtMs ?? Infinity, getNowMs() + 60_000);
         }
-        if (nextAtMs !== undefined && owner === expectedOwner && !expectedOwner.controller.signal.aborted) {
+        if (nextAtMs !== undefined &&
+            owner === expectedOwner &&
+            !expectedOwner.controller.signal.aborted) {
             const token = {};
             routingTimerToken = token;
             routingTimer = scheduleRetry(() => {
-                if (routingTimerToken !== token || owner !== expectedOwner || expectedOwner.controller.signal.aborted)
+                if (routingTimerToken !== token ||
+                    owner !== expectedOwner ||
+                    expectedOwner.controller.signal.aborted)
                     return;
                 routingTimer = undefined;
                 routingTimerToken = undefined;
@@ -1781,32 +2093,69 @@ export function createTelegramUpdateWorkerRuntime(deps) {
     };
     const mutateRoutingSource = (input, select) => {
         const expectedOwner = owner, ids = [...input.sourceUpdateIds];
-        if (!ids.length || !ids.includes(input.updateId) || new Set(ids).size !== ids.length || ids.some(id => !Number.isSafeInteger(id) || id < 0))
+        if (!ids.length ||
+            !ids.includes(input.updateId) ||
+            new Set(ids).size !== ids.length ||
+            ids.some((id) => !Number.isSafeInteger(id) || id < 0))
             return undefined;
-        const sources = ids.map(id => deferredSources.get(id)), binding = sources[0]?.journalBindingKey;
-        const current = () => !!expectedOwner && owner === expectedOwner && expectedOwner.controller.signal === input.signal && !input.signal.aborted &&
-            !!binding && sources.every((source, index) => !!source && deferredSources.get(ids[index]) === source && !source.historical &&
-            source.journalBindingKey === binding && claims.get(ids[index]) !== "queued" && claims.get(ids[index]) !== "abandoning") &&
-            deps.getJournalBindingKey?.() === binding && deps.isContextCurrent?.(expectedOwner.ctx) !== false &&
-            deps.hasAuthority(expectedOwner.ctx) && isQueueOwnerIdentityCurrent(expectedOwner);
+        const sources = ids.map((id) => deferredSources.get(id)), binding = sources[0]?.journalBindingKey;
+        const current = () => !!expectedOwner &&
+            owner === expectedOwner &&
+            expectedOwner.controller.signal === input.signal &&
+            !input.signal.aborted &&
+            !!binding &&
+            sources.every((source, index) => !!source &&
+                deferredSources.get(ids[index]) === source &&
+                !source.historical &&
+                source.journalBindingKey === binding &&
+                claims.get(ids[index]) !== "queued" &&
+                claims.get(ids[index]) !== "abandoning") &&
+            deps.getJournalBindingKey?.() === binding &&
+            deps.isContextCurrent?.(expectedOwner.ctx) !== false &&
+            deps.hasAuthority(expectedOwner.ctx) &&
+            isQueueOwnerIdentityCurrent(expectedOwner);
         if (!current() || !armRouting || !selectRouting || !expireRoutingObserver)
             return undefined;
-        const authority = { journalBindingKey: binding, entries: sources.map(source => structuredClone(source.entry)), operatorUserId: input.operatorUserId, isCurrent: current };
-        const result = select ? selectRouting(authority) : { issued: false, entries: armRouting({ ...authority, publishedAtMs: getNowMs() }) };
-        if (result.entries.length !== ids.length || result.entries.some((entry, index) => entry.updateId !== ids[index] || !entry.routingInput) || !current()) {
+        const authority = {
+            journalBindingKey: binding,
+            entries: sources.map((source) => structuredClone(source.entry)),
+            operatorUserId: input.operatorUserId,
+            isCurrent: current,
+        };
+        const result = select
+            ? selectRouting(authority)
+            : {
+                issued: false,
+                entries: armRouting({
+                    ...authority,
+                    publishedAtMs: getNowMs(),
+                    ...(input.chooser ? { chooser: input.chooser } : {}),
+                }),
+            };
+        if (result.entries.length !== ids.length ||
+            result.entries.some((entry, index) => entry.updateId !== ids[index] || !entry.routingInput) ||
+            !current()) {
             throw new Error("Telegram routing input lifetime ACK was not confirmed.");
         }
         const retained = deps.journal.read().entries;
-        if (result.entries.some(entry => !isDeepStrictEqual(retained.find(value => value.updateId === entry.updateId), entry)) || !current()) {
+        if (result.entries.some((entry) => !isDeepStrictEqual(retained.find((value) => value.updateId === entry.updateId), entry)) ||
+            !current()) {
             throw new Error("Telegram routing input lifetime ACK was not retained.");
         }
-        result.entries.forEach((entry, index) => { sources[index].entry = structuredClone(entry); });
+        // Retain the decoder's exact source representation, not the mutation result's property ordering.
+        result.entries.forEach((entry, index) => {
+            sources[index].entry = structuredClone(retained.find((value) => value.updateId === entry.updateId));
+        });
         pendingSignal = true;
         launchDrain();
-        return { issued: result.issued, lifetime: { ...result.entries[0].routingInput } };
+        return {
+            issued: result.issued,
+            lifetime: { ...result.entries[0].routingInput },
+        };
     };
     const drain = async (expectedOwner) => {
-        while (owner === expectedOwner && !expectedOwner.controller.signal.aborted) {
+        while (owner === expectedOwner &&
+            !expectedOwner.controller.signal.aborted) {
             const authorityResult = checkAuthority(expectedOwner);
             if (authorityResult)
                 return authorityResult;
@@ -1817,7 +2166,7 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                 scheduledRetryAtMs = await refreshJournalState(snapshot, expectedOwner);
                 // One complete validated baseline per generation, before batching or execution.
                 // Replayed v1 entries do not prove that a prior process never forwarded them.
-                expectedOwner.startupUpdateIds ??= new Set(snapshot.entries.map(entry => entry.updateId));
+                expectedOwner.startupUpdateIds ??= new Set(snapshot.entries.map((entry) => entry.updateId));
             }
             catch (error) {
                 return blockWithFailure("journal-read", "journal-read", error);
@@ -1834,24 +2183,39 @@ export function createTelegramUpdateWorkerRuntime(deps) {
             let blockedInputCustody;
             delete state.blockedInputCustody;
             for (const candidate of snapshot.entries) {
+                if (livePreparation?.ids.has(candidate.updateId) &&
+                    (!livePreparation.released || livePreparation.status?.issued))
+                    continue;
                 if (snapshot.version === TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION &&
                     (candidate.state === "retry-wait" || candidate.state === "failed")) {
                     hasUnavailableInputCustody = true;
-                    blockedInputCustody ??= { updateId: candidate.updateId, kind: "legacy-retry-state" };
+                    blockedInputCustody ??= {
+                        updateId: candidate.updateId,
+                        kind: "legacy-retry-state",
+                    };
                     continue;
                 }
-                if (snapshot.version === TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION && candidate.inputClaim) {
+                if (snapshot.version === TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION &&
+                    candidate.inputClaim) {
                     if (candidate.inputClaim.phase === "running") {
                         hasOutcomeUnknownInput = true;
-                        if (!blockedInputCustody || blockedInputCustody.kind !== "running-outcome-unknown")
-                            blockedInputCustody = { updateId: candidate.updateId,
-                                kind: "running-outcome-unknown" };
+                        if (!blockedInputCustody ||
+                            blockedInputCustody.kind !== "running-outcome-unknown")
+                            blockedInputCustody = {
+                                updateId: candidate.updateId,
+                                kind: "running-outcome-unknown",
+                            };
                         continue;
                     }
-                    if (candidate.inputClaim.handoff || !isTelegramUpdateJournalQueueOwnerProcess(candidate.inputClaim.owner, expectedOwner.queueOwnerIdentity)) {
+                    if (candidate.inputClaim.handoff ||
+                        !isTelegramUpdateJournalQueueOwnerProcess(candidate.inputClaim.owner, expectedOwner.queueOwnerIdentity)) {
                         hasUnavailableInputCustody = true;
-                        blockedInputCustody ??= { updateId: candidate.updateId,
-                            kind: candidate.inputClaim.handoff ? "handoff-frozen" : "foreign-ready" };
+                        blockedInputCustody ??= {
+                            updateId: candidate.updateId,
+                            kind: candidate.inputClaim.handoff
+                                ? "handoff-frozen"
+                                : "foreign-ready",
+                        };
                         continue;
                     }
                 }
@@ -1881,6 +2245,9 @@ export function createTelegramUpdateWorkerRuntime(deps) {
             const completedUpdateIds = [];
             let snapshotInvalidated = false;
             for (const entry of entries) {
+                if (livePreparation?.ids.has(entry.updateId) &&
+                    (!livePreparation.released || livePreparation.status?.issued))
+                    continue;
                 const priorExecutions = unsettledExecutionsByUpdateId.get(entry.updateId);
                 if (priorExecutions?.size) {
                     const completionResult = commitCompletedBatch(expectedOwner, completedUpdateIds);
@@ -1899,7 +2266,9 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                     completedUpdateIds.push({ updateId: entry.updateId });
                     continue;
                 }
-                if (isTelegramUpdateJournalLegacyFamilyVersion(snapshot.version) && entry.state === "pending" && deps.journal.inspectPendingRetention) {
+                if (isTelegramUpdateJournalLegacyFamilyVersion(snapshot.version) &&
+                    entry.state === "pending" &&
+                    deps.journal.inspectPendingRetention) {
                     const authorityResult = checkAuthority(expectedOwner, entry.updateId);
                     if (authorityResult)
                         return authorityResult;
@@ -1910,7 +2279,10 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                     }
                     catch (error) {
                         unverifiable = true;
-                        recordRuntimeEvent(error, { phase: "pending-retention-inspection", updateId: entry.updateId });
+                        recordRuntimeEvent(error, {
+                            phase: "pending-retention-inspection",
+                            updateId: entry.updateId,
+                        });
                     }
                     if (retained || unverifiable) {
                         // A copy is protection evidence only. A fresh owner must explicitly retry
@@ -1923,19 +2295,28 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                         continue;
                     }
                 }
-                if (isTelegramUpdateJournalLegacyFamilyVersion(snapshot.version) && (entry.state === "pending" || entry.state === "retry-wait")) {
+                if (isTelegramUpdateJournalLegacyFamilyVersion(snapshot.version) &&
+                    (entry.state === "pending" || entry.state === "retry-wait")) {
                     const historical = expectedOwner.startupUpdateIds.has(entry.updateId);
+                    let revived = false;
                     const journalBindingKey = deps.getJournalBindingKey?.();
                     // Classifiers and handler projections receive no mutable alias to CAS evidence.
                     if (journalBindingKey)
-                        deferredSources.set(entry.updateId, { entry: structuredClone(entry), journalBindingKey,
-                            ...(historical ? { historical: true } : {}) });
-                    const classifyPending = historical && entry.state === "pending" ? deps.shouldReviewHistoricalInput : deps.shouldHoldPendingInput;
+                        deferredSources.set(entry.updateId, {
+                            entry: structuredClone(entry),
+                            journalBindingKey,
+                            ...(historical ? { historical: true } : {}),
+                        });
+                    const classifyPending = historical && entry.state === "pending"
+                        ? deps.shouldReviewHistoricalInput
+                        : deps.shouldHoldPendingInput;
                     if (classifyPending) {
                         const checkHistoricalAuthority = () => {
-                            if (owner !== expectedOwner || expectedOwner.controller.signal.aborted)
+                            if (owner !== expectedOwner ||
+                                expectedOwner.controller.signal.aborted)
                                 return "aborted";
-                            if (deps.getJournalBindingKey?.() !== journalBindingKey || deps.isContextCurrent?.(expectedOwner.ctx) === false) {
+                            if (deps.getJournalBindingKey?.() !== journalBindingKey ||
+                                deps.isContextCurrent?.(expectedOwner.ctx) === false) {
                                 transition("blocked", entry.updateId, "authority-lost");
                                 return "blocked";
                             }
@@ -1957,12 +2338,18 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                         const authorityResult = checkHistoricalAuthority();
                         if (authorityResult)
                             return authorityResult;
-                        if (typeof review !== "boolean" && !(historical && entry.state === "pending" && review === "retain"))
+                        if (typeof review !== "boolean" &&
+                            !(historical &&
+                                entry.state === "pending" &&
+                                (review === "retain" ||
+                                    (review === "revive" &&
+                                        isRevivableTelegramRoutingInput(entry, getNowMs())))))
                             return blockWithFailure("execution", "historical-review-classification", new TelegramUpdateAdmissionOutcomeError("Historical classification must return a boolean or retain verdict."), entry.updateId);
                         // Classification may await a domain read; accepted/changed source evidence wins.
                         try {
                             const current = deps.journal.read();
-                            if (current.version !== snapshot.version || JSON.stringify(current.entries.find(candidate => candidate.updateId === entry.updateId)) !== JSON.stringify(entry)) {
+                            if (current.version !== snapshot.version ||
+                                JSON.stringify(current.entries.find((candidate) => candidate.updateId === entry.updateId)) !== JSON.stringify(entry)) {
                                 snapshotInvalidated = true;
                                 break;
                             }
@@ -1970,34 +2357,96 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                         catch (error) {
                             return blockWithFailure("journal-read", "historical-source-recheck", error, entry.updateId);
                         }
-                        if (review === "retain") {
+                        if (review === "revive") {
+                            // A still-waiting saved clock proves no selection ran, so this generation owns the source as live input.
+                            revived = true;
+                            const source = deferredSources.get(entry.updateId);
+                            if (source)
+                                delete source.historical;
+                            expectedOwner.startupUpdateIds = new Set([...expectedOwner.startupUpdateIds].filter((id) => id !== entry.updateId));
+                        }
+                        else if (review === "retain") {
                             claims.set(entry.updateId, "retained");
                             transition("deferred", entry.updateId);
                             continue;
                         }
-                        if (review && historical && spendHistorical && !entry.routingInput && classifyPending === deps.shouldReviewHistoricalInput) {
-                            completedUpdateIds.push({ updateId: entry.updateId, spent: true });
+                        if (review &&
+                            historical &&
+                            spendHistorical &&
+                            !entry.routingInput &&
+                            classifyPending === deps.shouldReviewHistoricalInput) {
+                            completedUpdateIds.push({
+                                updateId: entry.updateId,
+                                spent: true,
+                            });
                             continue;
                         }
-                        if (review) {
+                        if (review === true) {
                             claims.set(entry.updateId, "historical");
                             transition("deferred", entry.updateId);
                             continue;
                         }
                     }
-                    if (entry.state === "pending" && entry.routingInput) {
+                    if (!revived && entry.state === "pending" && entry.routingInput) {
                         claims.set(entry.updateId, "historical");
                         transition("deferred", entry.updateId);
                         continue;
                     }
                 }
+                if (livePreparation?.ids.has(entry.updateId) &&
+                    (!livePreparation.released || livePreparation.status?.issued))
+                    continue;
+                const prepared = livePreparation?.released && livePreparation.ids.has(entry.updateId)
+                    ? livePreparation
+                    : undefined;
+                const status = prepared?.status;
+                if (status) {
+                    status.issued = true;
+                    try {
+                        if (!status.current() ||
+                            !isDeepStrictEqual(prepared.saved?.[0], entry))
+                            throw new Error("Prepared status original changed.");
+                        status.assertCurrent();
+                        if (!status.current())
+                            throw new Error("Prepared status owner changed after assertion.");
+                    }
+                    catch (error) {
+                        claims.set(entry.updateId, "retained");
+                        recordRuntimeEvent(error, {
+                            phase: "prepared-status-authority",
+                            updateId: entry.updateId,
+                        });
+                        continue;
+                    }
+                }
                 clearRetryTimer();
                 transition("executing", entry.updateId);
-                const execution = await executeWithinOwner(expectedOwner, entry.update);
+                const execution = await executeWithinOwner(expectedOwner, entry.update, status
+                    ? async (update, ctx, signal) => {
+                        const admitted = await status.admit(update, ctx, signal);
+                        status.carrier = admitted.carrier;
+                        if (!status.current() ||
+                            admitted.outcome.kind !== "deferred" ||
+                            !isDeepStrictEqual(deps.journal
+                                .read()
+                                .entries.find((value) => value.updateId === entry.updateId), entry) ||
+                            !status.current())
+                            throw new Error("Prepared status admission is unconfirmed.");
+                        return admitted.outcome;
+                    }
+                    : undefined);
                 if (execution === TELEGRAM_UPDATE_WORKER_EXECUTION_ABORTED) {
                     return "aborted";
                 }
                 if (!execution.ok) {
+                    if (status) {
+                        claims.set(entry.updateId, "retained");
+                        recordRuntimeEvent(execution.error, {
+                            phase: "prepared-status-admission",
+                            updateId: entry.updateId,
+                        });
+                        continue;
+                    }
                     if (deps.executeCustodiedUpdate) {
                         transition("blocked", entry.updateId, "execution");
                         return "blocked";
@@ -2046,7 +2495,12 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                     return postExecutionAuthority;
                 const claimableUpdateIds = new Set([
                     entry.updateId,
-                    ...[...claims].filter(([, claim]) => claim !== "abandoning" && claim !== "historical" && claim !== "retained").map(([id]) => id),
+                    ...[...claims]
+                        .filter(([id, claim]) => !livePreparation?.ids.has(id) &&
+                        claim !== "abandoning" &&
+                        claim !== "historical" &&
+                        claim !== "retained")
+                        .map(([id]) => id),
                 ]);
                 let outcome;
                 try {
@@ -2056,11 +2510,37 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                     return blockWithFailure("invalid-outcome", "invalid-outcome", error, entry.updateId);
                 }
                 if (outcome.kind === "deferred") {
-                    if (outcome.routingReview && !deferredSources.get(entry.updateId)?.historical) {
+                    if (outcome.routingReview &&
+                        !deferredSources.get(entry.updateId)?.historical) {
                         return blockWithFailure("invalid-outcome", "historical-review-source", new TelegramUpdateAdmissionOutcomeError("Historical review needs an exact startup source."), entry.updateId);
                     }
                     claims.set(entry.updateId, outcome.routingReview ? "historical" : "deferred");
                     transition("deferred", entry.updateId);
+                    if (status) {
+                        // Native warm deferral precedes consumption; late reports retain the existing ACK owner.
+                        if (livePreparation === prepared)
+                            livePreparation = undefined;
+                        updateClaimCounts();
+                        try {
+                            if (!status.current())
+                                throw new Error("Prepared status consumer owner changed.");
+                            status.assertCurrent();
+                            if (!status.bindCarrier(status.carrier) || !status.current())
+                                throw new Error("Prepared status carrier binding refused.");
+                            status.assertCurrent();
+                            if (!status.current())
+                                throw new Error("Prepared status owner changed before consumption.");
+                            await status.execute();
+                            if (!status.current())
+                                throw new Error("Prepared status consumption result is unconfirmed.");
+                        }
+                        catch (error) {
+                            recordRuntimeEvent(error, {
+                                phase: "prepared-status-consume",
+                                updateId: entry.updateId,
+                            });
+                        }
+                    }
                     continue;
                 }
                 if (outcome.kind === "queued") {
@@ -2075,7 +2555,12 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                     snapshotInvalidated = true;
                     break;
                 }
-                completedUpdateIds.push({ updateId: entry.updateId, ...(outcome.expectedSource ? { expectedSource: outcome.expectedSource } : {}) });
+                completedUpdateIds.push({
+                    updateId: entry.updateId,
+                    ...(outcome.expectedSource
+                        ? { expectedSource: outcome.expectedSource }
+                        : {}),
+                });
             }
             const completionResult = commitCompletedBatch(expectedOwner, completedUpdateIds);
             if (completionResult)
@@ -2083,8 +2568,7 @@ export function createTelegramUpdateWorkerRuntime(deps) {
             if (!snapshotInvalidated && !hasMoreEntries)
                 continue;
             await yieldToEventLoop();
-            if (owner !== expectedOwner ||
-                expectedOwner.controller.signal.aborted) {
+            if (owner !== expectedOwner || expectedOwner.controller.signal.aborted) {
                 return "aborted";
             }
         }
@@ -2099,7 +2583,9 @@ export function createTelegramUpdateWorkerRuntime(deps) {
             try {
                 startupKey = deps.getJournalBindingKey?.();
             }
-            catch { /* Missing startup identity grants no notification. */ }
+            catch {
+                /* Missing startup identity grants no notification. */
+            }
         }
         let lastResult;
         const run = async () => {
@@ -2120,30 +2606,55 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                 if (pendingSignal && !expectedOwner.controller.signal.aborted) {
                     launchDrain();
                 }
-                else if (lastResult === "idle" && startupKey && onHeldSourcesPrepared && !expectedOwner.heldSourcesPreparedIssued) {
+                else if (lastResult === "idle" &&
+                    startupKey &&
+                    onHeldSourcesPrepared &&
+                    !expectedOwner.heldSourcesPreparedIssued) {
                     try {
                         const ctx = expectedOwner.ctx, key = startupKey;
-                        const isCurrent = () => owner === expectedOwner && !blocked && !expectedOwner.controller.signal.aborted &&
-                            deps.getJournalBindingKey?.() === key && deps.isContextCurrent?.(ctx) !== false && deps.hasAuthority(ctx);
+                        const isCurrent = () => owner === expectedOwner &&
+                            !blocked &&
+                            !expectedOwner.controller.signal.aborted &&
+                            deps.getJournalBindingKey?.() === key &&
+                            deps.isContextCurrent?.(ctx) !== false &&
+                            deps.hasAuthority(ctx);
                         if (!isCurrent())
                             return;
                         expectedOwner.heldSourcesPreparedIssued = true;
                         // Do not couple lifecycle/stop or the worker drain to a held controller/API reply.
-                        void Promise.resolve().then(() => isCurrent() ? onHeldSourcesPrepared({ ctx,
-                            journalBindingKey: key, signal: expectedOwner.controller.signal, isCurrent,
-                            routingSourceIds: [...deferredSources].filter(([, source]) => source.journalBindingKey === key && !!source.entry.routingInput)
-                                .map(([id]) => id) }) : undefined).catch(error => {
+                        void Promise.resolve()
+                            .then(() => isCurrent()
+                            ? onHeldSourcesPrepared({
+                                ctx,
+                                journalBindingKey: key,
+                                signal: expectedOwner.controller.signal,
+                                isCurrent,
+                                routingSourceIds: [...deferredSources]
+                                    .filter(([, source]) => source.journalBindingKey === key &&
+                                    !!source.entry.routingInput)
+                                    .map(([id]) => id),
+                            })
+                            : undefined)
+                            .catch((error) => {
                             try {
-                                deps.recordRuntimeEvent?.("inbound-worker", error, { phase: "held-source-preparation" });
+                                deps.recordRuntimeEvent?.("inbound-worker", error, {
+                                    phase: "held-source-preparation",
+                                });
                             }
-                            catch { /* Diagnostic only. */ }
+                            catch {
+                                /* Diagnostic only. */
+                            }
                         });
                     }
                     catch (error) {
                         try {
-                            deps.recordRuntimeEvent?.("inbound-worker", error, { phase: "held-source-preparation" });
+                            deps.recordRuntimeEvent?.("inbound-worker", error, {
+                                phase: "held-source-preparation",
+                            });
                         }
-                        catch { /* Diagnostic only. */ }
+                        catch {
+                            /* Diagnostic only. */
+                        }
                     }
                 }
             }
@@ -2162,22 +2673,34 @@ export function createTelegramUpdateWorkerRuntime(deps) {
         const source = deferredSources.get(input.updateId);
         const abandonPending = deps.journal.abandonPending;
         const isCurrent = () => {
-            if (!expectedOwner || owner !== expectedOwner || input.signal.aborted ||
-                expectedOwner.controller.signal !== input.signal || !source ||
-                source.entry.routingInput?.phase === "selected" || (source.historical && historicalSource !== source) ||
-                (claims.get(input.updateId) !== "deferred" && claims.get(input.updateId) !== "abandoning" &&
-                    !(claims.get(input.updateId) === "historical" && historicalSource === source)))
+            if (!expectedOwner ||
+                owner !== expectedOwner ||
+                input.signal.aborted ||
+                expectedOwner.controller.signal !== input.signal ||
+                !source ||
+                source.entry.routingInput?.phase === "selected" ||
+                (source.historical && historicalSource !== source) ||
+                (claims.get(input.updateId) !== "deferred" &&
+                    claims.get(input.updateId) !== "abandoning" &&
+                    !(claims.get(input.updateId) === "historical" &&
+                        historicalSource === source)))
                 return false;
-            return input.isCurrent() && deps.isContextCurrent?.(expectedOwner.ctx) !== false &&
-                deps.getJournalBindingKey?.() === source.journalBindingKey && deps.hasAuthority(expectedOwner.ctx);
+            return (input.isCurrent() &&
+                deps.isContextCurrent?.(expectedOwner.ctx) !== false &&
+                deps.getJournalBindingKey?.() === source.journalBindingKey &&
+                deps.hasAuthority(expectedOwner.ctx));
         };
         if (!source || !abandonPending || !isCurrent())
             return undefined;
         // Retain this claim on failure, including unknown commit: never reopen dispatch.
         claims.set(input.updateId, "abandoning");
         try {
-            const result = abandonPending({ ...input, entry: source.entry,
-                journalBindingKey: source.journalBindingKey, isCurrent });
+            const result = abandonPending({
+                ...input,
+                entry: source.entry,
+                journalBindingKey: source.journalBindingKey,
+                isCurrent,
+            });
             claims.delete(input.updateId);
             deferredSources.delete(input.updateId);
             state.journalEntryCount = result.entryCount;
@@ -2188,7 +2711,10 @@ export function createTelegramUpdateWorkerRuntime(deps) {
             return result;
         }
         catch (error) {
-            recordRuntimeEvent(error, { phase: "pending-abandonment", updateId: input.updateId });
+            recordRuntimeEvent(error, {
+                phase: "pending-abandonment",
+                updateId: input.updateId,
+            });
             updateClaimCounts();
             notifyStateChange();
             throw error;
@@ -2198,34 +2724,93 @@ export function createTelegramUpdateWorkerRuntime(deps) {
         const expectedOwner = owner;
         if (!expectedOwner)
             return undefined;
-        const { signal, journalBindingKey, isCurrent: callerIsCurrent, afterUpdateId } = input;
-        const isOwnerCurrent = () => owner === expectedOwner && expectedOwner.controller.signal === signal && !signal.aborted;
-        const isCurrent = () => isOwnerCurrent() && callerIsCurrent() && deps.isContextCurrent?.(expectedOwner.ctx) !== false &&
-            deps.getJournalBindingKey?.() === journalBindingKey && deps.hasAuthority(expectedOwner.ctx);
-        if (!isCurrent() || !deps.journal.abandonPending || !deps.journal.inspectPendingRetention ||
-            (afterUpdateId !== undefined && (!Number.isSafeInteger(afterUpdateId) || afterUpdateId < 0)))
+        const { signal, journalBindingKey, isCurrent: callerIsCurrent, afterUpdateId, } = input;
+        const isOwnerCurrent = () => owner === expectedOwner &&
+            expectedOwner.controller.signal === signal &&
+            !signal.aborted;
+        const isCurrent = () => isOwnerCurrent() &&
+            callerIsCurrent() &&
+            deps.isContextCurrent?.(expectedOwner.ctx) !== false &&
+            deps.getJournalBindingKey?.() === journalBindingKey &&
+            deps.hasAuthority(expectedOwner.ctx);
+        if (!isCurrent() ||
+            !deps.journal.abandonPending ||
+            !deps.journal.inspectPendingRetention ||
+            (afterUpdateId !== undefined &&
+                (!Number.isSafeInteger(afterUpdateId) || afterUpdateId < 0)))
             return undefined;
-        const matches = [...deferredSources].filter(([id, source]) => claims.get(id) === kind &&
-            source.journalBindingKey === journalBindingKey && (afterUpdateId === undefined || id > afterUpdateId))
+        const matches = [...deferredSources]
+            .filter(([id, source]) => claims.get(id) === kind &&
+            source.journalBindingKey === journalBindingKey &&
+            (afterUpdateId === undefined || id > afterUpdateId))
             .sort(([a], [b]) => a - b);
-        const sources = matches.slice(0, TELEGRAM_HELD_SOURCE_INSPECTION_LIMIT).map(([updateId, source]) => {
+        const sources = matches
+            .slice(0, TELEGRAM_HELD_SOURCE_INSPECTION_LIMIT)
+            .map(([updateId, source]) => {
             let committed;
-            return { original: structuredClone(source.entry), retry(authority) {
+            return {
+                original: structuredClone(source.entry),
+                retry(authority) {
                     const authorized = () => isOwnerCurrent() && authority.isCurrent() && isCurrent();
                     if (!authorized())
                         return undefined;
                     if (committed)
                         return { ...committed, duplicate: true };
-                    const stillProtected = () => authorized() && (claims.get(updateId) === kind || claims.get(updateId) === "abandoning") &&
+                    const stillProtected = () => authorized() &&
+                        (claims.get(updateId) === kind ||
+                            claims.get(updateId) === "abandoning") &&
                         deferredSources.get(updateId) === source;
                     if (!stillProtected())
                         return undefined;
                     committed = abandonSource({ ...authority, updateId, signal, isCurrent: stillProtected }, source);
                     return committed;
-                } };
+                },
+            };
         });
-        return isCurrent() ? { sources,
-            ...(matches.length > TELEGRAM_HELD_SOURCE_INSPECTION_LIMIT ? { nextAfterUpdateId: matches[TELEGRAM_HELD_SOURCE_INSPECTION_LIMIT - 1][0] } : {}) } : undefined;
+        return isCurrent()
+            ? {
+                sources,
+                ...(matches.length > TELEGRAM_HELD_SOURCE_INSPECTION_LIMIT
+                    ? {
+                        nextAfterUpdateId: matches[TELEGRAM_HELD_SOURCE_INSPECTION_LIMIT - 1][0],
+                    }
+                    : {}),
+            }
+            : undefined;
+    };
+    const inspectDeferredOriginal = (input) => {
+        const expectedOwner = owner;
+        const source = deferredSources.get(input.updateId);
+        const current = () => {
+            if (!expectedOwner ||
+                owner !== expectedOwner ||
+                input.signal.aborted ||
+                expectedOwner.controller.signal !== input.signal ||
+                !source ||
+                deferredSources.get(input.updateId) !== source ||
+                claims.get(input.updateId) !== "deferred" ||
+                deps.getJournalBindingKey?.() !== source.journalBindingKey ||
+                deps.isContextCurrent?.(expectedOwner.ctx) === false ||
+                !deps.hasAuthority(expectedOwner.ctx))
+                return false;
+            return isQueueOwnerIdentityCurrent(expectedOwner);
+        };
+        if (!current())
+            return undefined;
+        const snapshot = deps.journal.read();
+        const entry = snapshot.entries.find((value) => value.updateId === input.updateId);
+        if (!isTelegramUpdateJournalLegacyFamilyVersion(snapshot.version) ||
+            !entry ||
+            JSON.stringify(entry) !== JSON.stringify(source.entry) ||
+            !current())
+            return undefined;
+        return {
+            source: {
+                journalBindingKey: source.journalBindingKey,
+                ...createTelegramUpdateJournalEntryDigest(entry),
+            },
+            entry,
+        };
     };
     return {
         start(ctx) {
@@ -2247,6 +2832,8 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                 controller: createAbortController(),
                 queueOwnerIdentity,
             };
+            livePreparation = undefined;
+            delete state.preparedInputCount;
             claims.clear();
             deferredSources.clear();
             committedQueueReceipts.clear();
@@ -2260,31 +2847,408 @@ export function createTelegramUpdateWorkerRuntime(deps) {
             state.journalEntryCount = 0;
             state.journalSerializedBytes = 0;
             state.oldestAdmittedAtMs = undefined;
-            state.deferredClaimCount = 0;
-            delete state.abandoningClaimCount;
-            delete state.historicalClaimCount;
-            state.queuedClaimCount = 0;
-            state.foreignQueuedCount = 0;
-            delete state.foreignQueuedOwner;
-            state.retryWaitCount = 0;
-            state.failedCount = 0;
-            state.nextRetryUpdateId = undefined;
-            state.nextRetryAtMs = undefined;
-            state.nextRetryAttemptCount = undefined;
-            state.nextRetryFailureClass = undefined;
-            state.failedUpdateId = undefined;
-            state.failedFailureId = undefined;
-            state.failedAttemptCount = undefined;
-            state.failedClass = undefined;
-            state.failedSummary = undefined;
-            state.terminalFailureAtMs = undefined;
-            state.unsettledExecutionCount = unsettledExecutions.size;
+            clearTelegramUpdateWorkerClaimState(state, unsettledExecutions.size);
             state.lastCompletedUpdateId = undefined;
             state.lastCompletedAtMs = undefined;
             state.lastFailureAtMs = undefined;
             state.lastFailurePhase = undefined;
             notifyStateChange();
             launchDrain();
+        },
+        prepareDeferredLiveInput(input) {
+            const expectedOwner = owner, binding = deps.getJournalBindingKey?.(), ids = [...input.sourceUpdateIds];
+            const sources = ids.map((id) => deferredSources.get(id));
+            const ownerCurrent = () => !!expectedOwner &&
+                owner === expectedOwner &&
+                expectedOwner.controller.signal === input.signal &&
+                !input.signal.aborted &&
+                !!binding &&
+                deps.getJournalBindingKey?.() === binding &&
+                deps.hasAuthority(expectedOwner.ctx) &&
+                deps.isContextCurrent?.(expectedOwner.ctx) !== false &&
+                isQueueOwnerIdentityCurrent(expectedOwner) &&
+                input.isCurrent();
+            const sourcesCurrent = () => ownerCurrent() &&
+                sources.every((source, index) => !!source &&
+                    deferredSources.get(ids[index]) === source &&
+                    source.journalBindingKey === binding &&
+                    claims.get(ids[index]) === "deferred" &&
+                    isFreshLiveSource(expectedOwner, ids[index]));
+            if (!ownerCurrent() ||
+                !ids.length ||
+                !ids.includes(input.updateId) ||
+                new Set(ids).size !== ids.length ||
+                ids.some((id) => !Number.isSafeInteger(id) || id < 0) ||
+                livePreparation ||
+                deps.executeCustodiedUpdate ||
+                !sourcesCurrent())
+                return undefined;
+            const confirm = () => {
+                if (!sourcesCurrent())
+                    return false;
+                try {
+                    const snapshot = deps.journal.read();
+                    return (isTelegramUpdateJournalLegacyFamilyVersion(snapshot.version) &&
+                        sourcesCurrent() &&
+                        sources.every((source, index) => snapshot.entries.filter((entry) => entry.updateId === ids[index]).length === 1 &&
+                            source?.entry.state === "pending" &&
+                            !source.entry.queueOwner &&
+                            !source.entry.queueReceiptId &&
+                            !source.entry.preApprovalExcluded &&
+                            isDeepStrictEqual(snapshot.entries.find((entry) => entry.updateId === ids[index]), source.entry)));
+                }
+                catch (error) {
+                    recordRuntimeEvent(error, { phase: "live-deferred-observe" });
+                    return false;
+                }
+            };
+            if (!confirm())
+                return undefined;
+            const held = {
+                version: 1,
+                ids: new Set(ids),
+            };
+            livePreparation = held;
+            const current = () => livePreparation === held && sourcesCurrent();
+            const available = () => current() && !held.discardIssued;
+            const finish = () => {
+                livePreparation = undefined;
+                updateClaimCounts();
+                notifyStateChange();
+            };
+            updateClaimCounts();
+            notifyStateChange();
+            return {
+                sourceUpdateIds: Object.freeze(ids),
+                isCurrent: available,
+                isOwnerCurrent: ownerCurrent,
+                confirmSaved: () => available() && confirm(),
+                beginRelease(canRelease) {
+                    if (!available() ||
+                        !canRelease() ||
+                        !confirm() ||
+                        !canRelease() ||
+                        !available())
+                        return false;
+                    for (const source of sources)
+                        source.liveReleaseIssued = true;
+                    finish();
+                    return true;
+                },
+                settleTransferred(canSettle) {
+                    if (!current() || !canSettle() || !completeExact)
+                        return "protected";
+                    if (held.discardIssued)
+                        return "unknown";
+                    if (!confirm() || !canSettle() || !available())
+                        return "protected";
+                    const expected = sources.map((source) => createTelegramUpdateJournalEntryDigest(source.entry));
+                    held.discardIssued = true;
+                    try {
+                        const result = completeExact(ids, expected, undefined, () => current() && canSettle());
+                        if (!current() ||
+                            !canSettle() ||
+                            result.removedUpdateIds.length !== ids.length ||
+                            !ids.every((id) => result.removedUpdateIds.includes(id)))
+                            return "unknown";
+                    }
+                    catch (error) {
+                        recordRuntimeEvent(error, {
+                            phase: "live-deferred-transfer-settlement",
+                        });
+                        return "unknown";
+                    }
+                    for (const id of ids) {
+                        claims.delete(id);
+                        deferredSources.delete(id);
+                    }
+                    finish();
+                    for (const id of ids) {
+                        if (!ownerCurrent() || !canSettle())
+                            return "unknown";
+                        state.lastCompletedUpdateId = id;
+                        state.lastCompletedAtMs = getNowMs();
+                        try {
+                            deps.onUpdateCompleted?.(id, expectedOwner.ctx, binding);
+                        }
+                        catch (error) {
+                            recordRuntimeEvent(error, {
+                                phase: "update-completion-observer",
+                                updateId: id,
+                            });
+                        }
+                    }
+                    return ownerCurrent() && canSettle() ? "settled" : "unknown";
+                },
+                cancel() {
+                    if (!available())
+                        return false;
+                    finish();
+                    return true;
+                },
+            };
+        },
+        prepareLiveInput(ctx, sourceUpdateIds, isCurrent) {
+            const expectedOwner = owner, binding = deps.getJournalBindingKey?.();
+            const ids = [...sourceUpdateIds];
+            const currentOwner = () => !!expectedOwner &&
+                owner === expectedOwner &&
+                expectedOwner.ctx === ctx &&
+                !expectedOwner.controller.signal.aborted &&
+                !!binding &&
+                deps.getJournalBindingKey?.() === binding &&
+                deps.isContextCurrent?.(ctx) !== false &&
+                deps.hasAuthority(ctx) &&
+                isQueueOwnerIdentityCurrent(expectedOwner) &&
+                isCurrent?.() !== false;
+            if (!currentOwner() ||
+                !expectedOwner?.startupUpdateIds ||
+                livePreparation ||
+                deps.executeCustodiedUpdate ||
+                !completeExact ||
+                !ids.length ||
+                new Set(ids).size !== ids.length ||
+                ids.some((id) => !Number.isSafeInteger(id) ||
+                    id < 0 ||
+                    claims.has(id) ||
+                    unsettledExecutionsByUpdateId.has(id) ||
+                    (state.phase === "executing" && state.currentUpdateId === id)))
+                return undefined;
+            let before;
+            try {
+                before = deps.journal.read();
+            }
+            catch (error) {
+                recordRuntimeEvent(error, { phase: "live-input-prepare" });
+                return undefined;
+            }
+            if (!currentOwner() ||
+                !isTelegramUpdateJournalLegacyFamilyVersion(before.version) ||
+                before.entries.some((entry) => ids.includes(entry.updateId)))
+                return undefined;
+            const held = {
+                version: before.version,
+                ids: new Set(ids),
+            };
+            let released = false, completionReadiness;
+            livePreparation = held;
+            const current = () => livePreparation === held && !held.released && currentOwner();
+            const readPending = (full = true) => {
+                if (!current())
+                    return undefined;
+                try {
+                    const snapshot = deps.journal.read();
+                    const entries = snapshot.entries.filter((entry) => held.ids.has(entry.updateId));
+                    if (!current() ||
+                        snapshot.version !== held.version ||
+                        (full && entries.length !== ids.length) ||
+                        entries.some((entry) => entry.state !== "pending" ||
+                            entry.preApprovalExcluded === true ||
+                            entry.inputClaim ||
+                            entry.routingInput ||
+                            entry.failure ||
+                            entry.queueOwner ||
+                            entry.queueReceiptId ||
+                            entry.queueKind ||
+                            entry.queueHandoff ||
+                            "inputProvenance" in entry ||
+                            claims.has(entry.updateId) ||
+                            unsettledExecutionsByUpdateId.has(entry.updateId)))
+                        return undefined;
+                    return entries;
+                }
+                catch (error) {
+                    recordRuntimeEvent(error, { phase: "live-input-observe" });
+                    return undefined;
+                }
+            };
+            const finish = () => {
+                if (!held.released || !held.status)
+                    livePreparation = undefined;
+                updateClaimCounts();
+                notifyStateChange();
+                blocked = false;
+                pendingSignal = true;
+                launchDrain();
+            };
+            updateClaimCounts();
+            notifyStateChange();
+            return {
+                sourceUpdateIds: Object.freeze([...ids]),
+                isCurrent: () => current() && !held.discardIssued,
+                isOwnerCurrent: currentOwner,
+                confirmSaved() {
+                    const entries = readPending();
+                    if (held.discardIssued ||
+                        !entries ||
+                        (held.saved && !isDeepStrictEqual(held.saved, entries)))
+                        return false;
+                    held.saved ??= structuredClone(entries);
+                    return true;
+                },
+                prepareSourceCompletion() {
+                    if (!current() ||
+                        held.discardIssued ||
+                        !held.saved ||
+                        ids.length !== 1 ||
+                        !deps.getQueueOwnerIdentity)
+                        return undefined;
+                    if (completionReadiness)
+                        return completionReadiness.isCurrent()
+                            ? completionReadiness
+                            : undefined;
+                    const entries = readPending(), entry = entries?.[0], journal = deps.journal, read = journal.read, remove = journal.removeCompletedExact;
+                    if (!entry ||
+                        !isDeepStrictEqual(entries, held.saved) ||
+                        typeof remove !== "function" ||
+                        !completeExact ||
+                        !current())
+                        return undefined;
+                    const snapshot = {
+                        source: {
+                            journalBindingKey: binding,
+                            ...createTelegramUpdateJournalEntryDigest(entry),
+                        },
+                        update: structuredClone(entry.update),
+                    };
+                    const ownerCurrent = () => !held.discardIssued &&
+                        currentOwner() &&
+                        deps.journal === journal &&
+                        journal.read === read &&
+                        journal.removeCompletedExact === remove;
+                    let retained;
+                    completionReadiness = {
+                        get snapshot() {
+                            return structuredClone(snapshot);
+                        },
+                        isCurrent: ownerCurrent,
+                        bindCarrier(value) {
+                            if (!released ||
+                                !ownerCurrent() ||
+                                getTelegramUpdateExecutionFence(value)?.signal !==
+                                    expectedOwner.controller.signal)
+                                return undefined;
+                            if (retained)
+                                return value === retained.carrier &&
+                                    retained.completion.isCurrent()
+                                    ? retained.completion
+                                    : undefined;
+                            const completion = prepareTelegramDeferredSourceCompletion(value);
+                            if (!completion ||
+                                !isDeepStrictEqual(completion.source, snapshot.source) ||
+                                !ownerCurrent() ||
+                                !completion.isCurrent())
+                                return undefined;
+                            retained = { carrier: value, completion };
+                            return completion;
+                        },
+                    };
+                    return ownerCurrent() ? completionReadiness : undefined;
+                },
+                canPrepareStatusConsumption() {
+                    return (current() &&
+                        !held.discardIssued &&
+                        typeof deps.admitPreparedLiveInput === "function" &&
+                        !!deps.getQueueOwnerIdentity);
+                },
+                prepareStatusConsumption(input) {
+                    const admit = deps.admitPreparedLiveInput, ports = {
+                        assertCurrent: input.assertCurrent,
+                        bindCarrier: input.bindCarrier,
+                        execute: input.execute,
+                    };
+                    if (!current() ||
+                        held.status ||
+                        typeof admit !== "function" ||
+                        !completionReadiness ||
+                        !completionReadiness.isCurrent() ||
+                        Object.values(ports).some((port) => typeof port !== "function") ||
+                        !isDeepStrictEqual(input.source, completionReadiness.snapshot.source))
+                        return false;
+                    const readiness = completionReadiness, readyCurrent = readiness.isCurrent;
+                    held.status = {
+                        current: () => currentOwner() &&
+                            !held.discardIssued &&
+                            readiness.isCurrent === readyCurrent &&
+                            readyCurrent.call(readiness) &&
+                            deps.admitPreparedLiveInput === admit &&
+                            Object.entries(ports).every(([key, value]) => Reflect.get(input, key) === value),
+                        assertCurrent: ports.assertCurrent.bind(input),
+                        bindCarrier: ports.bindCarrier.bind(input),
+                        execute: ports.execute.bind(input),
+                        admit,
+                    };
+                    return held.status.current();
+                },
+                release(canRelease) {
+                    if (!current() ||
+                        held.discardIssued ||
+                        !held.saved ||
+                        !canRelease() ||
+                        held.status?.current() === false)
+                        return false;
+                    const entries = readPending();
+                    if (!entries ||
+                        !isDeepStrictEqual(entries, held.saved) ||
+                        !canRelease() ||
+                        !current())
+                        return false;
+                    released = true;
+                    held.released = true;
+                    finish();
+                    return true;
+                },
+                cancelEmpty() {
+                    if (!current() || held.discardIssued || held.saved)
+                        return false;
+                    try {
+                        const snapshot = deps.journal.read();
+                        if (!current() ||
+                            snapshot.version !== held.version ||
+                            snapshot.entries.some((entry) => held.ids.has(entry.updateId)))
+                            return false;
+                    }
+                    catch (error) {
+                        recordRuntimeEvent(error, { phase: "live-input-cancel-empty" });
+                        return false;
+                    }
+                    finish();
+                    return true;
+                },
+                discardSaved(canDiscard) {
+                    if (!current() || !canDiscard() || !completeExact)
+                        return "protected";
+                    if (held.discardIssued)
+                        return "unknown";
+                    const entries = readPending(false);
+                    if (!entries ||
+                        (held.saved && !isDeepStrictEqual(held.saved, entries)) ||
+                        !current() ||
+                        !canDiscard())
+                        return "protected";
+                    if (!entries.length) {
+                        finish();
+                        return "discarded";
+                    }
+                    const updateIds = entries.map((entry) => entry.updateId);
+                    const expected = entries.map((entry) => createTelegramUpdateJournalEntryDigest(entry));
+                    held.discardIssued = true;
+                    try {
+                        const result = completeExact(updateIds, expected, undefined, () => current() && canDiscard());
+                        if (!current() ||
+                            !canDiscard() ||
+                            result.removedUpdateIds.length !== updateIds.length ||
+                            !updateIds.every((id) => result.removedUpdateIds.includes(id)))
+                            return "unknown";
+                    }
+                    catch (error) {
+                        recordRuntimeEvent(error, { phase: "live-input-discard" });
+                        return "unknown";
+                    }
+                    finish();
+                    return "discarded";
+                },
+            };
         },
         signal() {
             if (!owner || owner.controller.signal.aborted)
@@ -2293,55 +3257,294 @@ export function createTelegramUpdateWorkerRuntime(deps) {
             pendingSignal = true;
             launchDrain();
         },
-        armRoutingInput(input) { return mutateRoutingSource(input, false)?.lifetime; },
-        selectRoutingInput(input) { return mutateRoutingSource(input, true)?.issued === true; },
+        armRoutingInput(input) {
+            return mutateRoutingSource(input, false)?.lifetime;
+        },
+        selectRoutingInput(input) {
+            return mutateRoutingSource(input, true)?.issued === true;
+        },
         isRoutingInputCurrent(input) {
-            return owner?.controller.signal === input.signal && !input.signal.aborted &&
-                deferredSources.has(input.updateId) && claims.get(input.updateId) !== "abandoning";
+            return (owner?.controller.signal === input.signal &&
+                !input.signal.aborted &&
+                deferredSources.has(input.updateId) &&
+                claims.get(input.updateId) !== "abandoning");
+        },
+        prepareDeferredSourceCompletion(input) {
+            const expectedOwner = owner, binding = deps.getJournalBindingKey?.(), journal = deps.journal, read = journal.read, remove = journal.removeCompletedExact;
+            const current = () => !!expectedOwner &&
+                owner === expectedOwner &&
+                expectedOwner.controller.signal === input.signal &&
+                !input.signal.aborted &&
+                !!binding &&
+                deps.getJournalBindingKey?.() === binding &&
+                deps.isContextCurrent?.(expectedOwner.ctx) !== false &&
+                deps.hasAuthority(expectedOwner.ctx) &&
+                isQueueOwnerIdentityCurrent(expectedOwner) &&
+                deps.journal === journal &&
+                journal.read === read &&
+                journal.removeCompletedExact === remove;
+            if (!deps.getQueueOwnerIdentity ||
+                !expectedOwner?.startupUpdateIds ||
+                typeof remove !== "function" ||
+                !completeExact ||
+                !current() ||
+                deps.executeCustodiedUpdate)
+                return undefined;
+            let original;
+            try {
+                original = inspectDeferredOriginal(input);
+            }
+            catch (error) {
+                recordRuntimeEvent(error, {
+                    phase: "source-completion-prepare",
+                    updateId: input.updateId,
+                });
+                return undefined;
+            }
+            if (!original ||
+                !current() ||
+                !isFreshLiveSource(expectedOwner, input.updateId) ||
+                original.entry.state !== "pending" ||
+                original.entry.preApprovalExcluded ||
+                original.entry.inputClaim ||
+                original.entry.queueOwner ||
+                original.entry.queueKind ||
+                original.entry.queueReceiptId ||
+                original.entry.queueHandoff ||
+                original.entry.failure ||
+                "inputProvenance" in original.entry)
+                return undefined;
+            const source = { ...original.source };
+            return {
+                get source() {
+                    return { ...source };
+                },
+                isCurrent: current,
+            };
+        },
+        prepareDeferredQueueAdmission(input) {
+            const expectedOwner = owner, binding = deps.getJournalBindingKey?.();
+            const read = queueAdmissionRead, commit = queueAdmissionCommit, inspect = queueAdmissionInspect;
+            const current = () => !!expectedOwner &&
+                owner === expectedOwner &&
+                expectedOwner.controller.signal === input.signal &&
+                !input.signal.aborted &&
+                !!binding &&
+                deps.getJournalBindingKey?.() === binding &&
+                deps.hasAuthority(expectedOwner.ctx) &&
+                deps.isContextCurrent?.(expectedOwner.ctx) !== false &&
+                isQueueOwnerIdentityCurrent(expectedOwner) &&
+                deps.journal === queueAdmissionJournal &&
+                deps.journal.read === read &&
+                deps.journal.markQueued === commit &&
+                deps.journal.isQueueReceiptCurrent === inspect;
+            if (!deps.getQueueOwnerIdentity ||
+                typeof commit !== "function" ||
+                !inspect ||
+                !current())
+                return undefined;
+            let original;
+            try {
+                original = inspectDeferredOriginal(input);
+            }
+            catch (error) {
+                recordRuntimeEvent(error, {
+                    phase: "queue-admission-prepare",
+                    updateId: input.updateId,
+                });
+                return undefined;
+            }
+            if (!original ||
+                !current() ||
+                !isFreshLiveSource(expectedOwner, input.updateId) ||
+                original.entry.state !== "pending" ||
+                original.entry.queueOwner ||
+                original.entry.queueReceiptId ||
+                original.entry.preApprovalExcluded)
+                return undefined;
+            const source = { ...original.source }, update = structuredClone(original.entry.update);
+            const complete = queueAdmissionJournal.completeQueued, completeScoped = queueAdmissionJournal.completeQueuedExact;
+            const readCompletion = queueAdmissionJournal.inspectSourceCompletion;
+            const completionCurrent = () => current() &&
+                queueAdmissionJournal.completeQueued === complete &&
+                completeScoped === queueCompletionPort &&
+                queueAdmissionJournal.completeQueuedExact === completeScoped &&
+                readCompletion === completionReaderPort &&
+                queueAdmissionJournal.inspectSourceCompletion === readCompletion;
+            const inspectedReceipts = new WeakMap();
+            return {
+                isCurrent: current,
+                inspectReceipt(receipt) {
+                    if (!current() ||
+                        receipt.journalBindingKey !== binding ||
+                        receipt.queueKind !== "prompt" ||
+                        !isDeepStrictEqual(receipt.sourceUpdateIds, [input.updateId]))
+                        return undefined;
+                    try {
+                        // The warm owner requires its actual publication ACK, not merely queued bytes or the report hint.
+                        const committed = getCurrentQueueReceipt(receipt);
+                        if (!committed ||
+                            !current() ||
+                            !isTelegramUpdateJournalQueueOwnerProcess(committed.queueOwner, expectedOwner.queueOwnerIdentity))
+                            return undefined;
+                        const entry = findExactQueuedPromptEntry(read.call(queueAdmissionJournal), receipt.receiptId, input.updateId, committed.queueOwner, update);
+                        if (!entry ||
+                            !current() ||
+                            !getCurrentQueueReceipt(receipt) ||
+                            !current())
+                            return undefined;
+                        const scope = committed.sourceCompletions?.find((scope) => scope.updateId === input.updateId);
+                        if (scope?.sourceSha256 ===
+                            createTelegramUpdateJournalEntryDigest(entry).sourceSha256) {
+                            inspectedReceipts.set(receipt, {
+                                receipt: normalizeQueueReceipt(committed.receipt),
+                                completion: {
+                                    updateId: scope.updateId,
+                                    sourceSha256: scope.sourceSha256,
+                                    completionSha256: scope.completionSha256,
+                                },
+                            });
+                        }
+                        return {
+                            source: { ...source },
+                            receipt: {
+                                queueKind: "prompt",
+                                receiptId: committed.receipt.receiptId,
+                                sourceUpdateIds: [...committed.receipt.sourceUpdateIds],
+                                queueOwner: { ...committed.queueOwner },
+                            },
+                        };
+                    }
+                    catch (error) {
+                        recordRuntimeEvent(error, {
+                            phase: "queue-admission-observe",
+                            updateId: input.updateId,
+                        });
+                        return undefined;
+                    }
+                },
+                prepareCompletionScope(receipt, queueOwner, completionSha256) {
+                    if (!completionCurrent() ||
+                        !queueCompletionPort ||
+                        !completionReaderPort ||
+                        !/^[a-f0-9]{64}$/u.test(completionSha256) ||
+                        receipt.journalBindingKey !== binding ||
+                        receipt.queueKind !== "prompt" ||
+                        !isDeepStrictEqual(receipt.sourceUpdateIds, [input.updateId]) ||
+                        !isTelegramUpdateJournalQueueOwnerProcess(queueOwner, expectedOwner.queueOwnerIdentity))
+                        return undefined;
+                    try {
+                        if (!current())
+                            return undefined;
+                        const entry = findExactQueuedPromptEntry(read.call(queueAdmissionJournal), receipt.receiptId, input.updateId, queueOwner, update);
+                        if (!entry ||
+                            inspect.call(queueAdmissionJournal, normalizeQueueReceipt(receipt), { ...queueOwner }) !== true ||
+                            !completionCurrent())
+                            return undefined;
+                        const completion = {
+                            ...createTelegramUpdateJournalEntryDigest(entry),
+                            completionSha256,
+                        };
+                        inspectedReceipts.set(receipt, {
+                            receipt: normalizeQueueReceipt(receipt),
+                            completion: { ...completion },
+                        });
+                        return { ...completion, journalBindingKey: binding };
+                    }
+                    catch (error) {
+                        recordRuntimeEvent(error, {
+                            phase: "queue-completion-scope",
+                            updateId: input.updateId,
+                        });
+                        return undefined;
+                    }
+                },
+                inspectCompletion(receipt) {
+                    const inspected = inspectedReceipts.get(receipt);
+                    // The native ACK belongs to this exact object and whole receipt, not an equivalent reconstructed query.
+                    if (!completionCurrent() ||
+                        !readCompletion ||
+                        !inspected ||
+                        !areTelegramQueueAdmissionReceiptsEqual(inspected.receipt, receipt) ||
+                        !isQueueReceiptCompletionAcknowledged(receipt) ||
+                        !completionCurrent())
+                        return undefined;
+                    try {
+                        const acknowledged = readCompletion.call(queueAdmissionJournal, {
+                            ...inspected.completion,
+                        });
+                        return completionCurrent() &&
+                            isDeepStrictEqual(acknowledged, inspected.completion)
+                            ? { ...source }
+                            : undefined;
+                    }
+                    catch (error) {
+                        recordRuntimeEvent(error, {
+                            phase: "queue-completion-observe",
+                            updateId: input.updateId,
+                        });
+                        return undefined;
+                    }
+                },
+            };
         },
         inspectDeferredSource(input) {
-            const expectedOwner = owner;
-            const source = deferredSources.get(input.updateId);
-            const current = () => {
-                if (!expectedOwner || owner !== expectedOwner || input.signal.aborted || expectedOwner.controller.signal !== input.signal ||
-                    !source || deferredSources.get(input.updateId) !== source || claims.get(input.updateId) !== "deferred" ||
-                    deps.getJournalBindingKey?.() !== source.journalBindingKey || deps.isContextCurrent?.(expectedOwner.ctx) === false ||
-                    !deps.hasAuthority(expectedOwner.ctx))
-                    return false;
-                return isQueueOwnerIdentityCurrent(expectedOwner);
-            };
-            if (!current())
-                return undefined;
-            const snapshot = deps.journal.read();
-            const entry = snapshot.entries.find(value => value.updateId === input.updateId);
-            if (!isTelegramUpdateJournalLegacyFamilyVersion(snapshot.version) || !entry ||
-                JSON.stringify(entry) !== JSON.stringify(source.entry) || !current())
-                return undefined;
-            return { journalBindingKey: source.journalBindingKey, ...createTelegramUpdateJournalEntryDigest(entry) };
+            return inspectDeferredOriginal(input)?.source;
+        },
+        inspectDeferredSourceSnapshot(input) {
+            const original = inspectDeferredOriginal(input);
+            return (original && {
+                source: original.source,
+                update: structuredClone(original.entry.update),
+            });
         },
         isHistoricalSource(input) {
             const source = deferredSources.get(input.updateId);
-            const isCurrent = () => owner?.controller.signal === input.signal && !input.signal.aborted &&
-                source?.historical === true && deferredSources.get(input.updateId) === source;
+            const isCurrent = () => owner?.controller.signal === input.signal &&
+                !input.signal.aborted &&
+                source?.historical === true &&
+                deferredSources.get(input.updateId) === source;
             if (!isCurrent())
                 return false;
             // Domain eligibility observes original evidence, never mutable handler projections.
-            return (!input.matchesOriginal || input.matchesOriginal(structuredClone(source.entry)) === true) && isCurrent();
+            return ((!input.matchesOriginal ||
+                input.matchesOriginal(structuredClone(source.entry)) === true) &&
+                isCurrent());
+        },
+        getRoutingInput(input) {
+            const lifetime = deferredSources.get(input.updateId)?.entry.routingInput;
+            return owner?.controller.signal === input.signal &&
+                !input.signal.aborted &&
+                lifetime
+                ? structuredClone(lifetime)
+                : undefined;
         },
         supportsDeferredAbandonment(input) {
             const expectedOwner = owner;
             const source = deferredSources.get(input.updateId);
-            if (!expectedOwner || input.signal.aborted || expectedOwner.controller.signal !== input.signal ||
-                !source || source.historical || input.journalBindingKey !== source.journalBindingKey ||
-                !deps.journal.abandonPending || !deps.journal.inspectPendingRetention ||
+            if (!expectedOwner ||
+                input.signal.aborted ||
+                expectedOwner.controller.signal !== input.signal ||
+                !source ||
+                source.historical ||
+                input.journalBindingKey !== source.journalBindingKey ||
+                !deps.journal.abandonPending ||
+                !deps.journal.inspectPendingRetention ||
                 claims.get(input.updateId) === "queued")
                 return false;
-            return deps.isContextCurrent?.(expectedOwner.ctx) !== false &&
-                deps.getJournalBindingKey?.() === source.journalBindingKey && deps.hasAuthority(expectedOwner.ctx);
+            return (deps.isContextCurrent?.(expectedOwner.ctx) !== false &&
+                deps.getJournalBindingKey?.() === source.journalBindingKey &&
+                deps.hasAuthority(expectedOwner.ctx));
         },
-        abandonDeferred(input) { return abandonSource(input); },
-        inspectAbandoning(input) { return inspectRecovery(input, "abandoning"); },
-        inspectHistorical(input) { return inspectRecovery(input, "historical"); },
+        abandonDeferred(input) {
+            return abandonSource(input);
+        },
+        inspectAbandoning(input) {
+            return inspectRecovery(input, "abandoning");
+        },
+        inspectHistorical(input) {
+            return inspectRecovery(input, "historical");
+        },
         async settleDeferred(input) {
             const expectedOwner = owner;
             if (!expectedOwner ||
@@ -2359,7 +3562,11 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                 return;
             }
             const claim = claims.get(input.updateId);
-            if (claim === "abandoning" || claim === "historical" || claim === "retained" ||
+            if (livePreparation?.ids.has(input.updateId))
+                return;
+            if (claim === "abandoning" ||
+                claim === "historical" ||
+                claim === "retained" ||
                 (!claim && routingJournal?.inspectExpiry(input.updateId)))
                 return;
             if (input.outcome.kind === "complete") {
@@ -2376,10 +3583,27 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                 }
                 if (completion.kind !== "complete")
                     return;
-                const result = commitCompletedBatch(expectedOwner, [{ updateId: input.updateId,
-                        ...(completion.expectedSource ? { expectedSource: completion.expectedSource } : {}) }]);
-                if (!result)
+                const source = completion.expectedSource && {
+                    ...completion.expectedSource,
+                };
+                const journalBindingKey = deps.getJournalBindingKey?.();
+                const isCurrent = () => owner === expectedOwner &&
+                    !input.signal.aborted &&
+                    deps.isContextCurrent?.(expectedOwner.ctx) !== false &&
+                    deps.hasAuthority(expectedOwner.ctx) &&
+                    isQueueOwnerIdentityCurrent(expectedOwner) &&
+                    deps.getJournalBindingKey?.() === journalBindingKey;
+                const result = commitCompletedBatch(expectedOwner, [
+                    {
+                        updateId: input.updateId,
+                        ...(source ? { expectedSource: source } : {}),
+                    },
+                ], source ? isCurrent : undefined);
+                if (!result) {
                     transition("idle", input.updateId);
+                    if (source && isCurrent())
+                        return { source, isCurrent };
+                }
                 return;
             }
             if (input.outcome.kind === "deferred") {
@@ -2394,7 +3618,14 @@ export function createTelegramUpdateWorkerRuntime(deps) {
             }
             let outcome;
             try {
-                outcome = validateTelegramUpdateAdmissionOutcome(input.outcome, input.updateId, new Set([input.updateId, ...[...claims].filter(([, claim]) => claim !== "abandoning" && claim !== "historical" && claim !== "retained").map(([id]) => id)]));
+                outcome = validateTelegramUpdateAdmissionOutcome(input.outcome, input.updateId, new Set([
+                    input.updateId,
+                    ...[...claims]
+                        .filter(([, claim]) => claim !== "abandoning" &&
+                        claim !== "historical" &&
+                        claim !== "retained")
+                        .map(([id]) => id),
+                ]));
             }
             catch (error) {
                 blockWithFailure("invalid-outcome", "late-invalid-outcome", error, input.updateId);
@@ -2422,7 +3653,9 @@ export function createTelegramUpdateWorkerRuntime(deps) {
         },
         async settleCustodied(input) {
             const expectedOwner = owner;
-            if (!expectedOwner || expectedOwner.controller.signal !== input.signal || input.signal.aborted)
+            if (!expectedOwner ||
+                expectedOwner.controller.signal !== input.signal ||
+                input.signal.aborted)
                 return;
             if (checkAuthority(expectedOwner, input.updateId))
                 return;
@@ -2446,7 +3679,8 @@ export function createTelegramUpdateWorkerRuntime(deps) {
             }
             const receipt = normalizeQueueReceipt(input.result.queueReceipt);
             const existing = committedQueueReceipts.get(receipt.receiptId);
-            if (existing && areTelegramQueueAdmissionReceiptsEqual(existing.receipt, receipt) &&
+            if (existing &&
+                areTelegramQueueAdmissionReceiptsEqual(existing.receipt, receipt) &&
                 areTelegramUpdateJournalQueueOwnersEqual(existing.queueOwner, input.result.queueReceipt.queueOwner))
                 return;
             if (existing) {
@@ -2454,7 +3688,7 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                 return;
             }
             if (!receipt.sourceUpdateIds.includes(input.updateId) ||
-                receipt.sourceUpdateIds.some(updateId => claims.get(updateId) !== "deferred")) {
+                receipt.sourceUpdateIds.some((updateId) => claims.get(updateId) !== "deferred")) {
                 blockWithFailure("invalid-outcome", "late-custody-unclaimed", new TelegramUpdateAdmissionOutcomeError(`Telegram update ${input.updateId} reported custodied queue without exact deferred claims.`), input.updateId);
                 return;
             }
@@ -2473,21 +3707,29 @@ export function createTelegramUpdateWorkerRuntime(deps) {
             }
             transition("queued", input.updateId);
         },
-        isQueueReceiptCommitted: receipt => getCurrentQueueReceipt(receipt) !== undefined,
+        isQueueReceiptCommitted: (receipt) => getCurrentQueueReceipt(receipt) !== undefined,
         getQueueReceiptOwner(receipt) {
             const committed = getCurrentQueueReceipt(receipt);
             return committed ? { ...committed.queueOwner } : undefined;
         },
         getQueueReceiptSettlementOwner(receipt, ctx, reason) {
             const expectedOwner = owner, committed = committedQueueReceipts.get(receipt.receiptId);
-            if (!expectedOwner || expectedOwner.controller.signal.aborted ||
-                !(deps.isContextCurrent?.(ctx) ?? expectedOwner.ctx === ctx) || !isQueueOwnerIdentityCurrent(expectedOwner) ||
-                !committed || !areTelegramQueueAdmissionReceiptsEqual(committed.receipt, normalizeQueueReceipt(receipt)) ||
-                (deps.getJournalBindingKey && committed.receipt.journalBindingKey !== deps.getJournalBindingKey()) ||
+            if (!expectedOwner ||
+                expectedOwner.controller.signal.aborted ||
+                !(deps.isContextCurrent?.(ctx) ?? expectedOwner.ctx === ctx) ||
+                !isQueueOwnerIdentityCurrent(expectedOwner) ||
+                !committed ||
+                !areTelegramQueueAdmissionReceiptsEqual(committed.receipt, normalizeQueueReceipt(receipt)) ||
+                (deps.getJournalBindingKey &&
+                    committed.receipt.journalBindingKey !==
+                        deps.getJournalBindingKey()) ||
                 !isTelegramUpdateJournalQueueOwnerProcess(committed.queueOwner, expectedOwner.queueOwnerIdentity))
                 return undefined;
             const attempt = scopedQueueCompletionAttempts.get(receipt.receiptId);
-            if (attempt ? attempt.owner !== expectedOwner || attempt.reason !== reason || attempt.journalBindingKey !== deps.getJournalBindingKey?.()
+            if (attempt
+                ? attempt.owner !== expectedOwner ||
+                    attempt.reason !== reason ||
+                    attempt.journalBindingKey !== deps.getJournalBindingKey?.()
                 : !getCurrentQueueReceipt(receipt))
                 return undefined;
             return { ...committed.queueOwner };
@@ -2500,7 +3742,9 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                 return false;
             }
             // An ACK permits only local completion reconciliation, never execution readiness.
-            const receipts = input.sourceCompletions === undefined ? input.receipts.filter(receipt => !isQueueReceiptCompletionAcknowledged(receipt)) : input.receipts;
+            const receipts = input.sourceCompletions === undefined
+                ? input.receipts.filter((receipt) => !isQueueReceiptCompletionAcknowledged(receipt))
+                : input.receipts;
             if (receipts.length === 0)
                 return input.sourceCompletions === undefined;
             const normalizedReceipts = receipts.map(normalizeQueueReceipt);
@@ -2528,83 +3772,138 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                 }
             }
             const completionBinding = deps.getJournalBindingKey?.();
-            const ordinaryObserverBound = normalizedReceipts.every(receipt => committedQueueReceipts.get(receipt.receiptId).receipt.journalBindingKey === completionBinding);
-            const ordinaryCompletionCurrent = () => ordinaryObserverBound && owner === expectedOwner &&
-                !expectedOwner.controller.signal.aborted && (deps.isContextCurrent?.(input.ctx) ?? expectedOwner.ctx === input.ctx) &&
-                isQueueOwnerIdentityCurrent(expectedOwner) && deps.getJournalBindingKey?.() === completionBinding;
+            const ordinaryObserverBound = normalizedReceipts.every((receipt) => committedQueueReceipts.get(receipt.receiptId).receipt
+                .journalBindingKey === completionBinding);
+            const ordinaryCompletionCurrent = () => ordinaryObserverBound &&
+                owner === expectedOwner &&
+                !expectedOwner.controller.signal.aborted &&
+                (deps.isContextCurrent?.(input.ctx) ??
+                    expectedOwner.ctx === input.ctx) &&
+                isQueueOwnerIdentityCurrent(expectedOwner) &&
+                deps.getJournalBindingKey?.() === completionBinding;
             let removedUpdateIds;
             let scopedCompletionCurrent;
             try {
-                const prepared = normalizedReceipts.flatMap(receipt => committedQueueReceipts.get(receipt.receiptId).sourceCompletions ?? []);
-                const sourceCompletions = input.sourceCompletions === undefined ? (prepared.length ? prepared : undefined) : input.sourceCompletions;
-                if (input.sourceCompletions !== undefined && prepared.some(expected => !input.sourceCompletions.some(value => isDeepStrictEqual(value, expected)))) {
+                const prepared = normalizedReceipts.flatMap((receipt) => committedQueueReceipts.get(receipt.receiptId).sourceCompletions ??
+                    []);
+                const sourceCompletions = input.sourceCompletions === undefined
+                    ? prepared.length
+                        ? prepared
+                        : undefined
+                    : input.sourceCompletions;
+                if (input.sourceCompletions !== undefined &&
+                    prepared.some((expected) => !input.sourceCompletions.some((value) => isDeepStrictEqual(value, expected)))) {
                     throw new Error("Telegram queued completion conflicts with its prepared source scopes.");
                 }
-                if (input.sourceCompletions === undefined && prepared.length && receipts.some(receipt => !requiredScopedQueueReceipts.has(receipt.receiptId))) {
-                    const scoped = receipts.filter(receipt => requiredScopedQueueReceipts.has(receipt.receiptId));
-                    const ordinary = receipts.filter(receipt => !requiredScopedQueueReceipts.has(receipt.receiptId));
+                if (input.sourceCompletions === undefined &&
+                    prepared.length &&
+                    receipts.some((receipt) => !requiredScopedQueueReceipts.has(receipt.receiptId))) {
+                    const scoped = receipts.filter((receipt) => requiredScopedQueueReceipts.has(receipt.receiptId));
+                    const ordinary = receipts.filter((receipt) => !requiredScopedQueueReceipts.has(receipt.receiptId));
                     if (!scoped.length || !ordinary.length)
                         throw new Error("Telegram mixed queue completion has incomplete scoped authority.");
                     const binding = deps.getJournalBindingKey?.();
-                    const current = () => owner === expectedOwner && !expectedOwner.controller.signal.aborted &&
-                        (deps.isContextCurrent?.(input.ctx) ?? expectedOwner.ctx === input.ctx) && isQueueOwnerIdentityCurrent(expectedOwner) &&
-                        !!binding && deps.getJournalBindingKey?.() === binding;
+                    const current = () => owner === expectedOwner &&
+                        !expectedOwner.controller.signal.aborted &&
+                        (deps.isContextCurrent?.(input.ctx) ??
+                            expectedOwner.ctx === input.ctx) &&
+                        isQueueOwnerIdentityCurrent(expectedOwner) &&
+                        !!binding &&
+                        deps.getJournalBindingKey?.() === binding;
                     // Independent whole receipts need independent ACKs. Ordinary siblings must not acquire invented scopes.
-                    if (!current() || !completeQueueReceipts({ receipts: scoped, ctx: input.ctx, reason: input.reason }) || !current())
+                    if (!current() ||
+                        !completeQueueReceipts({
+                            receipts: scoped,
+                            ctx: input.ctx,
+                            reason: input.reason,
+                        }) ||
+                        !current())
                         return false;
-                    return completeQueueReceipts({ receipts: ordinary, ctx: input.ctx, reason: input.reason });
+                    return completeQueueReceipts({
+                        receipts: ordinary,
+                        ctx: input.ctx,
+                        reason: input.reason,
+                    });
                 }
                 if (sourceCompletions === undefined) {
-                    if (queuedCompletions.some(receipt => requiredScopedQueueReceipts.has(receipt.receiptId))) {
+                    if (queuedCompletions.some((receipt) => requiredScopedQueueReceipts.has(receipt.receiptId))) {
                         throw new Error("Telegram scoped queue completion cannot downgrade required source scopes.");
                     }
-                    removedUpdateIds = deps.journal.completeQueued(queuedCompletions).removedUpdateIds;
+                    removedUpdateIds =
+                        deps.journal.completeQueued(queuedCompletions).removedUpdateIds;
                 }
                 else {
                     for (const receipt of queuedCompletions)
                         requiredScopedQueueReceipts.add(receipt.receiptId);
                     queuedCompletions.sort((a, b) => a.receiptId < b.receiptId ? -1 : a.receiptId > b.receiptId ? 1 : 0);
                     const journalBindingKey = deps.getJournalBindingKey?.();
-                    const current = () => owner === expectedOwner && !expectedOwner.controller.signal.aborted &&
-                        (deps.isContextCurrent?.(input.ctx) ?? expectedOwner.ctx === input.ctx) && isQueueOwnerIdentityCurrent(expectedOwner) &&
+                    const current = () => owner === expectedOwner &&
+                        !expectedOwner.controller.signal.aborted &&
+                        (deps.isContextCurrent?.(input.ctx) ??
+                            expectedOwner.ctx === input.ctx) &&
+                        isQueueOwnerIdentityCurrent(expectedOwner) &&
                         deps.getJournalBindingKey?.() === journalBindingKey;
-                    if (!journalBindingKey || !current() || !completeQueuedExact || !inspectCompletion ||
-                        !Array.isArray(sourceCompletions) || input.sourceCompletions !== undefined && sourceCompletions.length !== sourceUpdateIds.size) {
+                    if (!journalBindingKey ||
+                        !current() ||
+                        !completeQueuedExact ||
+                        !inspectCompletion ||
+                        !Array.isArray(sourceCompletions) ||
+                        (input.sourceCompletions !== undefined &&
+                            sourceCompletions.length !== sourceUpdateIds.size)) {
                         throw new Error("Telegram scoped queue completion requires full current source authority.");
                     }
                     scopedCompletionCurrent = current;
-                    const completions = normalizeTelegramQueueSourceCompletions(sourceCompletions, sourceUpdateIds, journalBindingKey, input.sourceCompletions !== undefined)
-                        .map(({ journalBindingKey: _binding, ...completion }) => completion);
-                    if (queuedCompletions.some(receipt => !completions.some(scope => receipt.sourceUpdateIds.includes(scope.updateId)))) {
+                    const completions = normalizeTelegramQueueSourceCompletions(sourceCompletions, sourceUpdateIds, journalBindingKey, input.sourceCompletions !== undefined).map(({ journalBindingKey: _binding, ...completion }) => completion);
+                    if (queuedCompletions.some((receipt) => !completions.some((scope) => receipt.sourceUpdateIds.includes(scope.updateId)))) {
                         throw new Error("Telegram scoped queue completion requires a proven origin for every whole receipt.");
                     }
-                    const previous = queuedCompletions.map(receipt => scopedQueueCompletionAttempts.get(receipt.receiptId));
-                    const retained = previous.find(attempt => attempt !== undefined);
-                    if (retained && (previous.some(attempt => attempt !== retained) || retained.owner !== expectedOwner ||
-                        retained.journalBindingKey !== journalBindingKey || retained.reason !== input.reason ||
-                        !isDeepStrictEqual(retained.receipts, queuedCompletions) || !isDeepStrictEqual(retained.completions, completions))) {
+                    const previous = queuedCompletions.map((receipt) => scopedQueueCompletionAttempts.get(receipt.receiptId));
+                    const retained = previous.find((attempt) => attempt !== undefined);
+                    if (retained &&
+                        (previous.some((attempt) => attempt !== retained) ||
+                            retained.owner !== expectedOwner ||
+                            retained.journalBindingKey !== journalBindingKey ||
+                            retained.reason !== input.reason ||
+                            !isDeepStrictEqual(retained.receipts, queuedCompletions) ||
+                            !isDeepStrictEqual(retained.completions, completions))) {
                         throw new Error("Telegram scoped queue completion has conflicting issued authority.");
                     }
                     if (!retained) {
-                        const attempt = { owner: expectedOwner, journalBindingKey, reason: input.reason,
-                            receipts: queuedCompletions.map(receipt => ({ ...receipt, sourceUpdateIds: [...receipt.sourceUpdateIds], queueOwner: { ...receipt.queueOwner } })),
-                            completions: completions.map(completion => ({ ...completion })) };
+                        const attempt = {
+                            owner: expectedOwner,
+                            journalBindingKey,
+                            reason: input.reason,
+                            receipts: queuedCompletions.map((receipt) => ({
+                                ...receipt,
+                                sourceUpdateIds: [...receipt.sourceUpdateIds],
+                                queueOwner: { ...receipt.queueOwner },
+                            })),
+                            completions: completions.map((completion) => ({ ...completion })),
+                        };
                         if (!current())
                             throw new Error("Telegram scoped queue completion authority changed before disposal.");
                         // Mark before issuance: an exception may follow a committed rename, and cannot license another disposal.
                         for (const receipt of queuedCompletions)
                             scopedQueueCompletionAttempts.set(receipt.receiptId, attempt);
-                        const result = completeQueuedExact(queuedCompletions.map(receipt => ({ ...receipt, sourceUpdateIds: [...receipt.sourceUpdateIds], queueOwner: { ...receipt.queueOwner } })), completions.map(completion => ({ ...completion })));
-                        if (!current() || !isDeepStrictEqual(result.sourceCompletions, completions)) {
+                        const result = completeQueuedExact(queuedCompletions.map((receipt) => ({
+                            ...receipt,
+                            sourceUpdateIds: [...receipt.sourceUpdateIds],
+                            queueOwner: { ...receipt.queueOwner },
+                        })), completions.map((completion) => ({ ...completion })));
+                        if (!current() ||
+                            !isDeepStrictEqual(result.sourceCompletions, completions)) {
                             throw new Error("Telegram scoped queue completion ACK was not confirmed.");
                         }
                         const removed = new Set(result.removedUpdateIds);
-                        if (removed.size !== sourceUpdateIds.size || [...sourceUpdateIds].some(id => !removed.has(id))) {
+                        if (removed.size !== sourceUpdateIds.size ||
+                            [...sourceUpdateIds].some((id) => !removed.has(id))) {
                             throw new Error("Telegram scoped queue completion did not remove every source.");
                         }
                     }
                     for (const completion of completions) {
-                        if (!current() || !isDeepStrictEqual(inspectCompletion({ ...completion }), completion) || !current()) {
+                        if (!current() ||
+                            !isDeepStrictEqual(inspectCompletion({ ...completion }), completion) ||
+                            !current()) {
                             throw new Error("Telegram scoped queue completion ACK was not retained under current authority.");
                         }
                     }
@@ -2647,7 +3946,10 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                         observeQueuedCompletion?.(normalizeQueueReceipt(receipt), input.ctx);
                     }
                     catch (error) {
-                        recordRuntimeEvent(error, { phase: "queue-receipt-completion-observer", receiptId: receipt.receiptId });
+                        recordRuntimeEvent(error, {
+                            phase: "queue-receipt-completion-observer",
+                            receiptId: receipt.receiptId,
+                        });
                     }
                 }
             // Ordinary queued disposal is source completion too; notify only after a whole positive ACK and fresh origin authority.
@@ -2659,7 +3961,10 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                         deps.onUpdateCompleted?.(updateId, input.ctx, completionBinding);
                     }
                     catch (error) {
-                        recordRuntimeEvent(error, { phase: "queue-source-completion-observer", updateId });
+                        recordRuntimeEvent(error, {
+                            phase: "queue-source-completion-observer",
+                            updateId,
+                        });
                     }
                 }
             if (!scopedCompletionCurrent || scopedCompletionCurrent()) {
@@ -2680,6 +3985,8 @@ export function createTelegramUpdateWorkerRuntime(deps) {
             if (owner !== expectedOwner)
                 return;
             owner = undefined;
+            livePreparation = undefined;
+            delete state.preparedInputCount;
             drainPromise = undefined;
             claims.clear();
             deferredSources.clear();
@@ -2689,30 +3996,12 @@ export function createTelegramUpdateWorkerRuntime(deps) {
             state.phaseStartedAtMs = getNowMs();
             state.currentUpdateId = undefined;
             state.blockedReason = undefined;
-            state.deferredClaimCount = 0;
-            delete state.abandoningClaimCount;
-            delete state.historicalClaimCount;
-            state.queuedClaimCount = 0;
-            state.foreignQueuedCount = 0;
-            delete state.foreignQueuedOwner;
-            state.retryWaitCount = 0;
-            state.failedCount = 0;
-            state.nextRetryUpdateId = undefined;
-            state.nextRetryAtMs = undefined;
-            state.nextRetryAttemptCount = undefined;
-            state.nextRetryFailureClass = undefined;
-            state.failedUpdateId = undefined;
-            state.failedFailureId = undefined;
-            state.failedAttemptCount = undefined;
-            state.failedClass = undefined;
-            state.failedSummary = undefined;
-            state.terminalFailureAtMs = undefined;
-            state.unsettledExecutionCount = unsettledExecutions.size;
+            clearTelegramUpdateWorkerClaimState(state, unsettledExecutions.size);
             notifyStateChange();
         },
         async waitForDrain() {
             await (drainPromise ?? Promise.resolve());
-            await Promise.allSettled([...pendingQueuePublications.values()].map(value => value.task));
+            await Promise.allSettled([...pendingQueuePublications.values()].map((value) => value.task));
         },
         getState() {
             return getTelegramUpdateWorkerStateSnapshot(state);
@@ -2805,19 +4094,6 @@ function getOrCreateUpdateHandlerRegistry() {
 export function getTelegramUpdateHandlerRegistry() {
     return getOrCreateUpdateHandlerRegistry();
 }
-/**
- * Wrap a default polling `handleUpdate` with the public update handler registry.
- */
-export function createTelegramUpdateHandle(deps) {
-    const registry = deps.registry ?? getOrCreateUpdateHandlerRegistry();
-    const { defaultHandle } = deps;
-    return async (update, ctx) => {
-        const verdict = await registry.dispatch(update);
-        if (verdict === "consume")
-            return;
-        await defaultHandle(update, ctx);
-    };
-}
 function mergeTelegramReportedAdmissionOutcome(current, next, updateId) {
     if (!current || current.kind === "deferred")
         return next;
@@ -2829,16 +4105,20 @@ function mergeTelegramReportedAdmissionOutcome(current, next, updateId) {
         if (!next.expectedSource)
             return current;
         if (current.expectedSource.updateId === next.expectedSource.updateId &&
-            current.expectedSource.journalBindingKey === next.expectedSource.journalBindingKey &&
+            current.expectedSource.journalBindingKey ===
+                next.expectedSource.journalBindingKey &&
             current.expectedSource.sourceSha256 === next.expectedSource.sourceSha256) {
             if (!current.expectedSource.completionSha256)
                 return next;
-            if (!next.expectedSource.completionSha256 || current.expectedSource.completionSha256 === next.expectedSource.completionSha256)
+            if (!next.expectedSource.completionSha256 ||
+                current.expectedSource.completionSha256 ===
+                    next.expectedSource.completionSha256)
                 return current;
         }
         throw new TelegramUpdateAdmissionOutcomeError(`Telegram update ${updateId} reported conflicting completion sources.`);
     }
-    if (current.kind === "queued" && next.kind === "queued" &&
+    if (current.kind === "queued" &&
+        next.kind === "queued" &&
         areTelegramQueueAdmissionReceiptsEqual(current, next))
         return current;
     throw new TelegramUpdateAdmissionOutcomeError(`Telegram update ${updateId} reported conflicting queue outcomes.`);
@@ -2850,17 +4130,23 @@ export function createTelegramInputCustodyWorkerJournalPort(store) {
     return {
         read: () => store.read(),
         isQueueReceiptCurrent(receipt, owner) {
-            const entries = store.read().entries.filter(entry => entry.queueReceiptId === receipt.receiptId);
-            return receipt.sourceUpdateIds.length > 0 && entries.length === receipt.sourceUpdateIds.length &&
+            const entries = store
+                .read()
+                .entries.filter((entry) => entry.queueReceiptId === receipt.receiptId);
+            return (receipt.sourceUpdateIds.length > 0 &&
+                entries.length === receipt.sourceUpdateIds.length &&
                 entries.every((entry, index) => entry.updateId === receipt.sourceUpdateIds[index] &&
-                    entry.state === "queued" && entry.queueKind === receipt.queueKind && !entry.queueHandoff &&
-                    entry.queueOwner !== undefined && areTelegramUpdateJournalQueueOwnersEqual(entry.queueOwner, owner));
+                    entry.state === "queued" &&
+                    entry.queueKind === receipt.queueKind &&
+                    !entry.queueHandoff &&
+                    entry.queueOwner !== undefined &&
+                    areTelegramUpdateJournalQueueOwnersEqual(entry.queueOwner, owner)));
         },
         markQueued: legacyMutation,
         markExecutionFailure: legacyMutation,
         // The common drain batches excluded IDs here; the store rejects all non-vetoed input atomically.
-        removeCompleted: updateIds => store.removeExcluded(updateIds),
-        completeQueued: receipts => store.completeQueued(receipts),
+        removeCompleted: (updateIds) => store.removeExcluded(updateIds),
+        completeQueued: (receipts) => store.completeQueued(receipts),
         inputCustody: {
             acquireInput: store.acquireInput,
             startInput: store.startInput,
@@ -2873,7 +4159,7 @@ export function createTelegramInputCustodyLegacyDispositionRuntime(deps) {
     const withBinding = (recoveryKey, operation) => {
         if (!recoveryKey)
             throw new TelegramUpdateAdmissionOutcomeError("Telegram legacy custody disposition binding is unavailable.");
-        return deps.withBindingReference(recoveryKey, binding => {
+        return deps.withBindingReference(recoveryKey, (binding) => {
             if (binding.recoveryKey !== recoveryKey)
                 throw new TelegramUpdateAdmissionOutcomeError("Telegram legacy custody disposition binding is unavailable.");
             return operation(binding.journal);
@@ -2881,10 +4167,10 @@ export function createTelegramInputCustodyLegacyDispositionRuntime(deps) {
     };
     return {
         list(recoveryKey) {
-            return withBinding(recoveryKey, journal => journal.listLegacyCustodyCandidates());
+            return withBinding(recoveryKey, (journal) => journal.listLegacyCustodyCandidates());
         },
         apply(recoveryKey, authority) {
-            return withBinding(recoveryKey, journal => journal.applyLegacyCustodyDisposition(authority));
+            return withBinding(recoveryKey, (journal) => journal.applyLegacyCustodyDisposition(authority));
         },
     };
 }
@@ -2893,44 +4179,62 @@ export function createTelegramInputCustodyHandoffClient(deps) {
         async transfer(input) {
             const reconciled = deps.resolveAcceptedReference?.({
                 sourceUpdateId: input.receipt.updateId,
-                recipientBindingKey: input.recipientBindingKey
+                recipientBindingKey: input.recipientBindingKey,
             });
             if (reconciled)
                 return { ...reconciled, duplicate: true };
-            const offered = deps.journal.offerInputHandoff({ receipt: input.receipt,
-                recipientOwner: input.recipientOwner, handoffToken: input.handoffToken });
+            const offered = deps.journal.offerInputHandoff({
+                receipt: input.receipt,
+                recipientOwner: input.recipientOwner,
+                handoffToken: input.handoffToken,
+            });
             const envelope = {
-                kind: "leader.offerInputCustodyHandoff", requestId: input.requestId,
+                kind: "leader.offerInputCustodyHandoff",
+                requestId: input.requestId,
                 recipientInstanceId: input.recipientInstanceId,
                 recipientRegistrationGeneration: input.recipientRegistrationGeneration,
                 recipientBindingKey: input.recipientBindingKey,
                 sourceRecoveryKey: offered.source.journalBindingKey,
-                source: offered.source, handoffId: offered.handoff.handoffId,
-                sentAtMs: input.sentAtMs, ...(input.auth ? { auth: input.auth } : {}),
+                source: offered.source,
+                handoffId: offered.handoff.handoffId,
+                sentAtMs: input.sentAtMs,
+                ...(input.auth ? { auth: input.auth } : {}),
             };
             const response = await deps.sendEnvelope(envelope);
-            if (response?.kind !== "bus.ack" || response.requestId !== input.requestId ||
-                !response.ok || !response.result || typeof response.result !== "object" ||
+            if (response?.kind !== "bus.ack" ||
+                response.requestId !== input.requestId ||
+                !response.ok ||
+                !response.result ||
+                typeof response.result !== "object" ||
                 Array.isArray(response.result))
                 throw new Error("Telegram input custody handoff acknowledgement is missing or rejected.");
             const result = response.result;
             const source = result.source;
             if (result.sourceRecoveryKey !== offered.source.journalBindingKey ||
-                !source || typeof source !== "object" || Array.isArray(source) ||
-                source.updateId !== offered.source.updateId ||
+                !source ||
+                typeof source !== "object" ||
+                Array.isArray(source) ||
+                source.updateId !==
+                    offered.source.updateId ||
                 !source.owner ||
                 typeof source.owner !== "object" ||
                 Array.isArray(source.owner) ||
                 typeof source.owner.acquisitionId !== "string" ||
-                source.owner.handoffId !== offered.handoff.handoffId ||
+                source.owner
+                    .handoffId !== offered.handoff.handoffId ||
                 typeof result.duplicate !== "boolean")
                 throw new Error("Telegram input custody handoff acknowledgement returned mismatched authority.");
-            return { sourceRecoveryKey: result.sourceRecoveryKey,
-                source: { updateId: source.updateId, owner: {
+            return {
+                sourceRecoveryKey: result.sourceRecoveryKey,
+                source: {
+                    updateId: source.updateId,
+                    owner: {
                         acquisitionId: source.owner.acquisitionId,
-                        handoffId: source.owner.handoffId
-                    } },
-                duplicate: result.duplicate };
+                        handoffId: source.owner.handoffId,
+                    },
+                },
+                duplicate: result.duplicate,
+            };
         },
     };
 }
@@ -2938,56 +4242,88 @@ export function createTelegramInputCustodyHandoffAcceptanceRuntime(deps) {
     return {
         accept(input, ctx) {
             const binding = deps.resolveBinding(input.sourceRecoveryKey);
-            if (!binding || binding.recoveryKey !== input.sourceRecoveryKey ||
+            if (!binding ||
+                binding.recoveryKey !== input.sourceRecoveryKey ||
                 binding.recipientBindingKey !== input.recipientBindingKey ||
                 input.source.journalBindingKey !== input.sourceRecoveryKey)
                 throw new Error("Telegram input custody handoff binding is unavailable or changed.");
-            const accepted = binding.journal.acceptInputHandoff({ source: input.source,
-                recipientOwner: binding.recipientOwner, handoffId: input.handoffId });
+            const accepted = binding.journal.acceptInputHandoff({
+                source: input.source,
+                recipientOwner: binding.recipientOwner,
+                handoffId: input.handoffId,
+            });
             const acceptedHandoffId = accepted.receipt.owner.handoffId;
             if (!acceptedHandoffId || acceptedHandoffId !== input.handoffId)
                 throw new Error("Telegram input custody handoff acceptance returned mismatched authority.");
             binding.signalWorker(ctx);
-            return { sourceRecoveryKey: binding.recoveryKey,
-                source: { updateId: accepted.receipt.updateId,
-                    owner: { acquisitionId: accepted.receipt.owner.acquisitionId,
-                        handoffId: acceptedHandoffId } }, duplicate: accepted.duplicate };
+            return {
+                sourceRecoveryKey: binding.recoveryKey,
+                source: {
+                    updateId: accepted.receipt.updateId,
+                    owner: {
+                        acquisitionId: accepted.receipt.owner.acquisitionId,
+                        handoffId: acceptedHandoffId,
+                    },
+                },
+                duplicate: accepted.duplicate,
+            };
         },
     };
 }
 export function createTelegramInputCustodyForwardReferenceResolver(deps) {
-    return input => {
+    return (input) => {
         if (input.recipientBindingKey !== deps.recipientBindingKey)
             return undefined;
-        const entry = deps.journal.read().entries.find(candidate => candidate.updateId === input.sourceUpdateId);
+        const entry = deps.journal
+            .read()
+            .entries.find((candidate) => candidate.updateId === input.sourceUpdateId);
         const claim = entry?.inputClaim;
-        if (!entry || entry.state !== "pending" || entry.preApprovalExcluded !== false ||
-            !claim || claim.phase !== "ready" || claim.handoff ||
+        if (!entry ||
+            entry.state !== "pending" ||
+            entry.preApprovalExcluded !== false ||
+            !claim ||
+            claim.phase !== "ready" ||
+            claim.handoff ||
             claim.recipientBindingKey !== deps.recipientBindingKey ||
             !claim.owner.handoffId ||
             claim.owner.sessionGeneration !== deps.recipientOwner.sessionGeneration ||
             !isTelegramUpdateJournalQueueOwnerProcess(claim.owner, deps.recipientOwner))
             return undefined;
-        return { sourceRecoveryKey: deps.recoveryKey, source: { updateId: entry.updateId,
-                owner: { acquisitionId: claim.owner.acquisitionId,
-                    handoffId: claim.owner.handoffId } } };
+        return {
+            sourceRecoveryKey: deps.recoveryKey,
+            source: {
+                updateId: entry.updateId,
+                owner: {
+                    acquisitionId: claim.owner.acquisitionId,
+                    handoffId: claim.owner.handoffId,
+                },
+            },
+        };
     };
 }
 export function createTelegramInputCustodySourceReferenceWakeRuntime(deps) {
     return {
         wakeSource(input, ctx) {
             const binding = deps.resolveBinding(input.sourceRecoveryKey);
-            if (!binding || binding.recoveryKey !== input.sourceRecoveryKey ||
+            if (!binding ||
+                binding.recoveryKey !== input.sourceRecoveryKey ||
                 binding.recipientBindingKey !== input.recipientBindingKey)
                 throw new Error("Telegram follower source-reference binding is unavailable or changed.");
-            const entry = binding.journal.read().entries.find(candidate => candidate.updateId === input.sourceUpdateId);
+            const entry = binding.journal
+                .read()
+                .entries.find((candidate) => candidate.updateId === input.sourceUpdateId);
             const claim = entry?.inputClaim;
-            if (!entry || entry.state !== "pending" || entry.preApprovalExcluded !== false ||
-                !claim || claim.phase !== "ready" || claim.handoff ||
+            if (!entry ||
+                entry.state !== "pending" ||
+                entry.preApprovalExcluded !== false ||
+                !claim ||
+                claim.phase !== "ready" ||
+                claim.handoff ||
                 claim.recipientBindingKey !== input.recipientBindingKey ||
                 claim.owner.acquisitionId !== input.sourceClaim.acquisitionId ||
                 claim.owner.handoffId !== input.sourceClaim.handoffId ||
-                claim.owner.sessionGeneration !== binding.recipientOwner.sessionGeneration ||
+                claim.owner.sessionGeneration !==
+                    binding.recipientOwner.sessionGeneration ||
                 !isTelegramUpdateJournalQueueOwnerProcess(claim.owner, binding.recipientOwner))
                 throw new Error("Telegram follower source-reference claim is unavailable or changed.");
             binding.signalWorker(ctx);
@@ -2996,10 +4332,10 @@ export function createTelegramInputCustodySourceReferenceWakeRuntime(deps) {
 }
 export function createTelegramInputCustodyBusBindingRuntime(deps) {
     const acceptance = createTelegramInputCustodyHandoffAcceptanceRuntime({
-        resolveBinding: deps.resolveBinding
+        resolveBinding: deps.resolveBinding,
     });
     const wake = createTelegramInputCustodySourceReferenceWakeRuntime({
-        resolveBinding: deps.resolveBinding
+        resolveBinding: deps.resolveBinding,
     });
     return {
         acceptHandoff: acceptance.accept,
@@ -3029,7 +4365,7 @@ export function evaluateTelegramInputCustodyActivationReadiness(input) {
         return { enabled: false, blocker: "migration-incomplete" };
     if (input.sourceStatus !== "absent" && input.sourceStatus !== "v3")
         return { enabled: false, blocker: "source-unready" };
-    if (input.peerReadiness.some(readiness => readiness !== "ready"))
+    if (input.peerReadiness.some((readiness) => readiness !== "ready"))
         return { enabled: false, blocker: "peer-capability-mismatch" };
     return { enabled: true };
 }
@@ -3049,9 +4385,17 @@ export function createTelegramInputCustodyReadinessEvidenceStore(deps) {
         if (!value || typeof value !== "object" || Array.isArray(value))
             throw new Error("Telegram custody readiness evidence is malformed.");
         const snapshot = value;
-        if (snapshot.version !== 1 || !Number.isSafeInteger(snapshot.revision) ||
-            snapshot.revision < 0 || Object.keys(snapshot).some(key => !["version", "revision", "writerExclusion", "migration", "startupExclusion",
-            "migrationCompletion"].includes(key)))
+        if (snapshot.version !== 1 ||
+            !Number.isSafeInteger(snapshot.revision) ||
+            snapshot.revision < 0 ||
+            Object.keys(snapshot).some((key) => ![
+                "version",
+                "revision",
+                "writerExclusion",
+                "migration",
+                "startupExclusion",
+                "migrationCompletion",
+            ].includes(key)))
             throw new Error("Telegram custody readiness evidence is malformed.");
         const validate = (evidence, kind) => {
             if (evidence === undefined)
@@ -3059,61 +4403,104 @@ export function createTelegramInputCustodyReadinessEvidenceStore(deps) {
             if (!evidence || typeof evidence !== "object" || Array.isArray(evidence))
                 throw new Error("Telegram custody readiness evidence is malformed.");
             const record = evidence;
-            const statuses = kind === "writer" ? ["excluded", "present", "unknown"]
+            const statuses = kind === "writer"
+                ? ["excluded", "present", "unknown"]
                 : ["complete", "incomplete", "unknown"];
-            const writerKeys = ["startupAuthorityId", "closureOperationId", "writerInventorySha256"];
-            const migrationKeys = ["migrationAuthorityId", "startupAuthorityId", "closureOperationId",
-                "migrationInventorySha256", "resultingSourceFamily"];
+            const writerKeys = [
+                "startupAuthorityId",
+                "closureOperationId",
+                "writerInventorySha256",
+            ];
+            const migrationKeys = [
+                "migrationAuthorityId",
+                "startupAuthorityId",
+                "closureOperationId",
+                "migrationInventorySha256",
+                "resultingSourceFamily",
+            ];
             const linkedKeys = kind === "writer" ? writerKeys : migrationKeys;
-            const suppliedLinkedKeys = linkedKeys.filter(key => record[key] !== undefined);
-            const linkedMalformed = suppliedLinkedKeys.length === linkedKeys.length && (typeof record.startupAuthorityId !== "string" || !record.startupAuthorityId ||
-                typeof record.closureOperationId !== "string" || !record.closureOperationId ||
-                (kind === "writer"
-                    ? typeof record.writerInventorySha256 !== "string" ||
-                        !/^[a-f0-9]{64}$/u.test(record.writerInventorySha256)
-                    : typeof record.migrationAuthorityId !== "string" || !record.migrationAuthorityId ||
-                        typeof record.migrationInventorySha256 !== "string" ||
-                        !/^[a-f0-9]{64}$/u.test(record.migrationInventorySha256) ||
-                        (record.resultingSourceFamily !== "absent" && record.resultingSourceFamily !== "v3")));
-            if (record.version !== 1 || typeof record.profileKey !== "string" || !record.profileKey ||
-                typeof record.recoveryKey !== "string" || !record.recoveryKey ||
-                !statuses.includes(record.status) || Object.keys(record).some(key => !["version", "profileKey", "recoveryKey", "status", ...linkedKeys].includes(key)) ||
-                (suppliedLinkedKeys.length !== 0 && suppliedLinkedKeys.length !== linkedKeys.length) ||
+            const suppliedLinkedKeys = linkedKeys.filter((key) => record[key] !== undefined);
+            const linkedMalformed = suppliedLinkedKeys.length === linkedKeys.length &&
+                (typeof record.startupAuthorityId !== "string" ||
+                    !record.startupAuthorityId ||
+                    typeof record.closureOperationId !== "string" ||
+                    !record.closureOperationId ||
+                    (kind === "writer"
+                        ? typeof record.writerInventorySha256 !== "string" ||
+                            !/^[a-f0-9]{64}$/u.test(record.writerInventorySha256)
+                        : typeof record.migrationAuthorityId !== "string" ||
+                            !record.migrationAuthorityId ||
+                            typeof record.migrationInventorySha256 !== "string" ||
+                            !/^[a-f0-9]{64}$/u.test(record.migrationInventorySha256) ||
+                            (record.resultingSourceFamily !== "absent" &&
+                                record.resultingSourceFamily !== "v3")));
+            if (record.version !== 1 ||
+                typeof record.profileKey !== "string" ||
+                !record.profileKey ||
+                typeof record.recoveryKey !== "string" ||
+                !record.recoveryKey ||
+                !statuses.includes(record.status) ||
+                Object.keys(record).some((key) => ![
+                    "version",
+                    "profileKey",
+                    "recoveryKey",
+                    "status",
+                    ...linkedKeys,
+                ].includes(key)) ||
+                (suppliedLinkedKeys.length !== 0 &&
+                    suppliedLinkedKeys.length !== linkedKeys.length) ||
                 linkedMalformed)
                 throw new Error("Telegram custody readiness evidence is malformed.");
-            return { version: 1, profileKey: record.profileKey,
-                recoveryKey: record.recoveryKey, status: record.status,
-                ...(suppliedLinkedKeys.length === linkedKeys.length ? kind === "writer" ? {
-                    startupAuthorityId: record.startupAuthorityId,
-                    closureOperationId: record.closureOperationId,
-                    writerInventorySha256: record.writerInventorySha256,
-                } : {
-                    migrationAuthorityId: record.migrationAuthorityId,
-                    startupAuthorityId: record.startupAuthorityId,
-                    closureOperationId: record.closureOperationId,
-                    migrationInventorySha256: record.migrationInventorySha256,
-                    resultingSourceFamily: record.resultingSourceFamily,
-                } : {}) };
+            return {
+                version: 1,
+                profileKey: record.profileKey,
+                recoveryKey: record.recoveryKey,
+                status: record.status,
+                ...(suppliedLinkedKeys.length === linkedKeys.length
+                    ? kind === "writer"
+                        ? {
+                            startupAuthorityId: record.startupAuthorityId,
+                            closureOperationId: record.closureOperationId,
+                            writerInventorySha256: record.writerInventorySha256,
+                        }
+                        : {
+                            migrationAuthorityId: record.migrationAuthorityId,
+                            startupAuthorityId: record.startupAuthorityId,
+                            closureOperationId: record.closureOperationId,
+                            migrationInventorySha256: record.migrationInventorySha256,
+                            resultingSourceFamily: record.resultingSourceFamily,
+                        }
+                    : {}),
+            };
         };
         const writerExclusion = validate(snapshot.writerExclusion, "writer");
         const migration = validate(snapshot.migration, "migration");
         let startupExclusion;
         if (snapshot.startupExclusion !== undefined) {
             const candidate = snapshot.startupExclusion;
-            if (!candidate || typeof candidate.profileKey !== "string" ||
+            if (!candidate ||
+                typeof candidate.profileKey !== "string" ||
                 typeof candidate.recoveryKey !== "string")
                 throw new Error("Telegram custody readiness evidence is malformed.");
-            startupExclusion = normalizeTelegramInputCustodyStartupExclusionAuthority(candidate, { profileKey: candidate.profileKey, recoveryKey: candidate.recoveryKey });
+            startupExclusion = normalizeTelegramInputCustodyStartupExclusionAuthority(candidate, {
+                profileKey: candidate.profileKey,
+                recoveryKey: candidate.recoveryKey,
+            });
             if (!startupExclusion)
                 throw new Error("Telegram custody readiness evidence is malformed.");
         }
         let migrationCompletion;
         if (snapshot.migrationCompletion !== undefined) {
             const candidate = snapshot.migrationCompletion;
-            if (!candidate || typeof candidate.profileKey !== "string" ||
+            if (!candidate ||
+                typeof candidate.profileKey !== "string" ||
                 typeof candidate.recoveryKey !== "string")
                 throw new Error("Telegram custody readiness evidence is malformed.");
-            migrationCompletion = normalizeTelegramInputCustodyMigrationCompletionAuthority(candidate, { profileKey: candidate.profileKey, recoveryKey: candidate.recoveryKey });
+            migrationCompletion =
+                normalizeTelegramInputCustodyMigrationCompletionAuthority(candidate, {
+                    profileKey: candidate.profileKey,
+                    recoveryKey: candidate.recoveryKey,
+                });
             if (!migrationCompletion)
                 throw new Error("Telegram custody readiness evidence is malformed.");
         }
@@ -3126,48 +4513,72 @@ export function createTelegramInputCustodyReadinessEvidenceStore(deps) {
             identities.push(startupExclusion);
         if (migrationCompletion)
             identities.push(migrationCompletion);
-        if (identities.some(evidence => evidence.profileKey !== identities[0]?.profileKey ||
+        if (identities.some((evidence) => evidence.profileKey !== identities[0]?.profileKey ||
             evidence.recoveryKey !== identities[0]?.recoveryKey))
             throw new Error("Telegram custody readiness evidence has conflicting identities.");
-        if (writerExclusion?.startupAuthorityId && startupExclusion &&
+        if (writerExclusion?.startupAuthorityId &&
+            startupExclusion &&
             (writerExclusion.startupAuthorityId !== startupExclusion.authorityId ||
-                writerExclusion.closureOperationId !== startupExclusion.closureOperationId ||
-                writerExclusion.writerInventorySha256 !== startupExclusion.writerInventorySha256))
+                writerExclusion.closureOperationId !==
+                    startupExclusion.closureOperationId ||
+                writerExclusion.writerInventorySha256 !==
+                    startupExclusion.writerInventorySha256))
             throw new Error("Telegram custody readiness evidence has conflicting authorities.");
-        if (migration?.migrationAuthorityId && migrationCompletion &&
+        if (migration?.migrationAuthorityId &&
+            migrationCompletion &&
             (migration.migrationAuthorityId !== migrationCompletion.authorityId ||
-                migration.startupAuthorityId !== migrationCompletion.startupAuthorityId ||
-                migration.closureOperationId !== migrationCompletion.closureOperationId ||
-                migration.migrationInventorySha256 !== migrationCompletion.migrationInventorySha256 ||
-                migration.resultingSourceFamily !== migrationCompletion.resultingSourceFamily))
+                migration.startupAuthorityId !==
+                    migrationCompletion.startupAuthorityId ||
+                migration.closureOperationId !==
+                    migrationCompletion.closureOperationId ||
+                migration.migrationInventorySha256 !==
+                    migrationCompletion.migrationInventorySha256 ||
+                migration.resultingSourceFamily !==
+                    migrationCompletion.resultingSourceFamily))
             throw new Error("Telegram custody readiness evidence has conflicting migration authorities.");
-        if (migrationCompletion && startupExclusion &&
-            (migrationCompletion.startupAuthorityId !== startupExclusion.authorityId ||
-                migrationCompletion.closureOperationId !== startupExclusion.closureOperationId))
+        if (migrationCompletion &&
+            startupExclusion &&
+            (migrationCompletion.startupAuthorityId !==
+                startupExclusion.authorityId ||
+                migrationCompletion.closureOperationId !==
+                    startupExclusion.closureOperationId))
             throw new Error("Telegram custody readiness evidence has conflicting cutover authorities.");
-        return { version: 1, revision: snapshot.revision,
+        return {
+            version: 1,
+            revision: snapshot.revision,
             ...(writerExclusion ? { writerExclusion } : {}),
             ...(migration ? { migration } : {}),
             ...(startupExclusion ? { startupExclusion } : {}),
-            ...(migrationCompletion ? { migrationCompletion } : {}) };
+            ...(migrationCompletion ? { migrationCompletion } : {}),
+        };
     };
     const read = () => decode(deps.readRetained());
     const publish = (input) => deps.withSerialization(() => {
         const current = read();
         if (current.revision !== input.expectedRevision)
             throw new Error("Telegram custody readiness evidence revision changed.");
-        const next = { ...current, revision: current.revision + 1,
-            ...(input.kind === "writer-exclusion" ? { writerExclusion: input.evidence } :
-                input.kind === "migration" ? { migration: input.evidence } :
-                    input.kind === "startup-exclusion" ? { startupExclusion: input.evidence } :
-                        { migrationCompletion: input.evidence }) };
+        const next = {
+            ...current,
+            revision: current.revision + 1,
+            ...(input.kind === "writer-exclusion"
+                ? { writerExclusion: input.evidence }
+                : input.kind === "migration"
+                    ? { migration: input.evidence }
+                    : input.kind === "startup-exclusion"
+                        ? { startupExclusion: input.evidence }
+                        : { migrationCompletion: input.evidence }),
+        };
         const serialized = `${JSON.stringify(next)}\n`;
         const validated = decode(serialized);
         const normalizedEvidence = input.kind === "writer-exclusion"
-            ? validated.writerExclusion : input.kind === "migration"
-            ? validated.migration : input.kind === "startup-exclusion"
-            ? validated.startupExclusion : validated.migrationCompletion;
-        if (!normalizedEvidence || !deps.authorizePublication(input.kind, normalizedEvidence))
+            ? validated.writerExclusion
+            : input.kind === "migration"
+                ? validated.migration
+                : input.kind === "startup-exclusion"
+                    ? validated.startupExclusion
+                    : validated.migrationCompletion;
+        if (!normalizedEvidence ||
+            !deps.authorizePublication(input.kind, normalizedEvidence))
             throw new Error("Telegram custody readiness evidence publication is unauthorized.");
         deps.publishRetained(serialized);
         return validated;
@@ -3178,23 +4589,45 @@ export function normalizeTelegramInputCustodyStartupExclusionAuthority(value, ex
     if (!value || typeof value !== "object" || Array.isArray(value))
         return undefined;
     const record = value;
-    const keys = ["version", "status", "authorityId", "closureOperationId", "profileKey",
-        "recoveryKey", "writerInventorySha256", "allowedWriterProtocol", "authorizedAtMs"];
-    if (Object.keys(record).some(key => !keys.includes(key)) || record.version !== 1 ||
+    const keys = [
+        "version",
+        "status",
+        "authorityId",
+        "closureOperationId",
+        "profileKey",
+        "recoveryKey",
+        "writerInventorySha256",
+        "allowedWriterProtocol",
+        "authorizedAtMs",
+    ];
+    if (Object.keys(record).some((key) => !keys.includes(key)) ||
+        record.version !== 1 ||
         (record.status !== "enforced" && record.status !== "revoked") ||
-        record.profileKey !== expected.profileKey || record.recoveryKey !== expected.recoveryKey ||
-        typeof record.authorityId !== "string" || !record.authorityId || record.authorityId.length > 512 ||
-        typeof record.closureOperationId !== "string" || !record.closureOperationId ||
+        record.profileKey !== expected.profileKey ||
+        record.recoveryKey !== expected.recoveryKey ||
+        typeof record.authorityId !== "string" ||
+        !record.authorityId ||
+        record.authorityId.length > 512 ||
+        typeof record.closureOperationId !== "string" ||
+        !record.closureOperationId ||
         record.closureOperationId.length > 512 ||
         typeof record.writerInventorySha256 !== "string" ||
         !/^[a-f0-9]{64}$/u.test(record.writerInventorySha256) ||
         record.allowedWriterProtocol !== "custody-v3" ||
-        !Number.isSafeInteger(record.authorizedAtMs) || record.authorizedAtMs < 0)
+        !Number.isSafeInteger(record.authorizedAtMs) ||
+        record.authorizedAtMs < 0)
         return undefined;
-    return { version: 1, status: record.status, authorityId: record.authorityId,
-        closureOperationId: record.closureOperationId, profileKey: expected.profileKey,
-        recoveryKey: expected.recoveryKey, writerInventorySha256: record.writerInventorySha256,
-        allowedWriterProtocol: "custody-v3", authorizedAtMs: record.authorizedAtMs };
+    return {
+        version: 1,
+        status: record.status,
+        authorityId: record.authorityId,
+        closureOperationId: record.closureOperationId,
+        profileKey: expected.profileKey,
+        recoveryKey: expected.recoveryKey,
+        writerInventorySha256: record.writerInventorySha256,
+        allowedWriterProtocol: "custody-v3",
+        authorizedAtMs: record.authorizedAtMs,
+    };
 }
 export function evaluateTelegramInputCustodyWriterExclusionEvidence(input) {
     const identity = { ...input.expected };
@@ -3203,14 +4636,17 @@ export function evaluateTelegramInputCustodyWriterExclusionEvidence(input) {
         input.inventory.profileKey !== input.expected.profileKey ||
         input.inventory.recoveryKey !== input.expected.recoveryKey ||
         !/^[a-f0-9]{64}$/u.test(input.inventory.writerInventorySha256) ||
-        !authority || authority.status !== "enforced" ||
+        !authority ||
+        authority.status !== "enforced" ||
         authority.profileKey !== input.expected.profileKey ||
         authority.recoveryKey !== input.expected.recoveryKey ||
         authority.writerInventorySha256 !== input.inventory.writerInventorySha256)
         return { version: 1, status: "unknown", ...identity };
-    const authorityBinding = { startupAuthorityId: authority.authorityId,
+    const authorityBinding = {
+        startupAuthorityId: authority.authorityId,
         closureOperationId: authority.closureOperationId,
-        writerInventorySha256: authority.writerInventorySha256 };
+        writerInventorySha256: authority.writerInventorySha256,
+    };
     let unknown = false;
     for (const writer of input.inventory.writers) {
         let liveness;
@@ -3221,49 +4657,82 @@ export function evaluateTelegramInputCustodyWriterExclusionEvidence(input) {
             liveness = "unverifiable";
         }
         if (liveness === "alive")
-            return { version: 1, status: "present", ...identity,
-                ...authorityBinding };
+            return {
+                version: 1,
+                status: "present",
+                ...identity,
+                ...authorityBinding,
+            };
         if (liveness !== "dead")
             unknown = true;
     }
-    return { version: 1, status: unknown ? "unknown" : "excluded", ...identity,
-        ...authorityBinding };
+    return {
+        version: 1,
+        status: unknown ? "unknown" : "excluded",
+        ...identity,
+        ...authorityBinding,
+    };
 }
 export function normalizeTelegramInputCustodyMigrationCompletionAuthority(value, expected) {
     if (!value || typeof value !== "object" || Array.isArray(value))
         return undefined;
     const record = value;
-    const keys = ["version", "status", "authorityId", "startupAuthorityId",
-        "closureOperationId", "profileKey", "recoveryKey", "migrationInventorySha256",
-        "resultingSourceFamily", "authorizedAtMs"];
-    if (Object.keys(record).some(key => !keys.includes(key)) || record.version !== 1 ||
+    const keys = [
+        "version",
+        "status",
+        "authorityId",
+        "startupAuthorityId",
+        "closureOperationId",
+        "profileKey",
+        "recoveryKey",
+        "migrationInventorySha256",
+        "resultingSourceFamily",
+        "authorizedAtMs",
+    ];
+    if (Object.keys(record).some((key) => !keys.includes(key)) ||
+        record.version !== 1 ||
         (record.status !== "authorized" && record.status !== "revoked") ||
-        record.profileKey !== expected.profileKey || record.recoveryKey !== expected.recoveryKey ||
-        typeof record.authorityId !== "string" || !record.authorityId || record.authorityId.length > 512 ||
-        typeof record.startupAuthorityId !== "string" || !record.startupAuthorityId ||
+        record.profileKey !== expected.profileKey ||
+        record.recoveryKey !== expected.recoveryKey ||
+        typeof record.authorityId !== "string" ||
+        !record.authorityId ||
+        record.authorityId.length > 512 ||
+        typeof record.startupAuthorityId !== "string" ||
+        !record.startupAuthorityId ||
         record.startupAuthorityId.length > 512 ||
-        typeof record.closureOperationId !== "string" || !record.closureOperationId ||
+        typeof record.closureOperationId !== "string" ||
+        !record.closureOperationId ||
         record.closureOperationId.length > 512 ||
         typeof record.migrationInventorySha256 !== "string" ||
         !/^[a-f0-9]{64}$/u.test(record.migrationInventorySha256) ||
-        (record.resultingSourceFamily !== "absent" && record.resultingSourceFamily !== "v3") ||
-        !Number.isSafeInteger(record.authorizedAtMs) || record.authorizedAtMs < 0)
+        (record.resultingSourceFamily !== "absent" &&
+            record.resultingSourceFamily !== "v3") ||
+        !Number.isSafeInteger(record.authorizedAtMs) ||
+        record.authorizedAtMs < 0)
         return undefined;
-    return { version: 1, status: record.status, authorityId: record.authorityId,
+    return {
+        version: 1,
+        status: record.status,
+        authorityId: record.authorityId,
         startupAuthorityId: record.startupAuthorityId,
-        closureOperationId: record.closureOperationId, profileKey: expected.profileKey,
+        closureOperationId: record.closureOperationId,
+        profileKey: expected.profileKey,
         recoveryKey: expected.recoveryKey,
         migrationInventorySha256: record.migrationInventorySha256,
         resultingSourceFamily: record.resultingSourceFamily,
-        authorizedAtMs: record.authorizedAtMs };
+        authorizedAtMs: record.authorizedAtMs,
+    };
 }
 export function executeTelegramInputCustodyWriterCutover(input) {
-    const matchesAuthority = (candidate) => Boolean(candidate && candidate.status === "enforced" && candidate.version === 1 &&
+    const matchesAuthority = (candidate) => Boolean(candidate &&
+        candidate.status === "enforced" &&
+        candidate.version === 1 &&
         candidate.profileKey === input.expected.profileKey &&
         candidate.recoveryKey === input.expected.recoveryKey &&
         candidate.authorityId === input.startupAuthority.authorityId &&
         candidate.closureOperationId === input.closure.operationId &&
-        candidate.writerInventorySha256 === input.startupAuthority.writerInventorySha256 &&
+        candidate.writerInventorySha256 ===
+            input.startupAuthority.writerInventorySha256 &&
         candidate.allowedWriterProtocol === "custody-v3" &&
         candidate.authorizedAtMs === input.startupAuthority.authorizedAtMs);
     if (input.closure.profileKey !== input.expected.profileKey ||
@@ -3271,8 +4740,10 @@ export function executeTelegramInputCustodyWriterCutover(input) {
         !matchesAuthority(input.evidenceStore.read().startupExclusion))
         return { kind: "blocked", blocker: "startup-authority" };
     const evidence = evaluateTelegramInputCustodyWriterExclusionEvidence({
-        expected: input.expected, inventory: input.inventory,
-        startupAuthority: input.startupAuthority, getProcessLiveness: input.getProcessLiveness
+        expected: input.expected,
+        inventory: input.inventory,
+        startupAuthority: input.startupAuthority,
+        getProcessLiveness: input.getProcessLiveness,
     });
     if (evidence.status !== "excluded")
         return { kind: "blocked", blocker: "writer-inventory", evidence };
@@ -3291,30 +4762,43 @@ export function executeTelegramInputCustodyWriterCutover(input) {
     if (!matchesAuthority(current.startupExclusion))
         return { kind: "blocked", blocker: "startup-authority", evidence };
     const existing = current.writerExclusion;
-    if (existing?.status === "excluded" && existing.profileKey === evidence.profileKey &&
+    if (existing?.status === "excluded" &&
+        existing.profileKey === evidence.profileKey &&
         existing.recoveryKey === evidence.recoveryKey &&
         existing.startupAuthorityId === evidence.startupAuthorityId &&
         existing.closureOperationId === evidence.closureOperationId &&
         existing.writerInventorySha256 === evidence.writerInventorySha256)
-        return { kind: "completed", mode: installed.mode, evidence: existing,
-            resumed: installed.resumed };
-    input.evidenceStore.publish({ expectedRevision: current.revision,
-        kind: "writer-exclusion", evidence });
+        return {
+            kind: "completed",
+            mode: installed.mode,
+            evidence: existing,
+            resumed: installed.resumed,
+        };
+    input.evidenceStore.publish({
+        expectedRevision: current.revision,
+        kind: "writer-exclusion",
+        evidence,
+    });
     return { kind: "completed", mode: installed.mode, evidence, resumed: false };
 }
 function matchesTelegramInputCustodyActivationEvidence(evidence, expected) {
-    return Boolean(evidence && evidence.profileKey === expected.profileKey &&
+    return Boolean(evidence &&
+        evidence.profileKey === expected.profileKey &&
         evidence.recoveryKey === expected.recoveryKey);
 }
 export function executeTelegramInputCustodyMigrationCompletion(input) {
-    const matchesAuthority = (candidate) => Boolean(candidate && candidate.version === 1 && candidate.status === "authorized" &&
+    const matchesAuthority = (candidate) => Boolean(candidate &&
+        candidate.version === 1 &&
+        candidate.status === "authorized" &&
         candidate.profileKey === input.expected.profileKey &&
         candidate.recoveryKey === input.expected.recoveryKey &&
         candidate.authorityId === input.authority.authorityId &&
         candidate.startupAuthorityId === input.authority.startupAuthorityId &&
         candidate.closureOperationId === input.authority.closureOperationId &&
-        candidate.migrationInventorySha256 === input.authority.migrationInventorySha256 &&
-        candidate.resultingSourceFamily === input.authority.resultingSourceFamily &&
+        candidate.migrationInventorySha256 ===
+            input.authority.migrationInventorySha256 &&
+        candidate.resultingSourceFamily ===
+            input.authority.resultingSourceFamily &&
         candidate.authorizedAtMs === input.authority.authorizedAtMs);
     const current = input.evidenceStore.read();
     if (!matchesAuthority(current.migrationCompletion))
@@ -3330,15 +4814,19 @@ export function executeTelegramInputCustodyMigrationCompletion(input) {
     }
     if (source !== input.authority.resultingSourceFamily)
         return { kind: "blocked", blocker: "source-drift" };
-    const evidence = { version: 1,
-        status: "complete", ...input.expected,
+    const evidence = {
+        version: 1,
+        status: "complete",
+        ...input.expected,
         migrationAuthorityId: input.authority.authorityId,
         startupAuthorityId: input.authority.startupAuthorityId,
         closureOperationId: input.authority.closureOperationId,
         migrationInventorySha256: input.authority.migrationInventorySha256,
-        resultingSourceFamily: input.authority.resultingSourceFamily };
+        resultingSourceFamily: input.authority.resultingSourceFamily,
+    };
     const existing = current.migration;
-    if (existing?.status === "complete" && existing.profileKey === evidence.profileKey &&
+    if (existing?.status === "complete" &&
+        existing.profileKey === evidence.profileKey &&
         existing.recoveryKey === evidence.recoveryKey &&
         existing.migrationAuthorityId === evidence.migrationAuthorityId &&
         existing.startupAuthorityId === evidence.startupAuthorityId &&
@@ -3346,7 +4834,11 @@ export function executeTelegramInputCustodyMigrationCompletion(input) {
         existing.migrationInventorySha256 === evidence.migrationInventorySha256 &&
         existing.resultingSourceFamily === evidence.resultingSourceFamily)
         return { kind: "completed", evidence: existing, resumed: true };
-    input.evidenceStore.publish({ expectedRevision: current.revision, kind: "migration", evidence });
+    input.evidenceStore.publish({
+        expectedRevision: current.revision,
+        kind: "migration",
+        evidence,
+    });
     return { kind: "completed", evidence, resumed: false };
 }
 export function createTelegramInputCustodyProvenReadinessResolver(deps) {
@@ -3363,26 +4855,30 @@ export function createTelegramInputCustodyProvenReadinessResolver(deps) {
             const expected = deps.expectedIdentity();
             const authority = deps.readMigrationCompletionAuthority();
             return matchesTelegramInputCustodyActivationEvidence(authority, expected) &&
-                authority?.status === "authorized" && authority.resultingSourceFamily === source
-                ? source : "ambiguous";
+                authority?.status === "authorized" &&
+                authority.resultingSourceFamily === source
+                ? source
+                : "ambiguous";
         },
         areLegacyWritersExcluded() {
             const expected = deps.expectedIdentity();
             const evidence = deps.readWriterExclusionEvidence();
             const authority = deps.readStartupExclusionAuthority();
             const mode = deps.readWriterProtocolMode();
-            return matchesTelegramInputCustodyActivationEvidence(evidence, expected) &&
+            return (matchesTelegramInputCustodyActivationEvidence(evidence, expected) &&
                 matchesTelegramInputCustodyActivationEvidence(authority, expected) &&
                 matchesTelegramInputCustodyActivationEvidence(mode, expected) &&
-                evidence?.version === 1 && evidence.status === "excluded" &&
-                authority?.version === 1 && authority.status === "enforced" &&
+                evidence?.version === 1 &&
+                evidence.status === "excluded" &&
+                authority?.version === 1 &&
+                authority.status === "enforced" &&
                 mode?.protocol === "custody-v3" &&
                 evidence.startupAuthorityId === authority.authorityId &&
                 evidence.startupAuthorityId === mode.startupAuthorityId &&
                 evidence.closureOperationId === authority.closureOperationId &&
                 evidence.closureOperationId === mode.closureOperationId &&
                 evidence.writerInventorySha256 === authority.writerInventorySha256 &&
-                evidence.writerInventorySha256 === mode.writerInventorySha256;
+                evidence.writerInventorySha256 === mode.writerInventorySha256);
         },
         isHistoricalMigrationComplete() {
             const expected = deps.expectedIdentity();
@@ -3397,10 +4893,12 @@ export function createTelegramInputCustodyProvenReadinessResolver(deps) {
             catch {
                 source = "ambiguous";
             }
-            return matchesTelegramInputCustodyActivationEvidence(evidence, expected) &&
+            return (matchesTelegramInputCustodyActivationEvidence(evidence, expected) &&
                 matchesTelegramInputCustodyActivationEvidence(authority, expected) &&
-                evidence?.version === 1 && evidence.status === "complete" &&
-                authority?.version === 1 && authority.status === "authorized" &&
+                evidence?.version === 1 &&
+                evidence.status === "complete" &&
+                authority?.version === 1 &&
+                authority.status === "authorized" &&
                 authority.resultingSourceFamily === source &&
                 evidence.migrationAuthorityId === authority.authorityId &&
                 evidence.startupAuthorityId === authority.startupAuthorityId &&
@@ -3408,8 +4906,9 @@ export function createTelegramInputCustodyProvenReadinessResolver(deps) {
                 evidence.startupAuthorityId === mode?.startupAuthorityId &&
                 evidence.closureOperationId === authority.closureOperationId &&
                 evidence.closureOperationId === mode?.closureOperationId &&
-                evidence.migrationInventorySha256 === authority.migrationInventorySha256 &&
-                evidence.resultingSourceFamily === authority.resultingSourceFamily;
+                evidence.migrationInventorySha256 ===
+                    authority.migrationInventorySha256 &&
+                evidence.resultingSourceFamily === authority.resultingSourceFamily);
         },
         listPeerReadiness: deps.listPeerReadiness,
     });
@@ -3423,14 +4922,18 @@ export function createTelegramInputCustodyActivationReadinessResolver(deps) {
         try {
             legacyWritersExcluded = deps.areLegacyWritersExcluded();
         }
-        catch { /* blocked */ }
+        catch {
+            /* blocked */
+        }
         if (!legacyWritersExcluded)
             return { enabled: false, blocker: "legacy-writers-present" };
         let historicalMigrationComplete = false;
         try {
             historicalMigrationComplete = deps.isHistoricalMigrationComplete();
         }
-        catch { /* blocked */ }
+        catch {
+            /* blocked */
+        }
         if (!historicalMigrationComplete)
             return { enabled: false, blocker: "migration-incomplete" };
         let sourceStatus;
@@ -3449,8 +4952,13 @@ export function createTelegramInputCustodyActivationReadinessResolver(deps) {
         catch {
             peerReadiness = ["unknown"];
         }
-        return evaluateTelegramInputCustodyActivationReadiness({ requested,
-            sourceStatus, legacyWritersExcluded, historicalMigrationComplete, peerReadiness });
+        return evaluateTelegramInputCustodyActivationReadiness({
+            requested,
+            sourceStatus,
+            legacyWritersExcluded,
+            historicalMigrationComplete,
+            peerReadiness,
+        });
     };
 }
 export function createTelegramInputCustodyLifecycleBindingResolver(deps) {
@@ -3461,21 +4969,33 @@ export function createTelegramInputCustodyLifecycleBindingResolver(deps) {
             return undefined;
         const source = deps.resolveInputJournal();
         const recipientBindingKey = deps.getRecipientBindingKey()?.trim();
-        if (!source || !source.runtimeKey || !source.recoveryKey || !recipientBindingKey)
+        if (!source ||
+            !source.runtimeKey ||
+            !source.recoveryKey ||
+            !recipientBindingKey)
             return undefined;
         let port = ports.get(source.journal);
         if (!port) {
             port = createTelegramInputCustodyWorkerJournalPort(source.journal);
             ports.set(source.journal, port);
         }
-        return { runtimeKey: JSON.stringify({ source: source.runtimeKey, recipientBindingKey }),
+        return {
+            runtimeKey: JSON.stringify({
+                source: source.runtimeKey,
+                recipientBindingKey,
+            }),
             recoveryKey: source.recoveryKey,
-            recipientBindingKey, journal: { ...port, appendBatch: source.journal.appendBatch,
+            recipientBindingKey,
+            journal: {
+                ...port,
+                appendBatch: source.journal.appendBatch,
                 discardQueued: source.journal.discardQueued,
                 recoverDeadQueueOwner: source.journal.recoverDeadQueueOwner,
                 offerQueuedHandoff: source.journal.offerQueuedHandoff,
                 acceptQueuedHandoff: source.journal.acceptQueuedHandoff,
-                cancelQueuedHandoff: source.journal.cancelQueuedHandoff } };
+                cancelQueuedHandoff: source.journal.cancelQueuedHandoff,
+            },
+        };
     };
 }
 export function createTelegramCustodiedExecutionSession(input) {
@@ -3485,10 +5005,12 @@ export function createTelegramCustodiedExecutionSession(input) {
         const receipt = receipts.get(updateId);
         if (!receipt) {
             const duplicate = settledQueues.get(updateId);
-            if (duplicate && outcome.kind === "queued" &&
+            if (duplicate &&
+                outcome.kind === "queued" &&
                 duplicate.queueReceipt.queueKind === outcome.queueKind &&
                 duplicate.queueReceipt.receiptId === outcome.receiptId &&
-                duplicate.queueReceipt.sourceUpdateIds.length === outcome.sourceUpdateIds.length &&
+                duplicate.queueReceipt.sourceUpdateIds.length ===
+                    outcome.sourceUpdateIds.length &&
                 duplicate.queueReceipt.sourceUpdateIds.every((id, index) => id === outcome.sourceUpdateIds[index])) {
                 settledQueues.delete(updateId);
                 return duplicate;
@@ -3500,12 +5022,18 @@ export function createTelegramCustodiedExecutionSession(input) {
         if (outcome.kind === "queued") {
             if (!outcome.sourceUpdateIds.includes(updateId))
                 throw new TelegramUpdateAdmissionOutcomeError("Telegram grouped queue custody omitted the settling input.");
-            const grouped = outcome.sourceUpdateIds.map(sourceUpdateId => receipts.get(sourceUpdateId));
-            if (grouped.some(candidate => !candidate))
+            const grouped = outcome.sourceUpdateIds.map((sourceUpdateId) => receipts.get(sourceUpdateId));
+            if (grouped.some((candidate) => !candidate))
                 throw new TelegramUpdateAdmissionOutcomeError("Telegram grouped queue custody omitted an exact running source receipt.");
-            const queued = input.journal.queueInputs({ queueKind: outcome.queueKind,
-                receiptId: outcome.receiptId, receipts: grouped });
-            const result = { status: "queued", queueReceipt: queued.queueReceipt };
+            const queued = input.journal.queueInputs({
+                queueKind: outcome.queueKind,
+                receiptId: outcome.receiptId,
+                receipts: grouped,
+            });
+            const result = {
+                status: "queued",
+                queueReceipt: queued.queueReceipt,
+            };
             for (const sourceUpdateId of outcome.sourceUpdateIds) {
                 receipts.delete(sourceUpdateId);
                 if (sourceUpdateId !== updateId)
@@ -3520,8 +5048,11 @@ export function createTelegramCustodiedExecutionSession(input) {
     return {
         settle,
         async execute(update, handler) {
-            const acquired = input.journal.acquireInput({ updateId: update.update_id,
-                recipientBindingKey: input.recipientBindingKey, executionUpdate: update });
+            const acquired = input.journal.acquireInput({
+                updateId: update.update_id,
+                recipientBindingKey: input.recipientBindingKey,
+                executionUpdate: update,
+            });
             const started = input.journal.startInput(acquired.receipt);
             if (!started.started)
                 return { status: "outcome-unknown", receipt: acquired.receipt };
@@ -3549,6 +5080,10 @@ export function createTelegramUpdateAdmissionHandle(deps) {
     if (deps.onLateOutcome && !deps.onLateOutcomeError) {
         throw new Error("Telegram late admission outcomes require a diagnostic error sink.");
     }
+    return createTelegramUpdateSourceAdmissionHandle(deps);
+}
+/** Same native source/fence/late-ACK owner, with an internal binding-only callback instead of registry/ordinary dispatch. */
+function createTelegramUpdateSourceAdmissionHandle(deps, capture) {
     const registry = deps.registry ?? getOrCreateUpdateHandlerRegistry();
     let nextExecutionGeneration = 0;
     return async (update, ctx, signal) => {
@@ -3565,8 +5100,15 @@ export function createTelegramUpdateAdmissionHandle(deps) {
             generation,
             updateId: update.update_id,
             signal,
-            isCurrent: () => !signal.aborted && !suspended && ((!routingLifetime && !routingClockUnknown) || immediate || settlementReported ||
-                deps.isRoutingInputCurrent?.({ updateId: update.update_id, signal }) !== false),
+            isCurrent: () => !signal.aborted &&
+                !suspended &&
+                ((!routingLifetime && !routingClockUnknown) ||
+                    immediate ||
+                    settlementReported ||
+                    deps.isRoutingInputCurrent?.({
+                        updateId: update.update_id,
+                        signal,
+                    }) !== false),
             assertCurrent() {
                 if (!execution.isCurrent()) {
                     throw signal.reason ?? new DOMException("Aborted", "AbortError");
@@ -3574,18 +5116,25 @@ export function createTelegramUpdateAdmissionHandle(deps) {
             },
         };
         execution.assertCurrent();
-        const verdict = await registry.dispatch(update, execution);
-        execution.assertCurrent();
-        if (verdict === "consume")
-            return { kind: "complete" };
+        if (!capture) {
+            const verdict = await registry.dispatch(update, execution);
+            execution.assertCurrent();
+            if (verdict === "consume")
+                return { kind: "complete" };
+        }
         let immediate = true;
         let settlementReported = false;
         let outcome;
+        let completionAttempted = false;
+        let completedSource;
         const boundUpdate = bindTelegramUpdateExecutionFence(bindTelegramUpdateAdmissionSource(update, (next) => {
             if (!execution.isCurrent())
                 return;
             if (next.kind === "deferred" && next.routingReview) {
-                if (!immediate || settlementReported || routingClaims > 0 || !deps.isHistoricalSource?.({ updateId: update.update_id, signal })) {
+                if (!immediate ||
+                    settlementReported ||
+                    routingClaims > 0 ||
+                    !deps.isHistoricalSource?.({ updateId: update.update_id, signal })) {
                     throw new TelegramUpdateAdmissionOutcomeError("Historical review cannot override accepted or selected work.");
                 }
                 suspended = true;
@@ -3599,15 +5148,34 @@ export function createTelegramUpdateAdmissionHandle(deps) {
             if (!deps.onLateOutcome) {
                 throw new TelegramUpdateAdmissionOutcomeError(`Telegram update ${update.update_id} reported a late outcome without an owner.`);
             }
+            const expectedSource = next.kind === "complete" &&
+                next.expectedSource &&
+                !completionAttempted
+                ? { ...next.expectedSource }
+                : undefined;
+            if (expectedSource)
+                completionAttempted = true;
+            const reported = expectedSource
+                ? { ...next, expectedSource: { ...expectedSource } }
+                : next;
             void Promise.resolve()
-                .then(() => {
+                .then(async () => {
                 if (!execution.isCurrent())
                     return;
-                return deps.onLateOutcome(next, {
+                const completion = await deps.onLateOutcome(reported, {
                     updateId: update.update_id,
                     ctx,
                     signal,
                 });
+                if (expectedSource &&
+                    completion &&
+                    execution.isCurrent() &&
+                    completion.isCurrent() &&
+                    isDeepStrictEqual(completion.source, expectedSource))
+                    completedSource = {
+                        ...completion,
+                        source: { ...expectedSource },
+                    };
             })
                 .catch((error) => {
                 try {
@@ -3617,9 +5185,16 @@ export function createTelegramUpdateAdmissionHandle(deps) {
                     // Diagnostic sinks must not create an unhandled late Promise.
                 }
             });
-        }, { abandon: (authority) => {
-                const isCurrent = () => !signal.aborted && routingClaims === 0 && !settlementReported && authority.isCurrent();
-                if (immediate || outcome?.kind !== "deferred" || !deps.abandonDeferred || !isCurrent())
+        }, {
+            abandon: (authority) => {
+                const isCurrent = () => !signal.aborted &&
+                    routingClaims === 0 &&
+                    !settlementReported &&
+                    authority.isCurrent();
+                if (immediate ||
+                    outcome?.kind !== "deferred" ||
+                    !deps.abandonDeferred ||
+                    !isCurrent())
                     return undefined;
                 if (abandoned)
                     return { ...abandoned, duplicate: true };
@@ -3627,23 +5202,91 @@ export function createTelegramUpdateAdmissionHandle(deps) {
                 suspended = true;
                 // Failed/unknown publication keeps dispatch suspended for exact cancellation retry.
                 // An ineligible request that attempted no publication remains inert.
-                const result = deps.abandonDeferred({ ...authority, updateId: update.update_id, signal, isCurrent });
+                const result = deps.abandonDeferred({
+                    ...authority,
+                    updateId: update.update_id,
+                    signal,
+                    isCurrent,
+                });
                 if (result)
                     abandoned = result;
                 else
                     suspended = wasSuspended;
                 return result;
-            }, inspectAbandoning: request => execution.isCurrent()
-                ? deps.inspectAbandoning?.({ ...request, signal }) : undefined,
-            inspectHistorical: request => execution.isCurrent() ? deps.inspectHistorical?.({ ...request, signal }) : undefined,
+            },
+            inspectAbandoning: (request) => execution.isCurrent()
+                ? deps.inspectAbandoning?.({ ...request, signal })
+                : undefined,
+            inspectHistorical: (request) => execution.isCurrent()
+                ? deps.inspectHistorical?.({ ...request, signal })
+                : undefined,
             inspectSource: () => execution.isCurrent() && !immediate && !settlementReported
-                ? deps.inspectDeferredSource?.({ updateId: update.update_id, signal }) : undefined,
-            isHistorical: matchesOriginal => !signal.aborted && deps.isHistoricalSource?.({ updateId: update.update_id, signal,
-                ...(matchesOriginal ? { matchesOriginal } : {}) }) === true,
-            isHistoricalReviewHeld: () => !signal.aborted && suspended && outcome?.kind === "deferred" && outcome.routingReview === true,
-            supportsAbandonment: journalBindingKey => !signal.aborted && !settlementReported &&
-                deps.supportsDeferredAbandonment?.({ updateId: update.update_id, signal, journalBindingKey }) === true,
-            armRoutingInput: (operatorUserId, sourceUpdateIds) => {
+                ? deps.inspectDeferredSource?.({
+                    updateId: update.update_id,
+                    signal,
+                })
+                : undefined,
+            inspectSourceSnapshot: () => execution.isCurrent() && !immediate && !settlementReported
+                ? deps.inspectDeferredSourceSnapshot?.({
+                    updateId: update.update_id,
+                    signal,
+                })
+                : undefined,
+            inspectCompletion: () => execution.isCurrent() && completedSource?.isCurrent()
+                ? { ...completedSource.source }
+                : undefined,
+            isSourceUnsettled: () => execution.isCurrent() &&
+                !immediate &&
+                !settlementReported &&
+                !suspended,
+            prepareQueueAdmission: () => execution.isCurrent() &&
+                !immediate &&
+                !settlementReported &&
+                !suspended
+                ? deps.prepareDeferredQueueAdmission?.({
+                    updateId: update.update_id,
+                    signal,
+                })
+                : undefined,
+            prepareSourceCompletion: () => execution.isCurrent() &&
+                !immediate &&
+                !settlementReported &&
+                !suspended
+                ? deps.prepareDeferredSourceCompletion?.({
+                    updateId: update.update_id,
+                    signal,
+                })
+                : undefined,
+            prepareLiveInput: (sourceUpdateIds, isCurrent) => execution.isCurrent() &&
+                !immediate &&
+                !settlementReported &&
+                !suspended
+                ? deps.prepareDeferredLiveInput?.({
+                    updateId: update.update_id,
+                    sourceUpdateIds,
+                    signal,
+                    isCurrent: () => execution.isCurrent() && isCurrent(),
+                })
+                : undefined,
+            isHistorical: (matchesOriginal) => !signal.aborted &&
+                deps.isHistoricalSource?.({
+                    updateId: update.update_id,
+                    signal,
+                    ...(matchesOriginal ? { matchesOriginal } : {}),
+                }) === true,
+            isHistoricalReviewHeld: () => !signal.aborted &&
+                suspended &&
+                outcome?.kind === "deferred" &&
+                outcome.routingReview === true,
+            supportsAbandonment: (journalBindingKey) => !signal.aborted &&
+                !settlementReported &&
+                deps.supportsDeferredAbandonment?.({
+                    updateId: update.update_id,
+                    signal,
+                    journalBindingKey,
+                }) === true,
+            getRoutingInput: () => deps.getRoutingInput?.({ updateId: update.update_id, signal }),
+            armRoutingInput: (operatorUserId, sourceUpdateIds, chooser) => {
                 execution.assertCurrent();
                 if (settlementReported || routingClaims || suspended)
                     return undefined;
@@ -3653,7 +5296,13 @@ export function createTelegramUpdateAdmissionHandle(deps) {
                 if (routingSourceIds && !isDeepStrictEqual(ids, routingSourceIds))
                     throw new TelegramUpdateAdmissionOutcomeError("Telegram routing input source membership changed.");
                 try {
-                    routingLifetime = deps.armRoutingInput?.({ updateId: update.update_id, signal, operatorUserId, sourceUpdateIds: ids });
+                    routingLifetime = deps.armRoutingInput?.({
+                        updateId: update.update_id,
+                        signal,
+                        operatorUserId,
+                        sourceUpdateIds: ids,
+                        ...(chooser ? { chooser } : {}),
+                    });
                 }
                 catch (error) {
                     routingClockUnknown = true;
@@ -3673,8 +5322,13 @@ export function createTelegramUpdateAdmissionHandle(deps) {
                     if (!isDeepStrictEqual(sourceUpdateIds ?? [update.update_id], routingSourceIds))
                         throw new TelegramUpdateAdmissionOutcomeError("Telegram routing input selection changed its source membership.");
                     routingSelectionAttempted = true;
-                    routingSelectionConfirmed = deps.selectRoutingInput?.({ updateId: update.update_id, signal,
-                        operatorUserId: routingLifetime.operatorUserId, sourceUpdateIds: routingSourceIds }) === true;
+                    routingSelectionConfirmed =
+                        deps.selectRoutingInput?.({
+                            updateId: update.update_id,
+                            signal,
+                            operatorUserId: routingLifetime.operatorUserId,
+                            sourceUpdateIds: routingSourceIds,
+                        }) === true;
                     if (!routingSelectionConfirmed)
                         throw new TelegramUpdateAdmissionOutcomeError("Telegram routing input choice is expired or unavailable.");
                 }
@@ -3686,11 +5340,19 @@ export function createTelegramUpdateAdmissionHandle(deps) {
                     released = true;
                     routingClaims -= 1;
                 };
-            } }), execution);
+            },
+        }), execution);
         try {
             execution.assertCurrent();
-            await deps.defaultHandle(boundUpdate, ctx, execution);
-            if (outcome?.kind !== "deferred" || !outcome.routingReview || signal.aborted)
+            if (capture) {
+                capture(boundUpdate);
+                reportTelegramUpdateDeferred(boundUpdate.message);
+            }
+            else
+                await deps.defaultHandle(boundUpdate, ctx, execution);
+            if (outcome?.kind !== "deferred" ||
+                !outcome.routingReview ||
+                signal.aborted)
                 execution.assertCurrent();
         }
         finally {
@@ -3700,47 +5362,63 @@ export function createTelegramUpdateAdmissionHandle(deps) {
     };
 }
 export function createTelegramCustodiedUpdateAdmissionHandle(deps) {
-    const session = createTelegramCustodiedExecutionSession({ journal: deps.journal,
-        recipientBindingKey: deps.recipientBindingKey });
+    const session = createTelegramCustodiedExecutionSession({
+        journal: deps.journal,
+        recipientBindingKey: deps.recipientBindingKey,
+    });
     const admission = createTelegramUpdateAdmissionHandle({
         defaultHandle: deps.defaultHandle,
         registry: deps.registry,
         async onLateOutcome(outcome, details) {
             const result = await session.settle(details.updateId, outcome);
-            deps.onCustodiedLateSettlement?.(result, { updateId: details.updateId, signal: details.signal });
+            deps.onCustodiedLateSettlement?.(result, {
+                updateId: details.updateId,
+                signal: details.signal,
+            });
         },
         onLateOutcomeError: deps.onLateOutcomeError,
     });
-    return (update, ctx, signal) => session.execute(update, started => admission(started, ctx, signal));
+    return (update, ctx, signal) => session.execute(update, (started) => admission(started, ctx, signal));
 }
 // A dispatched prompt can remain in memory until agent_start. Remember only acknowledged
 // removal of these exact receipt objects for later local discard, never for dispatch/replay.
 const acknowledgedQueueReceiptCompletions = new WeakMap();
 const isQueueReceiptCompletionAcknowledged = (receipt) => {
     const acknowledged = acknowledgedQueueReceiptCompletions.get(receipt);
-    return acknowledged !== undefined && areTelegramQueueAdmissionReceiptsEqual(acknowledged, receipt);
+    return (acknowledged !== undefined &&
+        areTelegramQueueAdmissionReceiptsEqual(acknowledged, receipt));
 };
 export function createTelegramQueueAdmissionSettlementMuxRuntime(runtimes) {
     // Plan the whole request before mutation; unready is not an acknowledgement of completion.
     const complete = (items, ctx, kind) => {
         const plan = new Map();
-        const reason = kind === "prompt" ? "prompt-handoff" : kind === "control" ? "control-settlement" : "discard";
-        const settlementOwner = (runtime, receipt) => runtime.getQueueReceiptSettlementOwner ? runtime.getQueueReceiptSettlementOwner(receipt, ctx, reason) :
-            runtime.isItemReady({ admissionReceipts: [receipt] }) ? runtime.getQueueReceiptOwner(receipt) : undefined;
-        for (const receipt of items.flatMap(item => item.admissionReceipts ?? [])) {
+        const reason = kind === "prompt"
+            ? "prompt-handoff"
+            : kind === "control"
+                ? "control-settlement"
+                : "discard";
+        const settlementOwner = (runtime, receipt) => runtime.getQueueReceiptSettlementOwner
+            ? runtime.getQueueReceiptSettlementOwner(receipt, ctx, reason)
+            : runtime.isItemReady({ admissionReceipts: [receipt] })
+                ? runtime.getQueueReceiptOwner(receipt)
+                : undefined;
+        for (const receipt of items.flatMap((item) => item.admissionReceipts ?? [])) {
             if (isQueueReceiptCompletionAcknowledged(receipt))
                 continue;
-            const candidates = runtimes.filter(runtime => runtime.getQueueReceiptSettlementOwner ? !!settlementOwner(runtime, receipt)
+            const candidates = runtimes.filter((runtime) => runtime.getQueueReceiptSettlementOwner
+                ? !!settlementOwner(runtime, receipt)
                 : runtime.isItemReady({ admissionReceipts: [receipt] }));
             const selected = candidates[0];
             if (!selected)
                 return false;
             if (candidates.length > 1) {
                 const owner = settlementOwner(selected, receipt);
-                if (!owner || candidates.some(runtime => {
-                    const candidate = settlementOwner(runtime, receipt);
-                    return !candidate || !areTelegramUpdateJournalQueueOwnersEqual(owner, candidate);
-                }))
+                if (!owner ||
+                    candidates.some((runtime) => {
+                        const candidate = settlementOwner(runtime, receipt);
+                        return (!candidate ||
+                            !areTelegramUpdateJournalQueueOwnersEqual(owner, candidate));
+                    }))
                     return false;
             }
             const receipts = plan.get(selected) ?? [];
@@ -3749,8 +5427,10 @@ export function createTelegramQueueAdmissionSettlementMuxRuntime(runtimes) {
         }
         for (const [runtime, receipts] of plan) {
             const item = { admissionReceipts: receipts };
-            const completed = kind === "discard" ? runtime.onItemsDiscarded([item], ctx)
-                : kind === "prompt" ? runtime.onPromptHandedOff(item, ctx)
+            const completed = kind === "discard"
+                ? runtime.onItemsDiscarded([item], ctx)
+                : kind === "prompt"
+                    ? runtime.onPromptHandedOff(item, ctx)
                     : runtime.onControlSettled(item, ctx);
             if (completed !== true)
                 return false;
@@ -3787,12 +5467,17 @@ export function createTelegramQueueAdmissionSettlementRuntime(worker) {
                     receipts.push(receipt);
             }
         }
-        return receipts.length === 0 || worker.completeQueueReceipts({ receipts, ctx, reason });
+        return (receipts.length === 0 ||
+            worker.completeQueueReceipts({ receipts, ctx, reason }));
     };
     return {
         isItemReady: (item) => (item.admissionReceipts ?? []).every(worker.isQueueReceiptCommitted),
         getQueueReceiptOwner: worker.getQueueReceiptOwner,
-        ...(worker.getQueueReceiptSettlementOwner ? { getQueueReceiptSettlementOwner: worker.getQueueReceiptSettlementOwner } : {}),
+        ...(worker.getQueueReceiptSettlementOwner
+            ? {
+                getQueueReceiptSettlementOwner: worker.getQueueReceiptSettlementOwner,
+            }
+            : {}),
         onPromptHandedOff: (item, ctx) => complete([item], ctx, "prompt-handoff"),
         onControlSettled: (item, ctx) => complete([item], ctx, "control-settlement"),
         onItemsDiscarded: (items, ctx) => complete(items, ctx, "discard"),
@@ -3966,8 +5651,7 @@ export function createTelegramQueueHandoffReconciliationRuntimeAssembly(deps) {
         createRecipientJournalBindingKey(recipient) {
             if (!recipient.profileKey || !recipient.sessionId)
                 return undefined;
-            return deps.createRecipientJournalResolver(recipient.profileKey, recipient.sessionId)()
-                ?.recoveryKey;
+            return deps.createRecipientJournalResolver(recipient.profileKey, recipient.sessionId)()?.recoveryKey;
         },
         getQueuedItems: deps.queueStore.getQueuedItems,
         getReceiptOwner(receipt) {
@@ -4021,7 +5705,9 @@ export function createTelegramQueueHandoffReconciler(deps) {
             (followerRegistered && deps.canHandoffWithLeader?.() === false)) {
             return;
         }
-        const followers = deps.listFollowers().filter((follower) => follower.instanceId !== deps.donorInstanceId);
+        const followers = deps
+            .listFollowers()
+            .filter((follower) => follower.instanceId !== deps.donorInstanceId);
         if (followers.length === 0)
             return;
         for (const item of [...deps.getQueuedItems()]) {
@@ -4067,7 +5753,12 @@ export function createTelegramQueueHandoffReconciler(deps) {
                 stageRemote: async ({ payload: sourcePayload }) => {
                     const payload = {
                         ...sourcePayload,
-                        admissionReceipts: [{ ...sourcePayload.admissionReceipts[0], journalBindingKey: recipientJournalBindingKey }],
+                        admissionReceipts: [
+                            {
+                                ...sourcePayload.admissionReceipts[0],
+                                journalBindingKey: recipientJournalBindingKey,
+                            },
+                        ],
                     };
                     if (followerRegistered) {
                         return deps.stageThroughFollower({
@@ -4103,7 +5794,7 @@ export function createTelegramQueueHandoffReconciler(deps) {
                         typeof response.result !== "object" ||
                         !queueOwner) {
                         throw new Error(response.kind === "bus.ack"
-                            ? response.message ?? "Telegram queue handoff was rejected."
+                            ? (response.message ?? "Telegram queue handoff was rejected.")
                             : "Telegram queue handoff returned no acknowledgement.");
                     }
                     return {
@@ -4164,7 +5855,7 @@ export function createTelegramUpdateAdmissionRuntimeBinding(deps) {
     let follower;
     let settlement;
     let inputCustodyBus;
-    const getActive = () => deps.isFollowerRegistered() ? follower : leader;
+    const getActive = () => (deps.isFollowerRegistered() ? follower : leader);
     return {
         bind(input) {
             leader = input.leader;
@@ -4226,12 +5917,14 @@ export function createTelegramUpdateAdmissionLifecycleRuntime(deps) {
     let foreignQueueOwnerLiveness;
     let releaseSourceReference;
     let sourceReferenceBinding;
+    let activeContext;
     const withRetainedSourceReference = (operation) => {
         if (!journal || !worker)
             throw new Error("Telegram update admission worker is not active.");
         // Synchronous retained-source access needs a reference, not renewed execution authority.
         const release = !releaseSourceReference && sourceReferenceBinding
-            ? deps.acquireSourceReference?.(sourceReferenceBinding) : undefined;
+            ? deps.acquireSourceReference?.(sourceReferenceBinding)
+            : undefined;
         try {
             return operation(journal);
         }
@@ -4239,8 +5932,9 @@ export function createTelegramUpdateAdmissionLifecycleRuntime(deps) {
             release?.();
         }
     };
-    const readObservedJournal = () => withRetainedSourceReference(source => source.read());
+    const readObservedJournal = () => withRetainedSourceReference((source) => source.read());
     const stopCurrent = async (forget) => {
+        activeContext = undefined;
         await worker?.stop();
         const release = releaseSourceReference;
         releaseSourceReference = undefined;
@@ -4248,7 +5942,9 @@ export function createTelegramUpdateAdmissionLifecycleRuntime(deps) {
             release?.();
         }
         catch (error) {
-            deps.recordRuntimeEvent?.("inbound-worker", error, { phase: "source-reference-release" });
+            deps.recordRuntimeEvent?.("inbound-worker", error, {
+                phase: "source-reference-release",
+            });
         }
         if (!forget)
             return;
@@ -4267,12 +5963,15 @@ export function createTelegramUpdateAdmissionLifecycleRuntime(deps) {
             await stopCurrent(true);
             return;
         }
-        if (replace || !worker || activeRuntimeKey !== binding.runtimeKey ||
+        if (replace ||
+            !worker ||
+            activeRuntimeKey !== binding.runtimeKey ||
             workerInputCustody !== binding.journal.inputCustody) {
             const { runtimeKey, recoveryKey } = binding;
             await stopCurrent(true);
             binding = deps.resolveBinding();
-            if (!binding || binding.runtimeKey !== runtimeKey ||
+            if (!binding ||
+                binding.runtimeKey !== runtimeKey ||
                 binding.recoveryKey !== recoveryKey) {
                 throw new Error("Telegram update source binding changed during startup.");
             }
@@ -4371,6 +6070,7 @@ export function createTelegramUpdateAdmissionLifecycleRuntime(deps) {
             }
         }
         worker.start(ctx);
+        activeContext = ctx;
     };
     const runExclusive = (task) => {
         const next = operation.then(task, task);
@@ -4428,7 +6128,7 @@ export function createTelegramUpdateAdmissionLifecycleRuntime(deps) {
             if (!journal || !worker || !journal.cancelQueuedHandoff) {
                 throw new Error("Telegram update journal queue handoff cancellation is not available.");
             }
-            const result = withRetainedSourceReference(source => source.cancelQueuedHandoff(input));
+            const result = withRetainedSourceReference((source) => source.cancelQueuedHandoff(input));
             worker.signal();
             return result;
         },
@@ -4475,6 +6175,31 @@ export function createTelegramUpdateAdmissionLifecycleRuntime(deps) {
                     isTelegramReactionDependencyForQueueItem(entry.update, item)));
         },
         signal: () => worker?.signal(),
+        prepareLiveInput(ctx, sourceUpdateIds, isCurrent) {
+            const expectedWorker = worker, expectedBinding = sourceReferenceBinding, reference = releaseSourceReference;
+            if (!expectedWorker?.prepareLiveInput ||
+                !expectedBinding ||
+                (deps.acquireSourceReference && !reference))
+                return undefined;
+            const current = () => {
+                if (activeContext !== ctx ||
+                    worker !== expectedWorker ||
+                    sourceReferenceBinding !== expectedBinding ||
+                    releaseSourceReference !== reference ||
+                    expectedWorker.getState().phase === "stopped" ||
+                    isCurrent?.() === false)
+                    return false;
+                const binding = deps.resolveBinding();
+                return (binding?.runtimeKey === expectedBinding.runtimeKey &&
+                    binding.recoveryKey === expectedBinding.recoveryKey &&
+                    binding.journal.inputCustody ===
+                        expectedBinding.journal.inputCustody &&
+                    binding.hasAuthority?.() !== false);
+            };
+            if (!current())
+                return undefined;
+            return expectedWorker.prepareLiveInput(ctx, sourceUpdateIds, current);
+        },
         getState: () => {
             const state = worker?.getState();
             if (!state)
@@ -4496,20 +6221,25 @@ export function createTelegramUpdateAdmissionLifecycleRuntime(deps) {
 /** Compose source-bound routing and late grouped settlement under one worker. */
 export function createTelegramUpdateAdmissionWorkerRuntime(deps) {
     let worker;
-    const executeUpdate = createTelegramUpdateAdmissionHandle({
+    const admissionDeps = {
         defaultHandle: deps.defaultHandle,
         registry: deps.registry,
-        abandonDeferred: input => worker?.abandonDeferred?.(input),
-        armRoutingInput: input => worker?.armRoutingInput?.(input),
-        selectRoutingInput: input => worker?.selectRoutingInput?.(input) === true,
-        isRoutingInputCurrent: input => worker?.isRoutingInputCurrent?.(input) !== false,
-        supportsDeferredAbandonment: input => worker?.supportsDeferredAbandonment?.(input) === true,
-        inspectAbandoning: input => worker?.inspectAbandoning?.(input),
-        inspectHistorical: input => worker?.inspectHistorical?.(input),
-        inspectDeferredSource: input => worker?.inspectDeferredSource?.(input),
-        isHistoricalSource: input => worker?.isHistoricalSource?.(input) === true,
+        abandonDeferred: (input) => worker?.abandonDeferred?.(input),
+        armRoutingInput: (input) => worker?.armRoutingInput?.(input),
+        selectRoutingInput: (input) => worker?.selectRoutingInput?.(input) === true,
+        isRoutingInputCurrent: (input) => worker?.isRoutingInputCurrent?.(input) !== false,
+        getRoutingInput: (input) => worker?.getRoutingInput?.(input),
+        supportsDeferredAbandonment: (input) => worker?.supportsDeferredAbandonment?.(input) === true,
+        inspectAbandoning: (input) => worker?.inspectAbandoning?.(input),
+        inspectHistorical: (input) => worker?.inspectHistorical?.(input),
+        inspectDeferredSource: (input) => worker?.inspectDeferredSource?.(input),
+        inspectDeferredSourceSnapshot: (input) => worker?.inspectDeferredSourceSnapshot?.(input),
+        prepareDeferredLiveInput: (input) => worker?.prepareDeferredLiveInput?.(input),
+        prepareDeferredQueueAdmission: (input) => worker?.prepareDeferredQueueAdmission?.(input),
+        prepareDeferredSourceCompletion: (input) => worker?.prepareDeferredSourceCompletion?.(input),
+        isHistoricalSource: (input) => worker?.isHistoricalSource?.(input) === true,
         onLateOutcome(outcome, details) {
-            worker?.settleDeferred({
+            return worker?.settleDeferred({
                 updateId: details.updateId,
                 outcome,
                 signal: details.signal,
@@ -4521,24 +6251,54 @@ export function createTelegramUpdateAdmissionWorkerRuntime(deps) {
                 updateId,
             });
         },
-    });
-    const custodyBindingKey = deps.inputCustody ? deps.getRecipientBindingKey?.() : undefined;
+    };
+    const executeUpdate = createTelegramUpdateAdmissionHandle(admissionDeps);
+    const admitPreparedLiveInput = async (update, ctx, signal) => {
+        let carrier;
+        const admit = createTelegramUpdateSourceAdmissionHandle(admissionDeps, (value) => {
+            if (!value.message || typeof value.message !== "object")
+                throw new Error("Prepared live input needs one native message carrier.");
+            carrier = value.message;
+        });
+        const outcome = await admit(deps.prepareUpdateForExecution?.(update) ??
+            update, ctx, signal);
+        return { outcome, carrier };
+    };
+    const custodyBindingKey = deps.inputCustody
+        ? deps.getRecipientBindingKey?.()
+        : undefined;
     if (deps.inputCustody && !custodyBindingKey)
         throw new Error("Telegram custodied admission worker requires one recipient binding key.");
     const executeCustodiedUpdate = deps.inputCustody && custodyBindingKey
         ? createTelegramCustodiedUpdateAdmissionHandle({
-            journal: deps.inputCustody, recipientBindingKey: custodyBindingKey,
-            defaultHandle: deps.defaultHandle, registry: deps.registry,
+            journal: deps.inputCustody,
+            recipientBindingKey: custodyBindingKey,
+            defaultHandle: deps.defaultHandle,
+            registry: deps.registry,
             onLateOutcomeError(error, updateId) {
-                deps.recordRuntimeEvent?.("inbound-worker", error, { phase: "late-custodied-admission-handler", updateId });
+                deps.recordRuntimeEvent?.("inbound-worker", error, {
+                    phase: "late-custodied-admission-handler",
+                    updateId,
+                });
             },
             onCustodiedLateSettlement(result, details) {
-                worker?.settleCustodied({ updateId: details.updateId, result, signal: details.signal });
+                worker?.settleCustodied({
+                    updateId: details.updateId,
+                    result,
+                    signal: details.signal,
+                });
             },
-        }) : undefined;
+        })
+        : undefined;
     worker = createTelegramUpdateWorkerRuntime({
         ...deps,
-        ...(executeCustodiedUpdate ? { executeCustodiedUpdate: async (update, ctx, signal) => executeCustodiedUpdate(deps.prepareUpdateForExecution?.(update) ?? update, ctx, signal) } : {}),
+        admitPreparedLiveInput,
+        ...(executeCustodiedUpdate
+            ? {
+                executeCustodiedUpdate: async (update, ctx, signal) => executeCustodiedUpdate(deps.prepareUpdateForExecution?.(update) ??
+                    update, ctx, signal),
+            }
+            : {}),
         async executeUpdate(update, ctx, signal) {
             const typedUpdate = update;
             try {
@@ -4558,13 +6318,19 @@ export function createTelegramUpdateAdmissionWorkerRuntime(deps) {
 export function createTelegramUpdateAdmissionLifecycleAssembly(deps) {
     const leader = createTelegramUpdateAdmissionLifecycleRuntime({
         resolveBinding: deps.leader.resolveBinding,
-        ...(deps.acquireSourceReference ? { acquireSourceReference: binding => deps.acquireSourceReference("leader", binding) } : {}),
+        ...(deps.acquireSourceReference
+            ? {
+                acquireSourceReference: (binding) => deps.acquireSourceReference("leader", binding),
+            }
+            : {}),
         getQueueOwnerIdentity: deps.worker.getQueueOwnerIdentity,
         createWorker(journal, binding) {
             return createTelegramUpdateAdmissionWorkerRuntime({
                 ...deps.worker,
                 journal,
-                ...(binding.journal.inputCustody ? { inputCustody: binding.journal.inputCustody } : {}),
+                ...(binding.journal.inputCustody
+                    ? { inputCustody: binding.journal.inputCustody }
+                    : {}),
                 getJournalBindingKey: () => binding.recoveryKey,
                 getRecipientBindingKey: () => binding.recipientBindingKey,
                 hasAuthority: deps.leader.hasAuthority,
@@ -4574,8 +6340,14 @@ export function createTelegramUpdateAdmissionLifecycleAssembly(deps) {
     });
     const follower = createTelegramUpdateAdmissionLifecycleRuntime({
         getQueueOwnerIdentity: deps.worker.getQueueOwnerIdentity,
-        ...(deps.acquireSourceReference ? { acquireSourceReference: binding => deps.acquireSourceReference("follower", binding) } : {}),
-        ...(deps.follower.prepareBinding ? { prepareBinding: deps.follower.prepareBinding } : {}),
+        ...(deps.acquireSourceReference
+            ? {
+                acquireSourceReference: (binding) => deps.acquireSourceReference("follower", binding),
+            }
+            : {}),
+        ...(deps.follower.prepareBinding
+            ? { prepareBinding: deps.follower.prepareBinding }
+            : {}),
         resolveBinding() {
             const generation = deps.follower.getGeneration();
             if (!deps.follower.isRegistered() || !generation)
@@ -4596,7 +6368,9 @@ export function createTelegramUpdateAdmissionLifecycleAssembly(deps) {
             return createTelegramUpdateAdmissionWorkerRuntime({
                 ...deps.worker,
                 journal,
-                ...(binding.journal.inputCustody ? { inputCustody: binding.journal.inputCustody } : {}),
+                ...(binding.journal.inputCustody
+                    ? { inputCustody: binding.journal.inputCustody }
+                    : {}),
                 getJournalBindingKey: () => binding.recoveryKey,
                 getRecipientBindingKey: () => binding.recipientBindingKey,
                 hasAuthority: () => binding.hasAuthority?.() ?? false,
@@ -4610,8 +6384,11 @@ export function createTelegramUpdateAdmissionLifecycleAssembly(deps) {
         },
         recordRuntimeEvent: deps.recordRuntimeEvent,
     });
-    deps.runtimeBinding.bind({ leader, follower,
-        ...(deps.inputCustodyBus ? { inputCustodyBus: deps.inputCustodyBus } : {}) });
+    deps.runtimeBinding.bind({
+        leader,
+        follower,
+        ...(deps.inputCustodyBus ? { inputCustodyBus: deps.inputCustodyBus } : {}),
+    });
     return { leader, follower };
 }
 /** Own queue-owner projection and shared leader/follower worker composition. */

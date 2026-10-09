@@ -4,7 +4,7 @@
  * Owns conservative delayed grouping for Telegram text messages that look like automatic long-message splits
  */
 import { setTimeout as waitForTimeout } from "node:timers/promises";
-import { extractTelegramMessageText, } from "./media.js";
+import { createTelegramPendingGroupLifecycle, extractTelegramMessageText, } from "./media.js";
 const TELEGRAM_TEXT_GROUP_DEBOUNCE_MS = 1000;
 const TELEGRAM_TEXT_GROUP_MIN_SPLIT_LENGTH = 3600;
 const TELEGRAM_TEXT_GROUP_MAX_MESSAGE_ID_GAP = 12;
@@ -155,6 +155,7 @@ export function createTelegramTextGroupController(options = {}) {
             : (timer) => {
                 timer.abort();
             });
+    const lifecycle = createTelegramPendingGroupLifecycle(groups, clearTimer);
     return {
         prepareUpdateBatch(updates) {
             for (let index = 0; index + 1 < updates.length; index += 1) {
@@ -249,45 +250,9 @@ export function createTelegramTextGroupController(options = {}) {
                     : undefined,
             });
         },
-        async flushMessage(messageId) {
-            for (const state of groups.values()) {
-                if (!state.messages.some((message) => message.message_id === messageId)) {
-                    continue;
-                }
-                if (state.flushTimer)
-                    clearTimer(state.flushTimer);
-                state.flushTimer = undefined;
-                await state.dispatchNow?.();
-                if (state.messages.some((message) => message.message_id === messageId) &&
-                    !state.dispatching) {
-                    await state.dispatchNow?.();
-                }
-                return true;
-            }
-            return false;
-        },
-        suspend: () => {
-            for (const state of groups.values()) {
-                state.suspended = true;
-                if (state.flushTimer)
-                    clearTimer(state.flushTimer);
-                state.flushTimer = undefined;
-            }
-        },
-        resume: (context) => {
-            for (const state of groups.values()) {
-                state.context = context;
-                state.suspended = false;
-                if (!state.dispatching && !state.flushTimer)
-                    state.reschedule?.();
-            }
-        },
+        ...lifecycle,
         clear: () => {
-            for (const state of groups.values()) {
-                if (state.flushTimer)
-                    clearTimer(state.flushTimer);
-            }
-            groups.clear();
+            lifecycle.clear();
             plannedForwardCommentStarts.clear();
             plannedForwardCommentEnds.clear();
         },

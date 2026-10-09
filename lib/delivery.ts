@@ -10,8 +10,8 @@ import {
   type TelegramInlineKeyboardMarkup,
 } from "./keyboard.ts";
 import {
-  withTelegramReplyParameters,
   renderTelegramMessage,
+  withTelegramReplyParameters,
 } from "./replies.ts";
 import {
   areTelegramTargetsEqual as areDeliveryTargetsEqual,
@@ -92,6 +92,7 @@ export type TelegramDeliveryChatAction =
 /** @internal */
 export interface TelegramDeliveryRuntime {
   readonly generation: string;
+  hasPendingTarget?: (target: TelegramDeliveryTarget) => boolean;
   shutdown: () => void;
   sendView: (
     view: TelegramDeliveryView,
@@ -186,6 +187,7 @@ export function createTelegramDeliveryLifecycleHooks(
 ): {
   onSessionStart: () => Promise<void>;
   onSessionShutdown: () => Promise<void>;
+  hasPendingTarget: (target: TelegramDeliveryTarget) => boolean | undefined;
 } {
   let runtime: TelegramDeliveryRuntime | undefined;
   let unbind: ReturnType<typeof bindTelegramDeliveryRuntime> | undefined;
@@ -196,6 +198,7 @@ export function createTelegramDeliveryLifecycleHooks(
     runtime = undefined;
   };
   return {
+    hasPendingTarget: (target) => runtime?.hasPendingTarget?.(target),
     onSessionStart: async () => {
       stopCurrentRuntime();
       runtime = createRuntime();
@@ -207,7 +210,9 @@ export function createTelegramDeliveryLifecycleHooks(
   };
 }
 
-export function createTelegramDeliveryGenerationSeed(instanceId: string): string {
+export function createTelegramDeliveryGenerationSeed(
+  instanceId: string,
+): string {
   return `${instanceId}:${Date.now()}`;
 }
 
@@ -264,16 +269,25 @@ function failure<T>(
 }
 
 function classifyTelegramDeliveryTransportError(error: unknown): {
-  reason: Extract<TelegramDeliveryFailureReason,
-    "commit-unknown" | "message-unavailable" | "rate-limited" |
-    "transport-retryable" | "transport-failed">;
+  reason: Extract<
+    TelegramDeliveryFailureReason,
+    | "commit-unknown"
+    | "message-unavailable"
+    | "rate-limited"
+    | "transport-retryable"
+    | "transport-failed"
+  >;
   retryAfterMs?: number;
 } {
-  if (isTelegramApiCommitUnknownError(error)) return { reason: "commit-unknown" };
-  if (isTelegramMessageUnavailableError(error)) return { reason: "message-unavailable" };
+  if (isTelegramApiCommitUnknownError(error))
+    return { reason: "commit-unknown" };
+  if (isTelegramMessageUnavailableError(error))
+    return { reason: "message-unavailable" };
   const retryAfterMs = getTelegramApiRetryAfterMs(error);
-  if (retryAfterMs !== undefined) return { reason: "rate-limited", retryAfterMs };
-  if (isRetryableTelegramApiError(error)) return { reason: "transport-retryable" };
+  if (retryAfterMs !== undefined)
+    return { reason: "rate-limited", retryAfterMs };
+  if (isRetryableTelegramApiError(error))
+    return { reason: "transport-retryable" };
   return { reason: "transport-failed" };
 }
 
@@ -415,7 +429,7 @@ function resolveTelegramDeliveryTarget(
 
 function createTelegramDeliveryTargetQueue() {
   const queues = new Map<string, Promise<void>>();
-  return async function run<T>(
+  async function run<T>(
     target: TelegramDeliveryTarget,
     operation: () => Promise<T>,
   ): Promise<T> {
@@ -432,6 +446,11 @@ function createTelegramDeliveryTargetQueue() {
     } finally {
       if (queues.get(key) === settled) queues.delete(key);
     }
+  }
+  return {
+    run,
+    hasPendingTarget: (target: TelegramDeliveryTarget) =>
+      queues.has(targetKey(target)),
   };
 }
 
@@ -463,7 +482,8 @@ export function createTelegramDeliveryRuntime(
     TelegramDeliveryHandle,
     { target: TelegramDeliveryTarget; messageIds: readonly number[] }
   >();
-  const runForTarget = createTelegramDeliveryTargetQueue();
+  const targetQueue = createTelegramDeliveryTargetQueue();
+  const runForTarget = targetQueue.run;
   const render = (
     view: TelegramDeliveryView,
   ): TelegramDeliveryResult<readonly TelegramDeliveryRenderedChunk[]> => {
@@ -549,6 +569,7 @@ export function createTelegramDeliveryRuntime(
   };
   return {
     generation: deps.generation,
+    hasPendingTarget: targetQueue.hasPendingTarget,
     shutdown() {
       active = false;
     },
@@ -743,15 +764,21 @@ export function createTelegramBridgeDeliveryRuntime(
     async sendChunk(target, chunk, options) {
       assertTransportActive();
       const sent = await withTelegramReplyParameters(
-        target.chatId, options.replyToMessageId, target,
+        target.chatId,
+        options.replyToMessageId,
+        target,
         (replyParameters) => {
           const body = {
             chat_id: target.chatId,
             text: chunk.text,
-            ...(chunk.parseMode === "html" ? { parse_mode: "HTML" as const } : {}),
+            ...(chunk.parseMode === "html"
+              ? { parse_mode: "HTML" as const }
+              : {}),
             ...getTelegramTargetThreadParams(target),
             ...(replyParameters ? { reply_parameters: replyParameters } : {}),
-            ...(options.replyMarkup ? { reply_markup: options.replyMarkup } : {}),
+            ...(options.replyMarkup
+              ? { reply_markup: options.replyMarkup }
+              : {}),
           };
           return deps.api.sendMessage(
             target.threadId === undefined
@@ -870,21 +897,6 @@ export async function sendTelegramView(
   const invalid = validateView<TelegramDeliveryHandle>(view);
   if (invalid) return invalid;
   return runDeliveryOperation((runtime) => runtime.sendView(view, options));
-}
-
-/** @internal Edit an exact Telegram message through the currently bound runtime generation. */
-export async function editTelegramTargetView(
-  target: TelegramDeliveryTarget,
-  messageId: number,
-  view: TelegramDeliveryView,
-): Promise<TelegramDeliveryResult<TelegramDeliveryHandle>> {
-  const invalid = validateView<TelegramDeliveryHandle>(view);
-  if (invalid) return invalid;
-  return runDeliveryOperation((runtime) => runtime.editView({
-    target: { ...target },
-    messageIds: [messageId],
-    generation: runtime.generation,
-  }, view));
 }
 
 export async function editTelegramView(

@@ -11,7 +11,6 @@ import {
   createTelegramBusFollowerRegistry,
   createTelegramBusLocalServer,
   createTelegramBusProtocolIdentity,
-  getTelegramProcessBirthIdentity,
   sendTelegramBusLocalEnvelope,
   TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF,
 } from "../../lib/bus.ts";
@@ -22,7 +21,8 @@ import {
   createTelegramUpdateJournalStore,
   TelegramUpdateJournalError,
 } from "../../lib/journal.ts";
-import { createTelegramLockRuntime, isProcessAlive } from "../../lib/locks.ts";
+import { createTelegramLockRuntime } from "../../lib/locks.ts";
+import { getTelegramProcessBirthIdentity, isProcessAlive } from "../../lib/process-identity.ts";
 import {
   createTelegramQueueHandoffStagingRuntime,
   createTelegramQueueStore,
@@ -366,7 +366,7 @@ async function runTransportHandoff(input: TransportHandoffInput): Promise<void> 
   await new Promise<void>((resolve, reject) => {
     process.stdin.setEncoding("utf8");
     process.stdin.once("data", (chunk) => {
-      const command = chunk.trim();
+      const command = String(chunk).trim();
       if (command === "stop") resolve();
       else if (command === "execute-control") {
         const item = liveStore.getQueuedItems()[0];

@@ -22,10 +22,12 @@ import {
   clearTelegramVoiceSynthesisProviders,
   getTelegramVoiceSynthesisProviders,
   hasTelegramVoiceSynthesisProvider,
-  planTelegramVoiceReply,
   registerTelegramVoiceSynthesisProvider,
-  stripTelegramCommentMarkupForPreview,
 } from "../lib/outbound.ts";
+import {
+  planTelegramVoiceReply,
+  stripTelegramCommentMarkupForPreview,
+} from "../lib/outbound-markup.ts";
 
 // --- Test Setup ---
 

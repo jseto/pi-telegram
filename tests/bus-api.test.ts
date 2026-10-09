@@ -6,24 +6,75 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createTelegramBusAwareApiRuntime } from "../lib/bus-api.ts";
+import { createTelegramBusAwareApiRuntime, createTelegramSelectedMenuTextApi } from "../lib/bus-api.ts";
+import { createTelegramExtensionSectionRegistry, handleTelegramSectionCallback, type TelegramSectionRuntimeDeps } from "../lib/sections.ts";
 import { createTelegramBusLeaderApiProxy } from "../lib/bus-leader.ts";
-import { callTelegram, createTelegramApiClient, createTelegramBridgeApiRuntime, type TelegramBridgeApiRuntime } from "../lib/telegram-api.ts";
+import { callTelegram, createTelegramApiClient, createTelegramBridgeApiRuntime, type TelegramBridgeApiRuntime, type TelegramApiCallOptions } from "../lib/telegram-api.ts";
 import { captureTelegramStaleTargetRequestRecovery, type TelegramSyncState } from "../lib/sync.ts";
 import type { TelegramTopicTargetRecord } from "../lib/threads.ts";
 
+test("Selected text API preparation proves availability without activating the future recipient", async () => {
+  let assertions = 0;
+  const config = { operationId: "operation", registrationGeneration: "generation", target: { chatId: 7, threadId: 42 },
+    assertAuthority() { assertions++; throw new Error("Future recipient is not released"); },
+    deliver: async () => assert.fail("No issuance") };
+  const api = createTelegramSelectedMenuTextApi(config);
+  assert.equal(assertions, 0);
+  for (const change of [{ deliver: undefined }, { assertAuthority: undefined }, { target: { chatId: 7, threadId: 0 } }, { operationId: "" }, { registrationGeneration: "" }]) {
+    assert.throws(() => createTelegramSelectedMenuTextApi({ ...config, ...change } as unknown as Parameters<typeof createTelegramSelectedMenuTextApi>[0]));
+  }
+  assert.equal(assertions, 0);
+  await assert.rejects(api.sendMessage({ chat_id: 7, message_thread_id: 42, text: "Status" }, { assertAuthority: config.assertAuthority }));
+  assert.equal(assertions, 1);
+});
+
+for (const edit of [false, true]) for (const fault of ["current", "callback", "callback-missing", "target", "thread", "extra", "preview", "markup", "mode", "reply", "reply-missing", "lost", "late", "observation", "capture"] as const) {
+  test(`Selected text API ${edit ? "edit" : "send"} preserves closed captured menu body (${fault})`, async () => {
+    let current = true, calls = 0;
+    const assertAuthority = () => { if (!current) throw new Error("Recipient changed"); };
+    const gate = Promise.withResolvers<void>(), effects: unknown[] = [];
+    const target = { chatId: 7, threadId: 42 }, options = { assertAuthority }, config = { operationId: "operation", registrationGeneration: "generation", target, assertAuthority,
+      async deliver(effect: { kind: "send-text" | "edit-text"; text: string }, assertion: () => void) {
+        assert.equal(assertion, assertAuthority); calls++; effects.push(structuredClone(effect)); await gate.promise;
+        if (fault === "lost") throw new Error("Issued reply lost");
+        return { operationId: fault === "observation" ? "other" : "operation", registrationGeneration: "generation", recipient: { target: { chatId: 7, threadId: 42 }, sessionId: "session", sessionGeneration: 1,
+          processId: 1, processBirthId: "birth", profileKey: "profile", journalBindingKey: "journal" }, effect: effect.kind, messageId: 11 };
+      } };
+    const api = createTelegramSelectedMenuTextApi(config);
+    const body: Record<string, unknown> = { chat_id: 7, message_thread_id: 42, text: "<b>Status</b>", parse_mode: "HTML", reply_markup: { inline_keyboard: [[{ text: "Queue", callback_data: "queue" }]] },
+      ...(edit ? { message_id: 11 } : { reply_parameters: { message_id: 11, allow_sending_without_reply: true } }) };
+    if (fault === "callback") options.assertAuthority = () => {};
+    if (fault === "callback-missing") Reflect.deleteProperty(options, "assertAuthority");
+    if (fault === "target") body.chat_id = 8;
+    if (fault === "thread") body.message_thread_id = 99;
+    if (fault === "extra") body.foreign = true;
+    if (fault === "preview") body.link_preview_options = { is_disabled: true };
+    if (fault === "markup") body.reply_markup = { inline_keyboard: [[{ text: "Site", url: "https://example.com" }]] };
+    if (fault === "mode") body.parse_mode = "Markdown";
+    if (fault === "reply") body.reply_parameters = { message_id: 11, allow_sending_without_reply: false };
+    if (fault === "reply-missing") body.reply_parameters = { allow_sending_without_reply: true };
+    const task = edit ? api.editMessageText(body as Parameters<typeof api.editMessageText>[0], options) : api.sendMessage(body as Parameters<typeof api.sendMessage>[0], options);
+    const early = ["callback", "callback-missing", "target", "thread", "extra", "preview", "markup", "mode", "reply", "reply-missing"].includes(fault);
+    if (fault === "late") current = false;
+    if (fault === "capture") { body.text = "changed"; target.threadId = 99; config.assertAuthority = () => {}; options.assertAuthority = () => {}; config.operationId = "changed"; }
+    gate.resolve();
+    if (early || ["lost", "late", "observation"].includes(fault)) await assert.rejects(task);
+    else assert.deepEqual(await task, edit ? "edited" : { message_id: 11 });
+    assert.equal(calls, early ? 0 : 1);
+    if (calls) assert.deepEqual(effects[0], { kind: edit ? "edit-text" : "send-text", text: "<b>Status</b>", parseMode: "HTML",
+      replyMarkup: { inline_keyboard: [[{ text: "Queue", callback_data: "queue" }]] }, ...(edit ? { messageId: 11 } : { replyToMessageId: 11 }) });
+  });
+}
+
 for (const direct of [true, false]) {
-  test(`Typed callback answers omit terminal sentence periods without rewriting messages (direct=${direct})`, async () => {
+  test(`Typed callback answers send authored toast text verbatim (direct=${direct})`, async () => {
     const calls: unknown[] = [];
     const runtime = createTelegramBusAwareApiRuntime({ directRuntime: createDirectRuntime(calls), ownsDirect: () => direct,
       async callFollowerApi(method, args) { calls.push({ method, args }); return { message_id: 1 }; } });
-    const cases: Array<[string | undefined, string | undefined]> = [
-      [undefined, undefined], ["", ""], ["Done.", "Done"], ["✅ Saved.", "✅ Saved"],
-      ["First sentence. Try again.", "First sentence. Try again"], ["Done. \n", "Done"],
-      ["Continue?", "Continue?"], ["Failed!", "Failed!"], ["Working...", "Working..."],
-      ["Working…", "Working…"], ["file.txt", "file.txt"], ["v1.2.3", "v1.2.3"],
-    ];
-    for (const [text, expected] of cases) {
+    // Each toast is written in its final form at its call site; the boundary never rewrites punctuation.
+    const cases: Array<string | undefined> = [undefined, "", "✅ Saved", "⚠️ Wrote a period.", "Continue?", "Working…", "v1.2.3"];
+    for (const text of cases) {
+      const expected = text;
       calls.length = 0;
       await runtime.answerCallbackQuery("callback", text);
       assert.deepEqual(calls, direct ? [{ kind: "answer-callback", callbackQueryId: "callback", text: expected }] :
@@ -38,6 +89,129 @@ for (const direct of [true, false]) {
     await runtime.call("answerCallbackQuery", raw);
     assert.deepEqual(calls, direct ? [{ kind: "call", method: "answerCallbackQuery", body: raw }] :
       [{ method: "call", args: ["answerCallbackQuery", raw, undefined] }]);
+  });
+}
+
+for (const direct of [true, false]) {
+  test(`Companion section toasts reach the client exactly as the companion wrote them (direct=${direct})`, async () => {
+    const calls: unknown[] = [], edited: string[] = [];
+    const runtime = createTelegramBusAwareApiRuntime({ directRuntime: createDirectRuntime(calls), ownsDirect: () => direct,
+      async callFollowerApi(method, args) { calls.push({ method, args }); return { message_id: 1 }; } });
+    const registry = createTelegramExtensionSectionRegistry();
+    registry.register({ id: "@fixture/companion", label: "Companion", render: () => ({ text: "Companion." }),
+      async handleCallback(ctx) {
+        await ctx.answerCallback(ctx.payload || undefined);
+        await ctx.edit({ text: "An in-chat notice." });
+        return "handled" as const;
+      } });
+    const deps: TelegramSectionRuntimeDeps = {
+      answerCallbackQuery: runtime.answerCallbackQuery,
+      editInteractiveMessage: async (_chat, _message, text) => { edited.push(text); },
+      sendInteractiveMessage: async () => undefined, sendRichMessage: async () => undefined,
+      enqueuePrompt: async () => {}, deleteMessage: async () => {},
+    };
+    for (const [text, expected] of [["✅ Saved", "✅ Saved"], ["⚠️ Operation failed.", "⚠️ Operation failed."],
+      ["Continue?", "Continue?"], ["", undefined]] as const) {
+      calls.length = 0;
+      assert.equal(await handleTelegramSectionCallback(registry, "0", "control", text, 100, 1, "companion-callback", deps), true);
+      assert.deepEqual(calls, direct ? [{ kind: "answer-callback", callbackQueryId: "companion-callback", text: expected }] :
+        [{ method: "call", args: ["answerCallbackQuery", { callback_query_id: "companion-callback", ...(expected !== undefined ? { text: expected } : {}) }] }]);
+      assert.equal(edited.at(-1), "An in-chat notice.");
+    }
+  });
+}
+
+for (const direct of [true, false]) {
+  for (const multipart of [true, false]) {
+    test(`Per-call API authority ${direct ? "stays local" : "cannot cross IPC"} for ${multipart ? "multipart" : "JSON"}`, async () => {
+      const calls: unknown[] = [];
+      let guardedDirectCalls = 0;
+      const options: TelegramApiCallOptions = { assertAuthority() {} };
+      const runtime = createTelegramBusAwareApiRuntime({ ownsDirect: () => direct,
+        directRuntime: { ...createDirectRuntime(calls),
+          async call<TResponse>(_method: string, _body: Record<string, unknown>, supplied?: TelegramApiCallOptions) {
+            assert.equal(supplied?.assertAuthority, options.assertAuthority);
+            guardedDirectCalls++;
+            return true as TResponse;
+          },
+          async callMultipart<TResponse>(_method: string, _fields: Record<string, string>, _field: string, _path: string,
+            _name: string, supplied?: TelegramApiCallOptions) {
+            assert.equal(supplied?.assertAuthority, options.assertAuthority);
+            guardedDirectCalls++;
+            return true as TResponse;
+          },
+        },
+        async callFollowerApi(method, args) { calls.push({ method, args }); return true; },
+      });
+      const request = multipart ? runtime.callMultipart("sendDocument", { chat_id: "7" }, "document", "/unused", "fixture.txt", options)
+        : runtime.call("sendMessage", { chat_id: 7, text: "menu" }, options);
+      if (direct) assert.equal(await request, true);
+      else await assert.rejects(request, { name: "TelegramApiAuthorityError", requestIssued: false });
+      assert.equal(guardedDirectCalls, direct ? 1 : 0);
+      assert.deepEqual(calls, [], "A guarded effect is never serialized without its enforceable lifetime.");
+    });
+  }
+}
+
+for (const direct of [true, false]) {
+  test(`Guarded BotFather typed API ${direct ? "preserves direct authority" : "refuses follower serialization"}`, async () => {
+    const calls: unknown[] = [], options: Pick<TelegramApiCallOptions, "assertAuthority"> = { assertAuthority() {} };
+    const commands = [{ command: "start", description: "Open menu" }];
+    let guardedCalls = 0;
+    const runtime = createTelegramBusAwareApiRuntime({ ownsDirect: () => direct,
+      directRuntime: { ...createDirectRuntime(calls), async setMyCommands(value, supplied) {
+        assert.equal(value, commands);
+        assert.equal(supplied?.assertAuthority, options.assertAuthority);
+        guardedCalls++;
+        return true;
+      } },
+      callFollowerApi: async () => assert.fail("A process-local lifetime cannot become a wire grant"),
+    });
+    if (direct) assert.equal(await runtime.setMyCommands(commands, options), true);
+    else await assert.rejects(runtime.setMyCommands(commands, options), { name: "TelegramApiAuthorityError", requestIssued: false });
+    assert.equal(guardedCalls, direct ? 1 : 0);
+    assert.deepEqual(calls, []);
+  });
+}
+
+for (const direct of [true, false]) {
+  test(`Typed callback authority ${direct ? "forwards the exact local guard" : "refuses before follower IPC"}`, async () => {
+    const calls: unknown[] = [], options: Pick<TelegramApiCallOptions, "assertAuthority"> = { assertAuthority() {} };
+    let guardedCalls = 0;
+    const runtime = createTelegramBusAwareApiRuntime({ ownsDirect: () => direct,
+      directRuntime: { ...createDirectRuntime(calls), async answerCallbackQuery(id, text, supplied) {
+        assert.equal(id, "captured-query");
+        assert.equal(text, "✅ Saved");
+        assert.equal(supplied?.assertAuthority, options.assertAuthority);
+        guardedCalls++;
+      } },
+      callFollowerApi: async () => assert.fail("A callback closure cannot become a wire grant"),
+    });
+    const request = runtime.answerCallbackQuery("captured-query", "✅ Saved", options);
+    if (direct) await request;
+    else await assert.rejects(request, { name: "TelegramApiAuthorityError", requestIssued: false });
+    assert.equal(guardedCalls, direct ? 1 : 0);
+    assert.deepEqual(calls, []);
+  });
+}
+
+for (const direct of [true, false]) {
+  test(`Typed callback authority captures its guard before direct-owner observation (direct=${direct})`, async () => {
+    const guard = () => {};
+    const options: Pick<TelegramApiCallOptions, "assertAuthority"> = { assertAuthority: guard };
+    let guardedCalls = 0;
+    const runtime = createTelegramBusAwareApiRuntime({
+      ownsDirect() { options.assertAuthority = undefined; return direct; },
+      directRuntime: { ...createDirectRuntime([]), async answerCallbackQuery(_id, _text, supplied) {
+        assert.equal(supplied?.assertAuthority, guard);
+        guardedCalls++;
+      } },
+      callFollowerApi: async () => assert.fail("Observation cannot drop the captured guard before IPC"),
+    });
+    const request = runtime.answerCallbackQuery("captured-query", "✅ Saved", options);
+    if (direct) await request;
+    else await assert.rejects(request, { name: "TelegramApiAuthorityError", requestIssued: false });
+    assert.equal(guardedCalls, direct ? 1 : 0);
   });
 }
 

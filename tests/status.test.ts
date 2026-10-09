@@ -21,6 +21,7 @@ import {
   type TelegramRuntimeProjectionStoreOptions,
   type TelegramRuntimeProjectionStorage,
   type TelegramStatusSnapshot,
+  type TelegramStatusBarState,
   createTelegramRuntimeEventRecorder,
   createTelegramRuntimeLogScope,
   createTelegramStatusHtmlBuilder,
@@ -448,6 +449,33 @@ test("Status snapshot queued microtasks cannot renew a revoked session scope", a
   await schedule.suspend();
 });
 
+for (const name of ["Telegram", "TeLeGrAm", "LeAdEr", "FoLlOwEr", "CuStOm"] as const) {
+  test(`Explicit Thread status labels preserve acknowledged title casing in every connection state (${name})`, () => {
+    const theme = { fg: (token: string, text: string) => `<${token}>${text}</${token}>` };
+    const base: TelegramStatusBarState = { hasBotToken: true, pollingActive: true, paired: true, busRole: "leader",
+      compactionInProgress: false, processing: false, queuedStatus: " +2", instanceThreadName: name };
+    const cases: { state: Partial<TelegramStatusBarState>; suffix: string }[] = [
+      { state: {}, suffix: "<success>leader</success><warning> +2</warning>" },
+      { state: { busRole: "follower", pollingActive: false }, suffix: "<success>follower</success><warning> +2</warning>" },
+      { state: { busRole: undefined }, suffix: "<success>connected</success><warning> +2</warning>" },
+      { state: { pollingActive: false }, suffix: "<dim>disconnected</dim><warning> +2</warning>" },
+      { state: { busLifecyclePhase: "electing" }, suffix: "<warning>electing</warning><warning> +2</warning>" },
+      { state: { busRole: "follower", followerRegistered: false }, suffix: "<warning>reconnecting</warning><warning> +2</warning>" },
+      { state: { error: "transport failure" }, suffix: "<error>error</error><warning> +2</warning>" },
+      { state: { pollingStopReason: "persistent-conflict" }, suffix: "<error>error</error>" },
+      { state: { paired: false }, suffix: "<warning>awaiting pairing</warning><warning> +2</warning>" },
+      { state: { hasBotToken: false }, suffix: "<muted>not configured</muted><warning> +2</warning>" },
+    ];
+    for (const { state, suffix } of cases) assert.equal(buildTelegramStatusBarText(theme, { ...base, ...state }), `<accent>${name}</accent> ${suffix}`);
+  });
+}
+
+test("Thread status uses the generic bridge label only when its title is absent", () => {
+  const theme = { fg: (_token: string, text: string) => text };
+  for (const instanceThreadName of [undefined, "", "  "]) assert.equal(buildTelegramStatusBarText(theme,
+    { hasBotToken: true, pollingActive: true, paired: true, compactionInProgress: false, processing: false, queuedStatus: "", instanceThreadName }), "telegram connected");
+});
+
 test("Status bar text renders bridge connection and queue states", () => {
   const theme = {
     fg: (token: string, text: string) => `<${token}>${text}</${token}>`,
@@ -532,7 +560,7 @@ test("Status bar text renders bridge connection and queue states", () => {
       processingStatus: "queued",
       queuedStatus: " +2",
     }),
-    "<accent>telegram</accent> <dim>disconnected</dim><warning> +2</warning>",
+    "<accent>Aurora</accent> <dim>disconnected</dim><warning> +2</warning>",
   );
   assert.equal(
     buildTelegramStatusBarText(theme, {
@@ -623,7 +651,7 @@ test("Status bar text renders bridge connection and queue states", () => {
       processing: false,
       queuedStatus: "",
     }),
-    "<accent>telegram</accent> <success>follower</success>",
+    "<accent>Follower</accent> <success>follower</success>",
   );
   assert.equal(
     buildTelegramStatusBarText(theme, {

@@ -127,15 +127,6 @@ export type ThreadReconciliationAction = {
     messageId?: number;
     leaderEpoch?: number | string;
 } | {
-    kind: "close-delete-disconnected-instance-topic";
-    target: TelegramTarget & {
-        threadId: number;
-    };
-    reason: "manual-disconnect";
-    instanceId?: string;
-    messageId?: number;
-    leaderEpoch?: number | string;
-} | {
     kind: "close-delete-graceful-shutdown-topic";
     target: TelegramTarget & {
         threadId: number;
@@ -220,6 +211,14 @@ export interface ThreadReconciliationInput {
     previousState?: ThreadReconciliationMachineState;
     freshCreationGraceMs?: number;
 }
+/** A Thread record still claims its slot/target while active, starting or pending. */
+export declare function isCurrentThreadRecord(record: {
+    readonly status: string;
+}): boolean;
+/** Pure Bot API vocabulary for a deleted/missing Thread; callers own their HTTP-status policy. */
+export declare function isTelegramTopicDeletedErrorMessage(message: string): boolean;
+/** Pure Bot API vocabulary for a closed Thread; closure is not deletion evidence. */
+export declare function isTelegramTopicClosedErrorMessage(message: string): boolean;
 export interface ThreadReconciliationRuntime {
     getState: () => ThreadReconciliationMachineState | undefined;
     recordPlan: (plan: ThreadReconciliationPlan) => void;
@@ -229,13 +228,40 @@ export declare function createThreadReconciliationRuntime(deps: {
     recordRuntimeEvent: (category: string, message: unknown, details?: Record<string, unknown>) => void;
     scheduleSnapshotPersist: () => void;
 }): ThreadReconciliationRuntime;
-export declare function planDisconnectedInstanceThreadCleanup(input: {
-    target: TelegramTarget & {
-        threadId: number;
-    };
-    instanceId?: string;
-    leaderEpoch?: number | string;
-}): ThreadReconciliationPlan;
+/** Momentary preparation evidence only: not an action, lease, issued effect or reusable deletion grant. */
+export interface TelegramLiveRebindCleanupPreparation {
+    status: "prepared";
+    operationId: string;
+    target: ThreadTarget;
+    recipientTarget: ThreadTarget;
+    leaderEpoch: string;
+}
+export declare function prepareLiveRebindThreadCleanup(input: {
+    operationId: string;
+    oldTarget: ThreadTarget;
+    recipientTarget: ThreadTarget;
+    leaderEpoch: string;
+    targetProtected: boolean;
+    /** Narrow body-free current-work projection; no cached idle or historical disposition proof. */
+    work: Readonly<{
+        sessionBusy: boolean;
+        targetWork: boolean;
+        deliveryPending: boolean;
+        unknown: boolean;
+    }> | undefined;
+}): TelegramLiveRebindCleanupPreparation | undefined;
+export type TelegramLiveRebindCleanupOutcome = "confirmed" | "failed" | "unknown";
+/**
+ * One unretried deletion for an already issued live-rebind cleanup grant. Success or confirmed absence is `confirmed`;
+ * protection or authority loss before the request and a definite request rejection are `failed`; every other outcome is
+ * `unknown`. The caller owns the durable issue marker and terminal record; this never repeats or rolls back.
+ */
+export declare function issueLiveRebindThreadCleanup(prepared: TelegramLiveRebindCleanupPreparation, ports: {
+    /** Throws when the issuer's current recipient/work/ownership authority no longer holds. */
+    assertCurrent(): void;
+    deleteTopic(target: ThreadTarget): Promise<unknown>;
+    classifyFailure(error: unknown): "absent" | "rejected" | "unknown";
+}): Promise<TelegramLiveRebindCleanupOutcome>;
 export declare function applyThreadReconciliationPlan(plan: ThreadReconciliationPlan, ports: ThreadReconciliationApplyPorts): Promise<ThreadReconciliationApplyResult>;
 export declare function planThreadReconciliation(input: ThreadReconciliationInput): ThreadReconciliationPlan;
 export {};

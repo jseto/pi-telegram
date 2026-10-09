@@ -7,7 +7,7 @@
 import fsPromises, { chmod, link, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { createHash } from "node:crypto";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import assert from "node:assert/strict";
@@ -27,6 +27,9 @@ import {
   createTelegramTopicTargetRenamer,
   createTelegramWorkspaceBindingIdentity,
   createTelegramWorkspaceRestoreResolver,
+  createTelegramWorkspaceThreadRenameRecipient,
+  createTelegramWorkspaceThreadResetRecipient,
+  type TelegramWorkspaceThreadRenameAuthority,
   createTelegramTopicTargetStore,
   createTelegramConsolidatedWorkspaceStorage,
   parseTelegramWorkspaceStateSection,
@@ -37,14 +40,10 @@ import {
   findCurrentTelegramInstanceThreadRecord,
   getTelegramThreadOwnerFromProfileKey,
   getTelegramThreadOwnerKey,
-  getTelegramStatePath,
-  getTelegramTopicTargetsPath,
   getTelegramLeaderSessionHandoff,
   setTelegramLeaderSessionHandoff,
   provisionOwnBusTopic,
-  reconcileTelegramFreshAllocationCursor,
   resolveTelegramInstanceThreadIdentity,
-  resolveTelegramInstanceThreadTarget,
   listTelegramThreadStatusFollowers,
   listTelegramThreadStatusTargets,
   listTelegramThreadStatusReservations,
@@ -53,6 +52,7 @@ import {
   isTelegramTopicModeUnavailableError,
   isTelegramTopicTargetStaleError,
   type TelegramWorkspaceRestoreIntent,
+  type TelegramWorkspaceLiveRebindIntent,
   type TelegramWorkspaceRestoreSourceAcceptance,
 } from "../lib/threads.ts";
 import { createTelegramLockRuntime } from "../lib/locks.ts";
@@ -60,6 +60,9 @@ import { createTelegramWorkspaceAdmissionLedger } from "../lib/workspace-admissi
 import {
   isTelegramApiCommitUnknownError,
   TelegramApiCommitUnknownError,
+  createTelegramApiClient,
+  createTelegramBridgeApiRuntime,
+  type TelegramApiCallOptions,
 } from "../lib/telegram-api.ts";
 
 import { withWorkspaceRelocationFixture, withWorkspaceRestoreFixture as fixture, restoreFixtureRecipient as recipient } from "./fixtures/workspace.ts";
@@ -261,6 +264,930 @@ for (const role of ["leader", "follower"] as const) {
       assert.equal(await readFile(f.path, "utf8"), bytes);
     }, role);
   });
+}
+
+type WorkspaceRestoreFixture = Parameters<Parameters<typeof fixture>[0]>[0];
+async function withLiveRebindSnapshot(role: "leader" | "follower", run: (f: WorkspaceRestoreFixture,
+  live: TelegramWorkspaceLiveRebindIntent, wire: Record<string, unknown>) => Promise<void>) {
+  await fixture(async f => {
+    const committed = (await f.store.commit(f.request, f.auth))!;
+    assert.ok(committed);
+    const live: TelegramWorkspaceLiveRebindIntent = { kind: "live-rebind", request: structuredClone(committed.request),
+      operatorUserId: committed.operatorUserId, executor: structuredClone(committed.executor), recipient: recipient(role),
+      revision: 0, createdAtMs: 1000, updatedAtMs: 1000, phase: "rebound" };
+    const wire: Record<string, unknown> = JSON.parse(await readFile(f.path, "utf8"));
+    const section = wire.workspaceRestore as Record<string, unknown>;
+    section.revision = Number(section.revision) + 1;
+    section.operations = [];
+    section.liveRebindings = [live];
+    await writeFile(f.path, JSON.stringify(wire));
+    await run(f, live, wire);
+  }, role);
+}
+
+for (const role of ["leader", "follower"] as const) {
+  for (const progress of [
+    { phase: "rebound" }, { phase: "released" }, { phase: "released", cleanup: "issued" },
+    ...(["confirmed", "failed", "unknown", "not-issued"] as const).map(cleanup => ({ phase: "finished", cleanup })),
+  ]) {
+    test(`Live rebinding snapshot round-trips separate metadata (${role}, ${progress.phase}, ${progress.cleanup ?? "none"})`, async () => {
+      await withLiveRebindSnapshot(role, async (f, live, wire) => {
+        const value = { ...live, ...progress };
+        (wire.workspaceRestore as Record<string, unknown>).liveRebindings = [value];
+        const bytes = JSON.stringify(wire); await writeFile(f.path, bytes);
+        const decoded = parseTelegramWorkspaceStateSection(wire, "default")!;
+        assert.deepEqual(decoded.workspaceRestore?.liveRebindings, [value]);
+        assert.deepEqual(decoded.workspaceRestore?.operations, []);
+        const cold = createTelegramTopicTargetStore({ path: f.path });
+        await cold.load();
+        const store = cold.workspaceRestore({ profileName: "default", tokenSha256: "a".repeat(64) });
+        assert.deepEqual(store.list(), [], "Live metadata never becomes a legacy Restore grant");
+        assert.equal(store.issueCleanup(value as unknown as TelegramWorkspaceRestoreIntent, f.auth), undefined);
+        cold.renameByTarget(f.request.target, "Still same session"); await cold.persist();
+        const after = JSON.parse(await readFile(f.path, "utf8"));
+        assert.deepEqual(after.workspaceRestore.liveRebindings, [value], "Ordinary publication preserves the new metadata");
+        assert.equal(after.workspaceBindings[0].sessionId, f.request.binding.sessionId);
+        assert.equal(after.workspaceBindings[0].slot, f.request.binding.slot);
+      });
+    });
+  }
+}
+
+const invalidLiveRebinding: Record<string, (value: Record<string, any>) => void> = {
+  "legacy-record": value => { delete value.kind; value.phase = "relocated"; value.committedAtMs = 1000; },
+  "legacy-proof": value => { value.routing = { settlements: [] }; },
+  "future-key": value => { value.future = true; },
+  "foreign-operator": value => { value.operatorUserId = 8; },
+  "foreign-session": value => { value.recipient.sessionId = "other"; },
+  "foreign-instance": value => { value.recipient.instanceId = "other"; },
+  "foreign-role": value => { value.recipient.kind = "follower"; },
+  "empty-generation": value => { value.recipient.generation = ""; },
+  "wrong-clock": value => { value.updatedAtMs = 999; },
+  "invalid-revision": value => { value.revision = -1; },
+  "early-cleanup": value => { value.cleanup = "issued"; },
+  "early-terminal": value => { value.phase = "released"; value.cleanup = "confirmed"; },
+  "unfinished-terminal": value => { value.phase = "finished"; },
+  "unknown-phase": value => { value.phase = "ready"; },
+  "unknown-outcome": value => { value.phase = "finished"; value.cleanup = "deleted-probably"; },
+  "duplicate-source": value => { value.request.source.updateIds = [100, 100]; },
+};
+for (const [damage, mutate] of Object.entries(invalidLiveRebinding)) {
+  test(`Live rebinding snapshot refuses malformed or borrowed authority (${damage})`, async () => {
+    await withLiveRebindSnapshot("leader", async (f, live, wire) => {
+      const value = structuredClone(live); mutate(value);
+      (wire.workspaceRestore as Record<string, unknown>).liveRebindings = [value];
+      const bytes = JSON.stringify(wire); await writeFile(f.path, bytes);
+      assert.throws(() => parseTelegramWorkspaceStateSection(wire, "default"), /Invalid Workspace Restore evidence/);
+      await assert.rejects(() => createTelegramTopicTargetStore({ path: f.path }).load(), /Invalid Workspace Restore evidence/);
+      assert.equal(await readFile(f.path, "utf8"), bytes, "Invalid metadata is not repaired or erased");
+    });
+  });
+}
+
+for (const conflict of ["empty", "capacity", "clock", "live-id", "live-binding", "legacy-id", "legacy-binding", "live-in-legacy"] as const) {
+  test(`Live rebinding snapshot enforces bounded and disjoint operation namespaces (${conflict})`, async () => {
+    await withLiveRebindSnapshot("leader", async (f, live, wire) => {
+      const section = wire.workspaceRestore as Record<string, unknown>;
+      const other = structuredClone(live); other.request.operationId = "other";
+      if (conflict === "empty") section.liveRebindings = [];
+      if (conflict === "capacity") section.liveRebindings = Array(27).fill(live);
+      if (conflict === "clock") section.revision = 0;
+      if (conflict === "live-id") section.liveRebindings = [live, live];
+      if (conflict === "live-binding") section.liveRebindings = [live, other];
+      if (conflict === "live-in-legacy") { section.operations = [live]; delete section.liveRebindings; }
+      if (conflict.startsWith("legacy-")) section.operations = [{ request: conflict === "legacy-id" ? live.request : other.request,
+        operatorUserId: live.operatorUserId, executor: live.executor, revision: 0, createdAtMs: 1000,
+        updatedAtMs: 1000, committedAtMs: 1000, phase: "relocated" }];
+      const bytes = JSON.stringify(wire); await writeFile(f.path, bytes);
+      assert.throws(() => parseTelegramWorkspaceStateSection(wire, "default"), /Workspace (?:Restore|live rebinding) evidence/);
+      assert.equal(await readFile(f.path, "utf8"), bytes);
+    });
+  });
+}
+
+test("Live rebinding terminal metadata does not conflict with another live attempt or rewrite legacy facts", async () => {
+  await withLiveRebindSnapshot("leader", async (f, live, wire) => {
+    const finished = { ...structuredClone(live), phase: "finished", cleanup: "unknown" };
+    finished.request.operationId = "finished";
+    const section = wire.workspaceRestore as Record<string, unknown>;
+    section.liveRebindings = [live, finished];
+    assert.doesNotThrow(() => parseTelegramWorkspaceStateSection(wire, "default"));
+    section.liveRebindings = [finished];
+    const legacy = { request: live.request, operatorUserId: live.operatorUserId, executor: live.executor,
+      revision: 0, createdAtMs: 1000, updatedAtMs: 1000, committedAtMs: 1000, phase: "relocated" };
+    section.operations = [legacy];
+    const bytes = JSON.stringify(wire); await writeFile(f.path, bytes);
+    assert.deepEqual(f.open().list(), [legacy], "A separate terminal row neither replaces nor loosens legacy evidence");
+    assert.deepEqual(parseTelegramWorkspaceStateSection(wire, "default")?.workspaceRestore?.liveRebindings, [finished]);
+    assert.equal(await readFile(f.path, "utf8"), bytes);
+  });
+});
+
+async function withLiveRebindStoreFixture(role: "leader" | "follower", layout: "standalone" | "consolidated",
+  run: (f: WorkspaceRestoreFixture) => Promise<void>) {
+  await fixture(async f => {
+    if (layout === "standalone") return run(f);
+    const path = join(dirname(f.path), "live-consolidated.json");
+    const owner = createTelegramLockRuntime({ statePath: path, key: () => "default", pid: 10,
+      instanceId: "leader", runtimeGeneration: 1, isProcessAlive: () => true });
+    owner.acquire({ cwd: "/repo" });
+    const consolidated = { captureAuthority() {
+      const epoch = owner.getOwnedLeaderEpoch();
+      return epoch === undefined ? undefined : () => owner.owns() && owner.getOwnedLeaderEpoch() === epoch;
+    }, publishIfOwned: owner.publishStateSectionIfOwned! };
+    const storage = createTelegramConsolidatedWorkspaceStorage({ getPath: () => path, getProfile: () => "default", ...consolidated });
+    const initial = JSON.parse(await readFile(f.path, "utf8"));
+    storage.capturePublication()!(() => ({ value: initial, result: true }));
+    const threads = createTelegramTopicTargetStore({ path, telegramProfile: "default", consolidated, getNowMs: () => 1000 });
+    await threads.load();
+    const open: WorkspaceRestoreFixture["open"] = (overrides = {}) => {
+      const { threadStore = threads, ...options } = overrides;
+      return threadStore.workspaceRestore({ profileName: "default", tokenSha256: "a".repeat(64), getNowMs: () => 1000, ...options });
+    };
+    const auth = { ...f.auth, executor: { instanceId: "leader", leaderEpoch: String(owner.getOwnedLeaderEpoch()!) }, isCurrent: () => owner.owns() };
+    try { await run({ ...f, path, threads, open, store: open(), auth,
+      request: { ...f.request, binding: threads.listWorkspaceBindings()[0]!, owner: threads.list()[0]! } }); }
+    finally { owner.release(); }
+  }, role);
+}
+
+for (const role of ["leader", "follower"] as const) {
+for (const layout of ["standalone", "consolidated"] as const) {
+for (const fault of ["clear", "unreleased", "issued", "wrong-target", "dirty-binding", "binding", "live-record", "stale-record", "reservation", "provision", "untargeted-provision", "unrelated-provision", "cleanup", "recipient-claim", "foreign-claim", "orphan-claim", "unrelated-claim", "canonical-only"] as const) {
+  test(`Live cleanup protection observes canonical and warm ownership without legacy exemptions (${role}, ${layout}, ${fault})`, async () => {
+    await withLiveRebindStoreFixture(role, layout, async f => {
+      const committed = (await f.store.commitLiveRebind(f.request, recipient(role), f.auth))!;
+      const released = f.store.advanceLiveRebind(committed, "release", f.auth)!;
+      let expected = structuredClone(released);
+      if (fault === "unreleased") expected = committed;
+      if (fault === "issued") expected = f.store.advanceLiveRebind(released, "issue-cleanup", f.auth)!;
+      if (fault === "wrong-target") expected.request.binding.target.threadId = 99;
+      const old = f.request.binding.target;
+      // Native corruption injection represents refused/unknown ownership, not a new publication permission.
+      const injectCanonical = (mutate: (file: { workspaceBindings: unknown[]; threads: unknown[]; reservations?: unknown[]; pendingProvisions?: unknown[] }) => void) => {
+        withTelegramFileTransaction(`${f.path}.transaction`, () => {
+          const root = JSON.parse(readFileSync(f.path, "utf8"));
+          mutate(layout === "consolidated" ? root.profiles.default.workspace : root);
+          writeFileSync(f.path, JSON.stringify(root), { mode: 0o600 });
+        });
+      };
+      if (fault === "dirty-binding") f.threads.upsertWorkspaceBinding({ ...f.threads.listWorkspaceBindings()[0]!, target: old });
+      if (fault === "binding" || fault === "canonical-only") {
+        const identity = createTelegramWorkspaceBindingIdentity("/other", 0, "other-session")!;
+        injectCanonical(file => file.workspaceBindings.push({ ...f.request.binding, ...identity, slot: "B", target: old }));
+        if (fault === "canonical-only") {
+          const cold = createTelegramTopicTargetStore({ path: f.path, telegramProfile: "default", getNowMs: () => 1000 });
+          assert.equal(cold.isWorkspaceLiveRebindCleanupTargetProtected(expected), true, "An uninitialized local claim projection cannot certify absence");
+        }
+      }
+      if (fault === "live-record" || fault === "stale-record") {
+        const record = { profileKey: "other", target: old, instanceId: "other", slot: "B", status: fault === "live-record" ? "active" as const : "stale" as const,
+          createdAtMs: 1000, updatedAtMs: 1000 };
+        if (fault === "live-record") injectCanonical(file => file.threads.push(record));
+        else f.threads.upsert(record);
+      }
+      if (fault === "reservation") injectCanonical(file => (file.reservations ??= []).push({ target: old, slot: "B", reason: "pending ownership", createdAtMs: 800, updatedAtMs: 800, expiresAtMs: 900 }));
+      if (fault === "provision") injectCanonical(file => (file.pendingProvisions ??= []).push({ id: "other-provision", owner: "leader", instanceId: "other", slot: "B", target: old, startedAtMs: 900, expiresAtMs: 950 }));
+      if (fault === "untargeted-provision" || fault === "unrelated-provision") {
+        f.threads.upsertPendingProvision({ id: "other-provision", owner: "leader", instanceId: "other", slot: "B", startedAtMs: 900,
+          ...(fault === "unrelated-provision" ? { target: { chatId: old.chatId, threadId: 77 } } : {}) }); await f.threads.persist();
+      }
+      if (fault === "cleanup") { f.threads.upsertPendingCleanup({ id: "other-cleanup", owner: "leader", instanceId: "other", runtimeGeneration: "other", target: old, requestedAtMs: 1000 }); await f.threads.persist(); }
+      if (fault === "recipient-claim" || fault === "foreign-claim") {
+        const claim = f.threads.claimWorkspaceIdentity(f.request.binding.cwd, fault === "recipient-claim" ? f.request.owner.instanceId! : "contender",
+          fault === "foreign-claim" ? f.request.owner.instanceId : undefined, { existingBindingOnly: true, sessionId: f.request.binding.sessionId });
+        assert.ok(claim);
+      }
+      if (fault === "orphan-claim" || fault === "unrelated-claim") {
+        const claim = f.threads.claimWorkspaceIdentity("/other", "other", undefined, { sessionId: "other-session" }); assert.ok(claim);
+        if (fault === "unrelated-claim") { f.threads.upsertWorkspaceBinding({ ...f.request.binding, ...claim, target: { chatId: old.chatId, threadId: 77 } }, "other"); await f.threads.persist(); }
+      }
+      const corrupted = ["binding", "canonical-only", "live-record", "reservation", "provision"].includes(fault);
+      const bytes = await readFile(f.path, "utf8"), bindings = f.threads.listWorkspaceBindings(), records = f.threads.list();
+      const operations = corrupted ? undefined : f.store.listLiveRebindings();
+      const protectedNow = !["clear", "stale-record", "recipient-claim", "unrelated-claim", "unrelated-provision"].includes(fault);
+      assert.equal(f.threads.isWorkspaceLiveRebindCleanupTargetProtected(expected), protectedNow);
+      assert.equal(f.threads.isWorkspaceLiveRebindCleanupTargetProtected(expected), protectedNow, "A read grants no issued or retained cleanup action");
+      assert.equal(await readFile(f.path, "utf8"), bytes); assert.deepEqual(f.threads.listWorkspaceBindings(), bindings); assert.deepEqual(f.threads.list(), records);
+      if (!corrupted) { assert.deepEqual(f.store.listLiveRebindings(), operations); assert.deepEqual(f.store.list(), []); }
+      if (fault === "clear") {
+        assert.ok(f.threads.claimWorkspaceIdentity(f.request.binding.cwd, "late-contender", f.request.owner.instanceId,
+          { existingBindingOnly: true, sessionId: f.request.binding.sessionId }));
+        assert.equal(f.threads.isWorkspaceLiveRebindCleanupTargetProtected(expected), true, "An earlier clear sample does not hide a new current claim");
+        f.threads.releaseWorkspaceClaim("late-contender");
+        assert.equal(f.threads.isWorkspaceLiveRebindCleanupTargetProtected(expected), false);
+        assert.equal(await readFile(f.path, "utf8"), bytes);
+      }
+    });
+  });
+}
+}
+}
+
+for (const operation of ["rename", "reset"] as const) {
+for (const fault of ["current", "wrong-intent", "observer-refusal", "observer-change"] as const) {
+  test(`Live name ${operation} publication observes its exact owned Workspace frame (${fault})`, async () => {
+    await withLiveRebindStoreFixture("leader", "consolidated", async f => {
+      const committed = (await f.store.commitLiveRebind(f.request, recipient("leader"), f.auth))!;
+      const intent = f.store.advanceLiveRebind(committed, "release", f.auth)!;
+      if (operation === "reset") { f.threads.renameByTarget(f.request.target, "Azure"); await f.threads.persist(); }
+      const before = await readFile(f.path, "utf8"), observations: unknown[] = [];
+      const expected = structuredClone(intent);
+      if (fault === "wrong-intent") expected.request.operationId = "other-operation";
+      if (fault === "observer-change") {
+        assert.throws(() => f.threads.withWorkspaceLiveRebindSnapshot(expected, () => {
+          f.store.advanceLiveRebind(intent, "not-issued", f.auth);
+        }), /observation changed/, "An observation callback cannot change canonical evidence behind the final grant");
+        assert.equal(f.store.listLiveRebindings()[0]?.phase, "finished", "A current observation change is not rolled back");
+        return;
+      }
+      const guard = () => {
+        f.threads.withWorkspaceLiveRebindSnapshot(expected, snapshot => {
+          observations.push(structuredClone(snapshot));
+          assert.deepEqual(snapshot.workspaceBindings?.[0]?.target, f.request.target);
+          if (fault === "observer-refusal") throw new Error("Observer refused current authority");
+        });
+        return true;
+      };
+      const result = operation === "rename" ? f.threads.renameByTargetAndPersist(f.request.target, "Azure", { updateDisplayTitle: true }, guard)
+        : f.threads.clearManualNameByTargetAndPersist(f.request.target, "A", guard);
+      if (fault === "current") {
+        await result;
+        assert.ok(observations.length > 2, "Same exact guard must observe inside native publication as well as entry/result");
+        assert.equal(f.threads.getWorkspaceBindingByTarget(f.request.target, f.request.binding.sessionId)?.manualThreadName,
+          operation === "rename" ? "Azure" : undefined);
+        assert.deepEqual(f.store.listLiveRebindings(), [intent], "Name observation/publication cannot transition the live operation");
+      } else { await assert.rejects(result, /observation changed|Observer refused/); assert.equal(await readFile(f.path, "utf8"), before); }
+      assert.deepEqual(f.store.list(), []); assert.deepEqual(f.threads.listPendingCleanups(), []);
+    });
+  });
+}
+}
+
+for (const role of ["leader", "follower"] as const) {
+  for (const layout of ["standalone", "consolidated"] as const) {
+    test(`Live rebinding store commits one binding and operation, then finishes without proof or rollback (${role}, ${layout})`, async () => {
+      await withLiveRebindStoreFixture(role, layout, async f => {
+        const beforeRoot = layout === "consolidated" ? readTelegramRuntimeState(f.path) : undefined;
+        const intent = (await f.store.commitLiveRebind(f.request, recipient(role), f.auth))!;
+        assert.ok(intent); assert.equal(intent.phase, "rebound");
+        assert.deepEqual(f.store.list(), [], "New operations do not enter legacy proof issuance");
+        assert.deepEqual(f.open().listLiveRebindings(), [intent]);
+        assert.equal(f.threads.listWorkspaceBindings()[0]?.sessionId, f.request.binding.sessionId);
+        assert.equal(f.threads.listWorkspaceBindings()[0]?.slot, f.request.binding.slot);
+        assert.deepEqual(f.threads.listWorkspaceBindings()[0]?.target, f.request.target);
+        assert.deepEqual(f.threads.list()[0]?.target, f.request.target);
+        const bytes = await readFile(f.path, "utf8");
+        assert.deepEqual(await f.store.commitLiveRebind(f.request, recipient(role), f.auth), intent);
+        assert.equal(await readFile(f.path, "utf8"), bytes, "A duplicate commit is a read, not another relocation");
+        assert.equal(f.store.advanceLiveRebind(intent, "issue-cleanup", f.auth), undefined);
+        assert.equal(f.store.advanceLiveRebind(intent, "confirmed", f.auth), undefined);
+        const released = f.store.advanceLiveRebind(intent, "release", f.auth)!;
+        assert.ok(released);
+        assert.equal(f.store.advanceLiveRebind(intent, "release", f.auth), undefined, "Stale revision cannot release again");
+        const issued = f.store.advanceLiveRebind(released, "issue-cleanup", f.auth)!;
+        assert.ok(issued);
+        assert.equal(f.store.advanceLiveRebind(issued, "issue-cleanup", f.auth), undefined, "Issued deletion never grants another attempt");
+        assert.equal(f.store.advanceLiveRebind(issued, "not-issued", f.auth), undefined);
+        const finished = f.store.advanceLiveRebind(issued, "unknown", f.auth)!;
+        assert.equal(finished.phase, "finished"); assert.equal(finished.cleanup, "unknown");
+        assert.deepEqual(f.threads.listWorkspaceBindings()[0]?.target, f.request.target, "Unknown cleanup cannot roll back the binding");
+        assert.equal(f.store.advanceLiveRebind(finished, "release", f.auth), undefined);
+        const nextRequest = { ...f.request, operationId: "next-live", source: { journalBindingKey: "next-source", updateIds: [102] },
+          binding: f.threads.listWorkspaceBindings()[0]!, owner: f.threads.list()[0]!, target: { chatId: 7, threadId: 43 } };
+        const next = (await f.store.commitLiveRebind(nextRequest, recipient(role), f.auth))!;
+        assert.ok(next, "Terminal failure is not a permanent rebinding blocker");
+        assert.deepEqual(f.store.listLiveRebindings(), [next], "Only terminal live metadata is pruned on the next attempt");
+        if (beforeRoot) {
+          const afterRoot = readTelegramRuntimeState(f.path);
+          assert.deepEqual(afterRoot.profiles.default?.transport, beforeRoot.profiles.default?.transport);
+        }
+      });
+    });
+    for (const boundary of ["after-write-before-rename", "after-rename"] as const) {
+      test(`Live rebinding store publication is atomic and reads its lost reply (${role}, ${layout}, ${boundary})`, async () => {
+        await withLiveRebindStoreFixture(role, layout, async f => {
+          const before = await readFile(f.path, "utf8");
+          const store = f.open({ onPublicationBoundary(at) { if (at === boundary) throw new Error("lost live publication reply"); } });
+          if (boundary === "after-write-before-rename") {
+            await assert.rejects(() => store.commitLiveRebind(f.request, recipient(role), f.auth), /lost live publication reply/);
+            assert.equal(await readFile(f.path, "utf8"), before);
+            assert.deepEqual(f.open().listLiveRebindings(), []);
+            assert.deepEqual(f.threads.listWorkspaceBindings()[0]?.target, f.request.binding.target);
+          } else {
+            const intent = await store.commitLiveRebind(f.request, recipient(role), f.auth);
+            assert.ok(intent, "An exact retained operation reconciles publication, not target equality");
+            assert.deepEqual(f.open().listLiveRebindings(), [intent]);
+            let target;
+            f.threads.withWorkspaceRestoreSnapshot(intent, snapshot => {
+              target = snapshot.workspaceBindings?.[0]?.target;
+              return undefined;
+            });
+            assert.deepEqual(target, f.request.target, "Read the canonical transaction, not a potentially stale warm projection");
+          }
+        });
+      });
+    }
+    test(`Live rebinding store rechecks authority at the actual rename boundary (${role}, ${layout})`, async () => {
+      await withLiveRebindStoreFixture(role, layout, async f => {
+        let current = true;
+        const auth = { ...f.auth, isCurrent: () => current && f.auth.isCurrent() };
+        const before = await readFile(f.path, "utf8");
+        const store = f.open({ onPublicationBoundary(at) { if (at === "after-write-before-rename") current = false; } });
+        assert.equal(await store.commitLiveRebind(f.request, recipient(role), auth), undefined);
+        assert.equal(await readFile(f.path, "utf8"), before, "A staged candidate cannot spend a revoked grant");
+        assert.deepEqual(f.open().listLiveRebindings(), []);
+      });
+    });
+    test(`Live rebinding store current-grant loss refuses commit and state transitions (${role}, ${layout})`, async () => {
+      await withLiveRebindStoreFixture(role, layout, async f => {
+        const before = await readFile(f.path, "utf8");
+        const stale = { ...f.auth, isCurrent: () => false };
+        assert.equal(await f.store.commitLiveRebind(f.request, recipient(role), stale), undefined);
+        assert.equal(await readFile(f.path, "utf8"), before);
+        const intent = (await f.store.commitLiveRebind(f.request, recipient(role), f.auth))!;
+        const rebound = await readFile(f.path, "utf8");
+        assert.equal(f.store.advanceLiveRebind(intent, "release", stale), undefined);
+        assert.equal(await readFile(f.path, "utf8"), rebound);
+        const replacement = { ...f.auth, executor: { ...f.auth.executor, leaderEpoch: "replacement-epoch" } };
+        assert.equal(f.store.advanceLiveRebind(intent, "release", replacement), undefined);
+        const ended = f.store.advanceLiveRebind(intent, "not-issued", replacement)!;
+        assert.ok(ended, "Current authority may end metadata without borrowing the old dispatch/delete grant");
+        assert.deepEqual(ended.executor, intent.executor);
+      });
+    });
+    for (const outcome of ["confirmed", "failed", "unknown", "not-issued"] as const) {
+      test(`Live rebinding store records terminal cleanup without journal proof (${role}, ${layout}, ${outcome})`, async () => {
+        await withLiveRebindStoreFixture(role, layout, async f => {
+          let value = (await f.store.commitLiveRebind(f.request, recipient(role), f.auth))!;
+          if (outcome !== "not-issued") value = f.store.advanceLiveRebind(value, "release", f.auth)!;
+          if (outcome === "confirmed" || outcome === "unknown") value = f.store.advanceLiveRebind(value, "issue-cleanup", f.auth)!;
+          const finished = f.store.advanceLiveRebind(value, outcome, f.auth)!;
+          assert.equal(finished.phase, "finished"); assert.equal(finished.cleanup, outcome);
+          assert.deepEqual(f.open().listLiveRebindings(), [finished]);
+          assert.deepEqual(f.threads.listWorkspaceBindings()[0]?.target, f.request.target);
+          assert.deepEqual(f.store.list(), []);
+        });
+      });
+    }
+  }
+}
+
+for (const layout of ["standalone", "consolidated"] as const) {
+  test(`Finished live cleanup leaves the strict temporary-tab cleanup gate unchanged (${layout})`, async () => {
+    await withLiveRebindStoreFixture("leader", layout, async f => {
+      let live = (await f.store.commitLiveRebind(f.request, recipient("leader"), f.auth))!;
+      live = f.store.advanceLiveRebind(live, "release", f.auth)!;
+      live = f.store.advanceLiveRebind(live, "issue-cleanup", f.auth)!;
+      assert.equal(f.store.advanceLiveRebind(live, "confirmed", f.auth)?.cleanup, "confirmed");
+      const input = { journalBindingKey: "temp-source", updateIds: [800] };
+      let entry = f.store.registerImplicitTemporaryThread(input, { chatId: 7, threadId: 55 }, "b".repeat(32), f.auth)!;
+      assert.ok(entry);
+      assert.equal(f.store.issueTemporaryThreadCleanup(entry, f.auth), undefined,
+        "A confirmed live cleanup cannot stand in for the temporary tab's own exact cancellation evidence");
+      assert.equal(f.store.recordTemporaryThreadInputCancellation(entry, input, f.auth, id => ({ journalBindingKey: input.journalBindingKey,
+        updateId: id, operatorAuthorityId: "telegram-owner:8" })), undefined, "Foreign operator evidence still refuses");
+      entry = f.store.recordTemporaryThreadInputCancellation(entry, input, f.auth, id => ({ journalBindingKey: input.journalBindingKey,
+        updateId: id, operatorAuthorityId: "telegram-owner:7" }))!;
+      const issued = f.store.issueTemporaryThreadCleanup(entry, f.auth)!;
+      assert.equal(issued.issued, true);
+      assert.equal(f.store.issueTemporaryThreadCleanup(issued.entry, f.auth), undefined, "The strict grant stays one-shot");
+      assert.deepEqual(f.store.listLiveRebindings().map(value => value.cleanup), ["confirmed"]);
+      assert.deepEqual(f.threads.listWorkspaceBindings()[0]?.target, f.request.target);
+    });
+  });
+}
+
+test("Live rebinding store consumes only target chooser metadata and preserves every saved input", async () => {
+  await fixture(async f => {
+    const path = join(dirname(f.path), "saved-input.json");
+    const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "live-store-fixture" });
+    const journal = createTelegramUpdateJournalStore({ path, profileName: "default", botIdentity });
+    journal.appendBatch([{ update_id: 100 }, { update_id: 101 }, { update_id: 102 }]);
+    const journalBindingKey = createTelegramUpdateJournalBindingKey({ path, profileName: "default", botIdentity });
+    const request = { ...f.request, source: { journalBindingKey, updateIds: [100] } };
+    let entry = f.store.registerImplicitTemporaryThread(request.source, request.target, "a".repeat(32), f.auth)!;
+    assert.ok(entry);
+    entry = f.store.recordTemporaryThreadInput(entry, { journalBindingKey, updateIds: [101, 102] }, f.auth)!;
+    assert.ok(entry);
+    const before = await readFile(path, "utf8");
+    const live = await f.store.commitLiveRebind(request, recipient("leader"), f.auth);
+    assert.ok(live);
+    assert.deepEqual(f.store.listTemporaryThreads(), [], "The new bound target is no longer a temporary chooser");
+    assert.equal(await readFile(path, "utf8"), before, "Chooser retirement cannot dispose of selected or sibling inputs");
+    assert.deepEqual(journal.read().entries.map(value => value.updateId), [100, 101, 102]);
+  });
+});
+
+for (const kind of ["reservation", "provision", "binding", "owner", "legacy", "forget"] as const) {
+  test(`Live rebinding store fences shared Workspace mutation and previous-runtime metadata (${kind})`, async () => {
+    await fixture(async f => {
+      const intent = (await f.store.commitLiveRebind(f.request, recipient("leader"), f.auth))!;
+      assert.ok(intent);
+      const before = await readFile(f.path, "utf8");
+      if (kind === "reservation") assert.throws(() => f.threads.reserveThread({ target: f.request.binding.target,
+        slot: "B", reason: "new-instance", createdAtMs: 1, updatedAtMs: 1 }), /Protected Workspace Restore/);
+      if (kind === "provision") assert.throws(() => f.threads.upsertPendingProvision({ id: "other", instanceId: "other",
+        owner: "manual-follower", target: f.request.target, startedAtMs: 1, expiresAtMs: 2 }), /Protected Workspace Restore/);
+      if (kind === "legacy") {
+        const legacyRequest = { ...f.request, operationId: "legacy", binding: f.threads.listWorkspaceBindings()[0]!,
+          owner: f.threads.list()[0]!, target: { chatId: 7, threadId: 43 } };
+        assert.equal(await f.store.commit(legacyRequest, f.auth), undefined);
+      }
+      if (kind === "binding") {
+        f.threads.upsertWorkspaceBinding({ ...f.threads.listWorkspaceBindings()[0]!, target: { chatId: 7, threadId: 99 } });
+        await assert.rejects(() => f.threads.persist(), /Protected Workspace Restore binding/);
+      }
+      if (kind === "owner") {
+        f.threads.upsert({ ...f.threads.list()[0]!, instanceId: "changed" });
+        await assert.rejects(() => f.threads.persist(), /Protected Workspace Restore owner/);
+      }
+      if (kind === "forget") {
+        const auth = { ...f.auth, executor: { ...f.auth.executor, instanceId: "new-runtime" } };
+        const forgotten = f.store.forgetPreviousWorld(auth)!;
+        assert.deepEqual(forgotten.liveRebindings, [intent]);
+        assert.deepEqual(f.store.listLiveRebindings(), []);
+        assert.deepEqual(f.threads.listWorkspaceBindings()[0]?.target, f.request.target);
+        return;
+      }
+      assert.equal(await readFile(f.path, "utf8"), before);
+    });
+  });
+}
+
+for (const layout of ["standalone", "consolidated"] as const) {
+  for (const boundary of ["current", "queued", "before-publication", "after-publication"] as const) {
+    test(`Guarded Workspace persistence fences caller authority (${layout}, ${boundary})`, async () => {
+      await withConsolidatedWorkspaceFixture(async f => {
+        f.owner.acquire({ cwd: "/repo" });
+        let current = true;
+        let armed = false;
+        const path = layout === "consolidated" ? f.rootPath : join(f.dir, "guarded-state.json");
+        const store = createTelegramTopicTargetStore({ path, telegramProfile: "default",
+          ...(layout === "consolidated" ? { consolidated: {
+            captureAuthority: f.consolidated.captureAuthority,
+            publishIfOwned: <T>(...args: Parameters<typeof f.consolidated.publishIfOwned<T>>) => {
+              if (armed && boundary === "before-publication") current = false;
+              const result = f.consolidated.publishIfOwned(...args);
+              if (armed && boundary === "after-publication") current = false;
+              return result;
+            },
+          } } : { commitPersist(commit) {
+            if (armed && boundary === "before-publication") current = false;
+            commit();
+            if (armed && boundary === "after-publication") current = false;
+            return true;
+          } }),
+        });
+        await store.load();
+        store.setBotState({ threadMode: "enabled" });
+        await store.persist();
+        const before = await readFile(path, "utf8");
+        store.setBotState({ threadMode: "disabled" });
+        armed = true;
+        const pending = store.persist(() => current);
+        if (boundary === "queued") current = false;
+        if (boundary === "current") await pending;
+        else await assert.rejects(pending, /authority|frame/);
+        const after = await readFile(path, "utf8");
+        if (boundary === "queued" || boundary === "before-publication") assert.equal(after, before);
+        else assert.notEqual(after, before);
+        // A lost post-publication result is not permission to roll back or reissue.
+        const reopened = createTelegramTopicTargetStore({ path, telegramProfile: "default",
+          ...(layout === "consolidated" ? { consolidated: f.consolidated } : {}),
+        });
+        await reopened.load();
+        assert.equal(reopened.getBotState()?.threadMode,
+          boundary === "queued" || boundary === "before-publication" ? "enabled" : "disabled");
+      });
+    });
+  }
+}
+
+for (const action of ["rename", "reset"] as const) for (const layout of ["standalone", "consolidated"] as const) {
+  for (const boundary of ["current", "no-display", "queued", "before-publication", "after-publication", "lost-before", "lost-after", "newer-local", "canonical-name", "newer-after-publication", "newer-title-after-publication"] as const) {
+    if ((action === "reset" && boundary === "no-display") || (action === "rename" && boundary === "newer-title-after-publication")) continue;
+    test(`Staged ${action === "reset" ? "reset " : ""}manual-name publication never leaves a refused dirty candidate (${layout}, ${boundary})`, async () => {
+      await withConsolidatedWorkspaceFixture(async f => {
+        f.owner.acquire({ cwd: "/repo" });
+        let current = true, armed = false, publications = 0;
+        const path = layout === "consolidated" ? f.rootPath : join(f.dir, "manual-name.json");
+        const beforePublication = () => {
+          if (!armed) return;
+          if (boundary === "before-publication") current = false;
+          if (boundary === "lost-before") throw new Error("Manual-name publication reply lost before issuance");
+          if (boundary === "canonical-name") {
+            const change = (value: Record<string, unknown>) => {
+              const record = (value.threads as Array<Record<string, unknown>>)[0]!;
+              record.manualThreadName = "Canonical";
+              const binding = (value.workspaceBindings as Array<Record<string, unknown>>)[0]!;
+              binding.manualThreadName = "Canonical"; binding.displayTitle = "Canonical";
+              return value;
+            };
+            if (layout === "consolidated") f.storage.capturePublication()!(value =>
+              ({ value: change(structuredClone(value) as Record<string, unknown>), result: true }));
+            else writeFileSync(path, `${JSON.stringify(change(JSON.parse(readFileSync(path, "utf8"))))}\n`);
+          }
+        };
+        const afterPublication = () => {
+          if (!armed) return;
+          publications++;
+          if (boundary === "after-publication") current = false;
+          if (boundary === "lost-after") throw new Error("Manual-name publication reply lost after issuance");
+          if (boundary === "newer-after-publication" || boundary === "newer-title-after-publication") {
+            if (boundary === "newer-after-publication") store.renameByTarget({ chatId: 7, threadId: 41 }, "Newer");
+            else store.setWorkspaceDisplayTitle(store.getWorkspaceBindingByTarget({ chatId: 7, threadId: 41 }, "first")!, "New title");
+            store.setBotState({ threadMode: "enabled" });
+          }
+        };
+        const store = createTelegramTopicTargetStore({ path, telegramProfile: "default", getNowMs: () => 3,
+          ...(layout === "consolidated" ? { consolidated: {
+            captureAuthority: f.consolidated.captureAuthority,
+            publishIfOwned: <T>(...args: Parameters<typeof f.consolidated.publishIfOwned<T>>) => {
+              beforePublication();
+              const result = f.consolidated.publishIfOwned(...args);
+              if (result.committed && result.result) afterPublication();
+              return result;
+            },
+          } } : { commitPersist(commit) {
+            beforePublication();
+            const before = existsSync(path) ? readFileSync(path, "utf8") : undefined;
+            commit();
+            if (readFileSync(path, "utf8") !== before) afterPublication();
+            return true;
+          } }),
+        });
+        await store.load();
+        const target = { chatId: 7, threadId: 41 };
+        for (const [sessionId, threadId, slot, name] of [["first", 41, "A", "Anchor"], ["second", 42, "B", "Beacon"]] as const) {
+          if (sessionId === "first") store.upsert({ owner: { kind: "leader", cwd: "/repo", instanceId: sessionId }, profileKey: sessionId,
+            instanceId: sessionId, target: { chatId: 7, threadId }, slot, threadName: name,
+            status: "active", createdAtMs: 1, updatedAtMs: 1 });
+          store.upsertWorkspaceBinding({ ...createTelegramWorkspaceBindingIdentity("/repo", slot === "A" ? 0 : 1, sessionId)!,
+            target: { chatId: 7, threadId }, slot, threadName: name, displayTitle: name, updatedAtMs: 1 });
+        }
+        if (action === "reset") store.renameByTarget(target, "Retained");
+        await store.persist();
+        const before = await readFile(path, "utf8");
+        const neighbor = store.getWorkspaceBindingByTarget({ chatId: 7, threadId: 42 }, "second");
+        const options = { updateDisplayTitle: boundary !== "no-display" };
+        armed = true;
+        const pending = action === "rename" ? store.renameByTargetAndPersist(target, "Navigator", options, () => current)
+          : store.clearManualNameByTargetAndPersist(target, "A", () => current);
+        target.threadId = 99; options.updateDisplayTitle = !options.updateDisplayTitle;
+        if (boundary === "queued") current = false;
+        if (boundary === "newer-local") {
+          store.renameByTarget({ chatId: 7, threadId: 41 }, "Newer");
+          store.setBotState({ threadMode: "enabled" });
+        }
+        if (boundary === "current" || boundary === "no-display") assert.equal((await pending)?.manualThreadName, action === "rename" ? "Navigator" : undefined);
+        else await assert.rejects(pending, /authority|frame|reply lost|changed|canonical/);
+        armed = false;
+        const committed = ["current", "no-display", "after-publication", "lost-after", "newer-after-publication", "newer-title-after-publication"].includes(boundary);
+        const committedName = action === "rename" ? "Navigator" : undefined;
+        const canonicalName = committed ? committedName : boundary === "canonical-name" ? "Canonical"
+          : action === "reset" ? "Retained" : undefined;
+        if (!committed && boundary !== "canonical-name") assert.equal(await readFile(path, "utf8"), before);
+        const reopen = () => createTelegramTopicTargetStore({ path, telegramProfile: "default",
+          ...(layout === "consolidated" ? { consolidated: f.consolidated } : {}) });
+        const canonical = reopen(); await canonical.load();
+        assert.equal(canonical.getWorkspaceBindingByTarget({ chatId: 7, threadId: 41 }, "first")?.manualThreadName,
+          canonicalName);
+        assert.deepEqual(canonical.getWorkspaceBindingByTarget({ chatId: 7, threadId: 42 }, "second"), neighbor);
+        assert.equal(publications, committed ? 1 : 0, "Unknown publication never issues another candidate");
+        if ((boundary === "newer-after-publication" || boundary === "newer-title-after-publication") && layout === "consolidated") {
+          await assert.rejects(store.persist(), /canonical snapshot changed/);
+          const newer = store.getWorkspaceBindingByTarget({ chatId: 7, threadId: 41 }, "first");
+          assert.equal(boundary === "newer-after-publication" ? newer?.manualThreadName : newer?.displayTitle,
+            boundary === "newer-after-publication" ? "Newer" : "New title",
+            "A stale base refuses publication without erasing newer local work or refreshing it away");
+          assert.equal(store.getBotState()?.threadMode, "enabled");
+          return;
+        }
+        // A clean ordinary read may observe an issued unknown fact; no selected effect is reconstructed.
+        await store.persist();
+        store.setBotState({ threadMode: "disabled" });
+        await store.persist();
+        const later = reopen(); await later.load();
+        const selected = later.getWorkspaceBindingByTarget({ chatId: 7, threadId: 41 }, "first");
+        assert.equal(selected?.manualThreadName, boundary === "newer-local" || boundary === "newer-after-publication" ? "Newer"
+          : canonicalName);
+        assert.equal(later.getActiveByInstanceId("first")?.manualThreadName, selected?.manualThreadName);
+        assert.equal(selected?.displayTitle, boundary === "newer-title-after-publication" ? "New title"
+          : boundary === "no-display" ? "Anchor" : selected?.manualThreadName ?? (action === "reset" && committed ? "A" : "Anchor"));
+        assert.deepEqual(later.getWorkspaceBindingByTarget({ chatId: 7, threadId: 42 }, "second"), neighbor);
+        assert.equal(later.getBotState()?.threadMode, "disabled", "Refused metadata does not freeze unrelated work");
+      });
+    });
+  }
+}
+
+
+for (const layout of ["standalone", "consolidated"] as const) {
+  test(`Staged reset refuses invalid or unavailable entry evidence without effects (${layout})`, async () => {
+    await withConsolidatedWorkspaceFixture(async f => {
+      f.owner.acquire({ cwd: "/repo" });
+      const path = layout === "consolidated" ? f.rootPath : join(f.dir, "reset-entry.json");
+      const store = createTelegramTopicTargetStore({ path, telegramProfile: "default",
+        ...(layout === "consolidated" ? { consolidated: f.consolidated } : {}) });
+      await store.load();
+      const target = { chatId: 7, threadId: 41 };
+      store.upsert({ owner: { kind: "leader", cwd: "/repo", instanceId: "first" }, profileKey: "first",
+        instanceId: "first", target, slot: "A", threadName: "Anchor", status: "active", createdAtMs: 1, updatedAtMs: 1 });
+      store.upsertWorkspaceBinding({ ...createTelegramWorkspaceBindingIdentity("/repo", 0, "first")!,
+        target, slot: "A", threadName: "Anchor", updatedAtMs: 1 });
+      store.renameByTarget(target, "Retained");
+      await store.persist();
+      const before = await readFile(path, "utf8"), inode = (await stat(path)).ino;
+      for (const [address, title, current] of [[target, "", true], [target, "A", false],
+        [{ chatId: 7, threadId: 99 }, "A", true]] as const) {
+        assert.equal(await store.clearManualNameByTargetAndPersist(address, title, () => current), undefined);
+      }
+      const binding = store.listWorkspaceBindings()[0]!;
+      store.upsertWorkspaceBinding({ ...binding, target: { chatId: 7, threadId: 99 } });
+      assert.equal(await store.clearManualNameByTargetAndPersist(target, "A", () => true), undefined);
+      assert.equal(store.getActiveByInstanceId("first")?.manualThreadName, "Retained");
+      assert.equal(await readFile(path, "utf8"), before);
+      assert.equal((await stat(path)).ino, inode, "Entry refusal publishes no read or candidate");
+      await store.refresh!();
+      assert.equal(store.getWorkspaceBindingByTarget(target, "first")?.manualThreadName, "Retained");
+    });
+  });
+}
+
+for (const action of ["rename", "reset"] as const) {
+for (const layout of ["standalone", "consolidated"] as const) {
+  for (const boundary of ["current", "scope", "local", "canonical", "unavailable", "retirement", "publication-frame", ...(action === "reset" ? ["result"] as const : [])] as const) {
+    test(`Read-only ${action} observation captures exact local/canonical identity (${layout}, ${boundary})`, async () => {
+      await withConsolidatedWorkspaceFixture(async f => {
+        f.owner.acquire({ cwd: "/repo" });
+        const scope = { path: layout === "consolidated" ? f.rootPath : join(f.dir, `${action}-observation.json`), profile: "default" };
+        const store = createTelegramTopicTargetStore({ path: () => scope.path, telegramProfile: () => scope.profile,
+          ...(layout === "consolidated" ? { consolidated: f.consolidated } : {}), getNowMs: () => 3 });
+        await store.load();
+        const target = { chatId: 7, threadId: 41 };
+        store.upsert({ owner: { kind: "leader", cwd: "/repo", instanceId: "first", telegramProfile: "default" }, profileKey: "first", instanceId: "first",
+          target, slot: "A", threadName: "Anchor", status: "active", createdAtMs: 1, updatedAtMs: 1 });
+        store.upsertWorkspaceBinding({ ...createTelegramWorkspaceBindingIdentity("/repo", 0, "session-first")!,
+          target, slot: "A", threadName: "Anchor", updatedAtMs: 1 });
+        store.upsertWorkspaceBinding({ ...createTelegramWorkspaceBindingIdentity("/repo", 1, "session-other")!,
+          target: { chatId: 7, threadId: 42 }, slot: "B", threadName: "Beacon", updatedAtMs: 1 });
+        if (action === "reset") store.renameByTarget(target, "Retained");
+        await store.persist();
+        const binding = store.listWorkspaceBindings()[0]!, owner = store.list()[0]!;
+        const capture = (binding: Parameters<typeof store.captureWorkspaceThreadRenameObservation>[0],
+          owner: Parameters<typeof store.captureWorkspaceThreadRenameObservation>[1]) => {
+          if (action === "rename") return store.captureWorkspaceThreadRenameObservation(binding, owner);
+          const observed = store.captureWorkspaceThreadResetObservation(binding, owner);
+          return (title?: string) => title === undefined ? observed.isCurrent() : observed.isResultCurrent(title);
+        };
+        const current = capture(binding, owner);
+        const bytes = await readFile(scope.path, "utf8"), inode = (await stat(scope.path)).ino;
+        const local = { records: store.list(), bindings: store.listWorkspaceBindings() };
+        assert.equal(current(), true);
+        assert.equal(await readFile(scope.path, "utf8"), bytes);
+        assert.equal((await stat(scope.path)).ino, inode, "Observation never publishes a read");
+        assert.deepEqual({ records: store.list(), bindings: store.listWorkspaceBindings() }, local);
+        const neighbor = store.listWorkspaceBindings()[1]!;
+        const writeCanonical = async (mutate: (file: Record<string, any>) => void) => {
+          const raw = JSON.parse(bytes);
+          mutate(layout === "consolidated" ? raw.profiles.default.workspace : raw);
+          await writeFile(scope.path, `${JSON.stringify(raw)}\n`, { mode: 0o600 });
+        };
+        if (boundary === "current") {
+          assert.equal(capture({ ...binding, sessionId: undefined }, owner)(), false);
+          assert.equal(capture(binding, { ...owner, profileKey: "foreign" })(), false);
+          assert.equal(capture(binding, { ...owner, status: "offline" })(), false);
+          binding.target.threadId = 99; binding.sessionId = "mutated"; owner.owner = { kind: "legacy", key: "mutated" };
+          assert.equal(current(), true, "Caller objects cannot redirect captured identity");
+          if (action === "reset") {
+            assert.equal(current("Retained"), false, "Present manual names are not reset-result authority");
+            store.clearManualNameByTarget(target, "A"); store.setBotState({ threadMode: "enabled" });
+            assert.equal(current(), true, "Intended metadata is not binding replacement");
+            assert.equal(current("A"), false, "Local reset cannot certify unpublished canonical absence/title");
+            await store.persist();
+            assert.equal(current("A"), true);
+            assert.equal(current("Older"), false);
+            const observed = store.captureWorkspaceThreadResetObservation(local.bindings[0]!, local.records[0]!);
+            for (const title of [undefined, "", " A ", "A\n", 1] as const)
+              assert.equal(observed.isResultCurrent(title as string), false, "Missing/invalid title is not identity-only authority");
+            store.setBotState({ threadMode: "disabled" });
+            assert.equal(current("A"), true, "Unrelated dirty work does not freeze observation");
+            store.upsert({ ...store.list()[0]!, threadName: "Generated" });
+            assert.equal(current("A"), true, "Generated identity is independent of the acknowledged automatic title");
+            assert.deepEqual(store.listWorkspaceBindings()[1], neighbor);
+            await writeCanonical(file => { file.workspaceBindings[0].manualThreadName = "Canonical";
+              file.threads[0].manualThreadName = "Canonical"; });
+            const changed = await readFile(scope.path, "utf8");
+            assert.equal(current(), true, "Name-only drift retains identity, not reset-result authority");
+            assert.equal(current("A"), false);
+            assert.equal(await readFile(scope.path, "utf8"), changed, "No canonical repair or publication");
+            assert.equal(store.getActiveByInstanceId("first")?.manualThreadName, undefined, "No local refresh");
+            return;
+          }
+          store.renameByTarget(target, "Newer"); store.setBotState({ threadMode: "enabled" });
+          assert.equal(current(), true, "Intended name metadata is not binding replacement");
+          assert.equal(current("Newer"), false, "Local name cannot certify unpublished canonical metadata");
+          await store.persist();
+          assert.equal(current(), true);
+          assert.equal(current("Newer"), true, "Optional result fence requires exact local and canonical names");
+          assert.equal(current("Older"), false);
+          assert.equal(store.getActiveByInstanceId("first")?.manualThreadName, "Newer");
+          assert.deepEqual(store.listWorkspaceBindings()[1], neighbor);
+          await writeCanonical(file => { file.workspaceBindings[0].manualThreadName = "Canonical";
+            file.threads[0].manualThreadName = "Canonical"; });
+          const changed = await readFile(scope.path, "utf8");
+          assert.equal(current(), true, "Name-only canonical drift retains identity, not result authority");
+          assert.equal(current("Newer"), false);
+          assert.equal(await readFile(scope.path, "utf8"), changed, "Result observation never repairs or publishes");
+          assert.equal(store.getActiveByInstanceId("first")?.manualThreadName, "Newer", "No projection refresh");
+        } else if (boundary === "scope") {
+          scope.profile = "other"; assert.equal(current(), false);
+          scope.profile = "default"; scope.path = join(f.dir, "absent.json"); assert.equal(current(), false);
+          assert.equal(existsSync(scope.path), false, "Missing scope is never created");
+        } else if (boundary === "local" || boundary === "canonical") {
+          for (const field of ["session", "slot", "target", "inactive", "owner", "status", "duplicate"] as const) {
+            if (boundary === "local") {
+              const originalBinding = local.bindings[0]!, originalOwner = local.records[0]!;
+              store.upsertWorkspaceBinding({ ...originalBinding,
+                ...(field === "session" ? createTelegramWorkspaceBindingIdentity("/repo", 0, "replacement")! : {}),
+                ...(field === "slot" ? { slot: "C" } : {}),
+                ...(field === "target" ? { target: { chatId: 7, threadId: 99 } } : {}),
+                ...(field === "inactive" ? { inactiveSinceMs: 2 } : {}) });
+              store.upsert({ ...originalOwner, ...(field === "owner" ? { instanceId: "replacement" } : {}),
+                ...(field === "status" ? { status: "offline" as const } : {}) });
+              if (field === "duplicate") store.upsertWorkspaceBinding({ ...neighbor, target });
+            } else await writeCanonical(file => {
+              const b = file.workspaceBindings[0], r = file.threads[0];
+              if (field === "session") Object.assign(b, createTelegramWorkspaceBindingIdentity("/repo", 0, "replacement")!);
+              if (field === "slot") b.slot = "C";
+              if (field === "target") b.target.threadId = 99;
+              if (field === "inactive") b.inactiveSinceMs = 2;
+              if (field === "owner") r.instanceId = "replacement";
+              if (field === "status") r.status = "offline";
+              if (field === "duplicate") file.workspaceBindings.push({ ...file.workspaceBindings[1], target });
+            });
+            assert.equal(current(), false, `${boundary} ${field} drift cannot borrow the address`);
+            if (boundary === "local") { await store.refresh!(); }
+          }
+        } else if (boundary === "unavailable") {
+          for (const field of ["missing-owner", "dropped-owner", "missing-binding", "dropped-retirement", "unsupported"] as const) {
+            await writeCanonical(file => {
+              if (field === "missing-owner") file.threads = [];
+              if (field === "dropped-owner") file.threads.push({ target });
+              if (field === "missing-binding") file.workspaceBindings = [];
+              if (field === "dropped-retirement") file.workspaceRetirements = [{}];
+              if (field === "unsupported") file.version = 9;
+            });
+            const damaged = await readFile(scope.path, "utf8");
+            assert.equal(current(), false, `Unavailable ${field} evidence refuses`);
+            assert.equal(await readFile(scope.path, "utf8"), damaged, "No reset or repair");
+            assert.deepEqual({ records: store.list(), bindings: store.listWorkspaceBindings() }, local, "No projection refresh");
+          }
+          await writeFile(scope.path, "broken", { mode: 0o600 }); assert.equal(current(), false);
+        } else if (boundary === "retirement") {
+          await writeCanonical(file => { file.workspaceRetirements = [{ id: "retire:rename", reason: "pressure",
+            profileKey: "default", binding: { ...file.workspaceBindings[0], inactiveSinceMs: 2 },
+            leaderEpoch: "leader:1", requestedAtMs: 3 }]; });
+          assert.equal(current(), false);
+        } else if (boundary === "result") {
+          assert.ok(await store.clearManualNameByTargetAndPersist(target, "A", () => current()));
+          const resetBytes = await readFile(scope.path, "utf8");
+          const resetInode = (await stat(scope.path)).ino;
+          const resetBinding = store.listWorkspaceBindings()[0]!, resetOwner = store.list()[0]!;
+          assert.equal(current("A"), true);
+          for (const side of ["local", "canonical"] as const) {
+            for (const field of ["owner-name", "binding-name", "title",
+              ...(side === "canonical" ? ["missing-title", "empty-owner-name", "null-binding-name", "space-title"] as const : [])] as const) {
+              if (side === "local") {
+                store.upsert({ ...resetOwner, ...(field === "owner-name" ? { manualThreadName: "Newer" } : {}) });
+                store.upsertWorkspaceBinding({ ...resetBinding,
+                  ...(field === "binding-name" ? { manualThreadName: "Newer" } : {}) });
+                if (field === "title") assert.equal(store.setWorkspaceDisplayTitle(resetBinding, "Newer title"), true);
+              } else {
+                const raw = JSON.parse(resetBytes), file = layout === "consolidated" ? raw.profiles.default.workspace : raw;
+                if (field === "owner-name") file.threads[0].manualThreadName = "Newer";
+                if (field === "binding-name") file.workspaceBindings[0].manualThreadName = "Newer";
+                if (field === "title") file.workspaceBindings[0].displayTitle = "Newer title";
+                if (field === "missing-title") delete file.workspaceBindings[0].displayTitle;
+                if (field === "empty-owner-name") file.threads[0].manualThreadName = "";
+                if (field === "null-binding-name") file.workspaceBindings[0].manualThreadName = null;
+                if (field === "space-title") file.workspaceBindings[0].displayTitle = " A ";
+                await writeFile(scope.path, `${JSON.stringify(raw)}\n`, { mode: 0o600 });
+              }
+              const retained = { records: store.list(), bindings: store.listWorkspaceBindings() };
+              const changedBytes = await readFile(scope.path, "utf8"), changedInode = (await stat(scope.path)).ino;
+              const lossless = field !== "empty-owner-name" && field !== "null-binding-name";
+              assert.equal(current(), lossless, `${side} ${field}: valid metadata retains identity; normalization cannot invent absence/title evidence`);
+              assert.equal(current("A"), false, `${side} ${field} drift refuses exact reset result`);
+              assert.equal(await readFile(scope.path, "utf8"), changedBytes);
+              assert.equal((await stat(scope.path)).ino, changedInode, "Observation writes no frame");
+              assert.deepEqual({ records: store.list(), bindings: store.listWorkspaceBindings() }, retained, "No refresh/dirty loss");
+              assert.deepEqual(store.listWorkspaceBindings()[1], neighbor);
+              if (side === "canonical") await writeFile(scope.path, resetBytes, { mode: 0o600 });
+              await store.refresh!();
+              assert.equal(current("A"), true, "Result observation is current, not a sticky failure or success");
+            }
+          }
+          assert.equal(await readFile(scope.path, "utf8"), resetBytes);
+          assert.equal((await stat(scope.path)).ino, resetInode);
+        } else {
+          let checks = 0;
+          const guard = () => { checks++; return current(); };
+          const renamed = action === "rename" ? await store.renameByTargetAndPersist(target, "Navigator", { updateDisplayTitle: true }, guard)
+            : await store.clearManualNameByTargetAndPersist(target, "A", guard);
+          assert.ok(renamed);
+          assert.equal(renamed.manualThreadName, action === "rename" ? "Navigator" : undefined);
+          assert.equal(current(action === "rename" ? "Navigator" : "A"), true);
+          assert.ok(checks > 1, "Observation remains callable inside native staged publication without another transaction");
+          assert.equal(current(), true);
+          assert.deepEqual(store.listWorkspaceBindings()[1], neighbor);
+        }
+      });
+    });
+  }
+}
+
+}
+
+for (const operation of ["rename", "reset"] as const) {
+  for (const boundary of ["capture-observation", "authority-observation", "result-observation", "authority-getter"] as const) {
+    for (const loss of ["caller", "session", ...(boundary === "result-observation" ? ["local", "canonical"] as const : [])] as const) {
+      test(`Thread name recipient refuses post-observation loss (${operation}, ${boundary}, ${loss})`, async () => {
+        await withWorkspaceRelocationFixture("leader", async (store, path) => {
+          const target = { chatId: 7, threadId: 10 }, context = {};
+          const authority: TelegramWorkspaceThreadRenameAuthority = {
+            context, sessionId: "session", sessionGeneration: 1, cwd: "/repo", profileName: "default",
+            botToken: "123:fixture", operatorUserId: 7, leaderEpoch: "epoch", ownsDirectDelivery: true,
+            followerRegistered: false, localTarget: target, localSlot: "A",
+          };
+          let armed = false, current = true, observations = 0;
+          let retained: { bytes: string; records: ReturnType<typeof store.list>; bindings: ReturnType<typeof store.listWorkspaceBindings> } | undefined;
+          const drift = () => {
+            if (!armed) return;
+            armed = false;
+            if (loss === "caller") current = false;
+            if (loss === "session") authority.sessionGeneration++;
+            if (loss === "local") store.upsert({ ...store.list()[0]!, status: "offline" });
+            if (loss === "canonical") {
+              const file = JSON.parse(readFileSync(path, "utf8"));
+              file.workspaceBindings[0].target.threadId = 99;
+              writeFileSync(path, JSON.stringify(file), { mode: 0o600 });
+            }
+            retained = { bytes: readFileSync(path, "utf8"), records: store.list(), bindings: store.listWorkspaceBindings() };
+          };
+          const observe = (read: () => boolean, result: boolean) => {
+            const value = read();
+            observations++;
+            if ((boundary === "result-observation") === result && boundary !== "authority-getter") drift();
+            return value;
+          };
+          const renameObservation = store.captureWorkspaceThreadRenameObservation;
+          store.captureWorkspaceThreadRenameObservation = (...args) => {
+            const read = renameObservation(...args);
+            return name => observe(() => read(name), name !== undefined);
+          };
+          const resetObservation = store.captureWorkspaceThreadResetObservation;
+          store.captureWorkspaceThreadResetObservation = (...args) => {
+            const read = resetObservation(...args);
+            return { isCurrent: () => observe(read.isCurrent, false),
+              isResultCurrent: title => observe(() => read.isResultCurrent(title), true) };
+          };
+          const deps = { store, instanceId: "old", target,
+            assertAuthority() { if (!current) throw new Error("Caller recipient revoked"); },
+            getAuthority() {
+              const value = { ...authority };
+              if (boundary === "authority-getter") drift();
+              return value;
+            } };
+          const prepare = () => operation === "rename"
+            ? createTelegramWorkspaceThreadRenameRecipient(deps) : createTelegramWorkspaceThreadResetRecipient(deps);
+          const originalBytes = await readFile(path, "utf8");
+          if (boundary === "capture-observation") {
+            armed = true;
+            assert.throws(prepare, /recipient|authority/u);
+          } else {
+            const recipient = prepare();
+            const result = operation === "rename"
+              ? await store.renameByTargetAndPersist(target, "Navigator", { updateDisplayTitle: true }, () => true)
+              : await store.clearManualNameByTargetAndPersist(target, "A", () => true);
+            assert.ok(result);
+            armed = true;
+            assert.throws(() => boundary === "result-observation"
+              ? (recipient.assertResult as (value: unknown) => void)(operation === "rename" ? result : "A")
+              : recipient.assertAuthority(), /recipient|authority/u);
+            assert.ok(retained, "Loss was observed at the intended boundary");
+            assert.equal(await readFile(path, "utf8"), retained.bytes, "Refusal never writes or rolls back published name metadata");
+            assert.deepEqual({ records: store.list(), bindings: store.listWorkspaceBindings() },
+              { records: retained.records, bindings: retained.bindings }, "Observation preserves newer dirty projections");
+          }
+          if (boundary === "capture-observation") assert.equal(await readFile(path, "utf8"), originalBytes);
+          assert.ok(observations > 0);
+          assert.equal(armed, false, "The intended synchronous boundary actually ran");
+        });
+      });
+    }
+  }
 }
 
 function openConsolidatedTopicStore(f: Parameters<Parameters<typeof withConsolidatedWorkspaceFixture>[0]>[0]) {
@@ -1527,25 +2454,6 @@ test("Thread store restores named-profile owner scope across persistence", async
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
-});
-
-test("Thread state path is transient and profile-aware", () => {
-  assert.equal(
-    getTelegramTopicTargetsPath("/agent"),
-    join("/agent", "tmp", "pi-telegram", "state.json"),
-  );
-  assert.equal(
-    getTelegramStatePath("/agent"),
-    getTelegramTopicTargetsPath("/agent"),
-  );
-  assert.equal(
-    getTelegramTopicTargetsPath("/agent", "omp"),
-    join("/agent", "tmp", "pi-telegram", "state.omp.json"),
-  );
-  assert.equal(
-    getTelegramStatePath("/agent", "omp"),
-    getTelegramTopicTargetsPath("/agent", "omp"),
-  );
 });
 
 test("Thread store persists dormant workspace bindings with exact cwd", async () => {
@@ -3546,36 +4454,6 @@ test("Thread store returns defensive copies and prunes offline/stale observation
   );
 });
 
-test("Thread cursor reconciliation preserves a live cursor and collision guards", () => {
-  const store = createTelegramTopicTargetStore({
-    path: "/tmp/unused-telegram-cursor-reconcile.json",
-    getNowMs: () => 1000,
-  });
-  store.upsert({
-    profileKey: "leader:/repo",
-    owner: { kind: "leader", cwd: "/repo", instanceId: "leader" },
-    target: { chatId: 7, threadId: 40 },
-    status: "active",
-    createdAtMs: 1,
-    updatedAtMs: 1,
-    instanceId: "leader",
-    slot: "D",
-  });
-  store.reserveThread({
-    target: { chatId: 7, threadId: 41 },
-    slot: "E",
-    reason: "leader-reload",
-    createdAtMs: 1,
-    updatedAtMs: 1,
-    expiresAtMs: 2000,
-  });
-  store.setBotState({ lastSlot: "D" });
-
-  assert.equal(reconcileTelegramFreshAllocationCursor(store, 1000), false);
-  assert.equal(store.getBotState().lastSlot, "D");
-  assert.equal(store.allocateSlot("manual:new"), "F");
-});
-
 test("Thread slot allocator preserves existing slots on reuse", () => {
   const store = createTelegramTopicTargetStore({
     path: "/tmp/unused-telegram-targets.json",
@@ -3991,6 +4869,110 @@ test("Thread store enforces one active target per live instance", () => {
   assert.equal(store.getByProfileKey("topic:1:11")?.status, "active");
   assert.equal(store.getByProfileKey("topic:1:11")?.instanceId, "inst-a");
 });
+
+function createGuardedThreadRenameFixture() {
+  const store = createTelegramTopicTargetStore({ path: "/unused/rename-state.json", getNowMs: () => 3 });
+  const target = { chatId: 7, threadId: 41 };
+  for (const [sessionId, threadId, slot, threadName] of [["first", 41, "A", "Anchor"], ["second", 42, "B", "Beacon"]] as const) {
+    store.upsert({ profileKey: sessionId, target: { chatId: 7, threadId }, instanceId: sessionId, slot,
+      threadName, status: "active", createdAtMs: 1, updatedAtMs: 1 });
+    store.upsertWorkspaceBinding({ ...createTelegramWorkspaceBindingIdentity("/repo", 0, sessionId)!,
+      target: { chatId: 7, threadId }, slot, threadName, displayTitle: threadName, updatedAtMs: 1 });
+  }
+  return { store, target, request: { target, threadName: "Navigator", slot: "A" },
+    snapshot: () => ({ records: store.list(), bindings: store.listWorkspaceBindings(), provisions: store.listPendingProvisions() }) };
+}
+
+for (const boundary of ["entry", "response", "local-publication", "no-display"] as const) {
+  test(`Guarded Thread rename refuses lost authority at ${boundary}`, async () => {
+    const f = createGuardedThreadRenameFixture(), before = f.snapshot();
+    let current = boundary !== "entry", edits = 0, publications = 0;
+    const renameByTarget = f.store.renameByTarget;
+    f.store.renameByTarget = (...args) => {
+      publications++; const result = renameByTarget(...args);
+      if (boundary === "local-publication") current = false;
+      return result;
+    };
+    const rename = createTelegramTopicTargetRenamer({ store: f.store,
+      assertAuthority() { if (!current) throw new Error("Rename recipient revoked"); },
+      shouldRenameDisplayedTitle() { if (boundary === "no-display") current = false; return boundary !== "no-display"; },
+      async callApi<TResponse>() { edits++; if (boundary === "response") current = false; return true as TResponse; },
+    });
+    await assert.rejects(rename(f.request), /Rename recipient revoked/);
+    assert.equal(edits, boundary === "entry" || boundary === "no-display" ? 0 : 1);
+    assert.equal(publications, boundary === "local-publication" ? 1 : 0);
+    if (boundary !== "local-publication") assert.deepEqual(f.snapshot(), before);
+    else assert.equal(f.store.getByProfileKey("first")?.manualThreadName, "Navigator", "Issued local publication is not rolled back after result loss");
+    assert.deepEqual(f.store.getByProfileKey("second"), before.records.find(record => record.instanceId === "second"));
+  });
+}
+
+test("Guarded Thread rename captures target, adapters and title policy across held API", async () => {
+  const f = createGuardedThreadRenameFixture(), held = Promise.withResolvers<void>();
+  const second = f.store.getWorkspaceBinding("/repo", "b", "second"), calls: unknown[] = [];
+  let checks = 0;
+  const guard = () => { checks++; };
+  const deps = { store: f.store, assertAuthority: guard, topicNameTemplate: "Pi {threadName}",
+    shouldRenameDisplayedTitle: () => true,
+    async callApi<TResponse>(method: string, body: Record<string, unknown>, options?: TelegramApiCallOptions) {
+      calls.push({ method, body }); assert.equal(options?.assertAuthority, guard); await held.promise; return true as TResponse;
+    },
+  };
+  const rename = createTelegramTopicTargetRenamer(deps), run = rename(f.request);
+  f.request.target.threadId = 42; f.request.threadName = "Wrong"; f.request.slot = "B";
+  deps.store = createTelegramTopicTargetStore({ path: "/unused/replacement.json" });
+  deps.callApi = async () => assert.fail("Cannot replace captured API");
+  deps.assertAuthority = () => assert.fail("Cannot replace captured authority");
+  deps.shouldRenameDisplayedTitle = () => false; deps.topicNameTemplate = "Wrong";
+  f.store.renameByTarget = () => assert.fail("Cannot replace captured local publication port");
+  held.resolve();
+  assert.equal((await run)?.manualThreadName, "Navigator");
+  assert.deepEqual(calls, [{ method: "editForumTopic", body: { chat_id: 7, message_thread_id: 41, name: "Pi Navigator" } }]);
+  assert.equal(f.store.getByProfileKey("first")?.manualThreadName, "Navigator");
+  assert.deepEqual(f.store.getWorkspaceBinding("/repo", "b", "second"), second);
+  assert.ok(checks >= 3);
+});
+
+for (const boundary of ["current", "entry", "response", "parsing", "retry-wait"] as const) {
+  test(`Guarded Thread rename composes store/direct/client at ${boundary}`, async () => {
+    const f = createGuardedThreadRenameFixture(), before = f.snapshot();
+    const originalFetch = globalThis.fetch, family = process.env.PI_TELEGRAM_NETWORK_FAMILY;
+    delete process.env.PI_TELEGRAM_NETWORK_FAMILY;
+    const requests: unknown[] = [], diagnostics: unknown[] = [];
+    let current = boundary !== "entry", sleeps = 0;
+    const guard = () => { if (!current) throw new Error("Rename recipient revoked"); };
+    globalThis.fetch = async (input, init) => {
+      assert.ok(String(input).endsWith("/editForumTopic")); requests.push(JSON.parse(String(init?.body)));
+      if (boundary === "response") current = false;
+      if (boundary === "retry-wait") return new Response(JSON.stringify({ ok: false, description: "Too Many Requests" }), { status: 429 });
+      const response = new Response(JSON.stringify({ ok: true, result: true }));
+      if (boundary === "parsing") response.text = async () => { current = false; return JSON.stringify({ ok: true, result: true }); };
+      return response;
+    };
+    const client = createTelegramApiClient(() => "123:fixture");
+    const direct = createTelegramBridgeApiRuntime({ client: { ...client,
+      call(method, body, options) {
+        assert.equal(options?.assertAuthority, guard);
+        return client.call(method, body, { ...options, sleep: async () => { sleeps++; current = false; } });
+      } }, tempDir: "/unused", maxFileSizeBytes: 1, tempFileMaxAgeMs: 1,
+      recordRuntimeEvent(_category, error) { diagnostics.push(error); },
+    });
+    try {
+      const run = createTelegramTopicTargetRenamer({ store: f.store, assertAuthority: guard, callApi: direct.call })(f.request);
+      if (boundary === "current") assert.equal((await run)?.manualThreadName, "Navigator");
+      else if (boundary === "entry") await assert.rejects(run, /Rename recipient revoked/);
+      else await assert.rejects(run, { name: "TelegramApiAuthorityError", requestIssued: true });
+      assert.deepEqual(requests, boundary === "entry" ? [] : [{ chat_id: 7, message_thread_id: 41, name: "Navigator" }]);
+      if (boundary !== "current") assert.deepEqual(f.snapshot(), before);
+      assert.equal(sleeps, boundary === "retry-wait" ? 1 : 0);
+      assert.equal(diagnostics.length, boundary === "current" || boundary === "entry" ? 0 : 1);
+      assert.deepEqual(f.store.getByProfileKey("second"), before.records.find(record => record.instanceId === "second"));
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (family === undefined) delete process.env.PI_TELEGRAM_NETWORK_FAMILY; else process.env.PI_TELEGRAM_NETWORK_FAMILY = family;
+    }
+  });
+}
 
 test("Thread renamer edits the Telegram topic and persists a manual override", async () => {
   const calls: unknown[] = [];
@@ -5401,40 +6383,6 @@ test("Thread identity resolver keeps status and prompt on registered local metad
       threadName: "Juno",
     },
   );
-});
-
-test("Thread helpers prefer follower and current store targets when resolving an instance thread target", () => {
-  const currentRecord = {
-    profileKey: "cwd:/repo",
-    target: { chatId: 7, threadId: 12 },
-    status: "active" as const,
-    createdAtMs: 1,
-    updatedAtMs: 1,
-    instanceId: "current",
-  };
-
-  assert.deepEqual(
-    resolveTelegramInstanceThreadTarget({
-      followerTarget: { chatId: 7, threadId: 11 },
-      leaderTarget: { chatId: 7, threadId: 10 },
-      currentRecord,
-    }),
-    { chatId: 7, threadId: 11 },
-  );
-  assert.deepEqual(
-    resolveTelegramInstanceThreadTarget({
-      leaderTarget: { chatId: 7, threadId: 10 },
-      currentRecord,
-    }),
-    { chatId: 7, threadId: 12 },
-  );
-  assert.deepEqual(
-    resolveTelegramInstanceThreadTarget({
-      leaderTarget: { chatId: 7, threadId: 10 },
-    }),
-    { chatId: 7, threadId: 10 },
-  );
-  assert.equal(resolveTelegramInstanceThreadTarget({}), undefined);
 });
 
 test("Leader thread state runtime owns target identity transitions", () => {

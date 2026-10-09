@@ -18,3 +18,7 @@ export declare function areTelegramTargetsEqual(left: TelegramTarget, right: Tel
 export declare function getTelegramTargetThreadParams(target: TelegramTarget): {
     message_thread_id?: number;
 };
+/** Pure wire parser for `{ chatId, threadId? }`; unknown fields are dropped and malformed shapes refuse. */
+export declare function parseTelegramTarget(value: unknown): TelegramTarget | undefined;
+/** Pure Bot API integer id parser accepting integer numbers or non-blank integer strings. */
+export declare function parseTelegramIntegerId(value: unknown): number | undefined;

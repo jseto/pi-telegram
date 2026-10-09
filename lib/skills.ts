@@ -8,8 +8,8 @@ import { existsSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { ExtensionAPI } from "./pi.ts";
 import { resolveAgentDir } from "./paths.ts";
+import type { ExtensionAPI } from "./pi.ts";
 
 const TELEGRAM_SKILLS_MODULE_PATH = fileURLToPath(import.meta.url);
 
@@ -18,7 +18,10 @@ export function getTelegramExtensionPackageRoot(modulePath: string): string {
   while (true) {
     if (existsSync(join(current, "package.json"))) {
       const parent = dirname(current);
-      if (basename(current) === "dist" && existsSync(join(parent, "package.json"))) {
+      if (
+        basename(current) === "dist" &&
+        existsSync(join(parent, "package.json"))
+      ) {
         return parent;
       }
       return current;
@@ -41,8 +44,10 @@ export function isRawTelegramExtensionCheckout(
   const packageRoot = resolve(getTelegramExtensionPackageRoot(modulePath));
   const agentDir = resolve(options.agentDir ?? resolveAgentDir());
   const cwd = resolve(options.cwd ?? process.cwd());
-  return dirname(packageRoot) === join(agentDir, "extensions") ||
-    dirname(packageRoot) === join(cwd, ".pi", "extensions");
+  return (
+    dirname(packageRoot) === join(agentDir, "extensions") ||
+    dirname(packageRoot) === join(cwd, ".pi", "extensions")
+  );
 }
 
 export const TELEGRAM_SKILLS_PATH = join(

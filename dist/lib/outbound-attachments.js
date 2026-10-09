@@ -8,10 +8,11 @@ import { basename } from "node:path";
 import { Type } from "@sinclair/typebox";
 import { isTelegramChannelPostValidationError, TelegramChannelPostValidationError, } from "./channel-posts.js";
 import { TELEGRAM_ATTACH_PROMPT_GUIDELINES, TELEGRAM_ATTACH_PROMPT_SNIPPET, TELEGRAM_MESSAGE_PROMPT_GUIDELINES, TELEGRAM_MESSAGE_PROMPT_SNIPPET, } from "./prompts.js";
-import { withTelegramReplyParameters, normalizeTelegramNativeMarkdown, } from "./replies.js";
+import { normalizeTelegramNativeMarkdown, withTelegramReplyParameters, } from "./replies.js";
 import { getTelegramTargetThreadParams, } from "./target.js";
 const MAX_ATTACHMENTS_PER_TURN = 10;
 export const TELEGRAM_OUTBOUND_ATTACHMENT_DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
+// Deliberately local: outbound attachment delivery stays decoupled from Bot API helpers.
 export function getTelegramOutboundAttachmentByteLimitFromEnv(env, names, defaultValue = TELEGRAM_OUTBOUND_ATTACHMENT_DEFAULT_MAX_BYTES) {
     for (const name of names) {
         const rawValue = env[name]?.trim();
@@ -102,8 +103,14 @@ export function createTelegramRichOutboundAttachmentSender(deps) {
         if (!plan)
             return false;
         try {
-            const result = await withTelegramReplyParameters(turn.chatId, turn.replyToMessageId, turn.target, (replyParameters) => deps.sendMultipart(plan.method, { ...plan.fields, ...(replyParameters ? { reply_parameters: JSON.stringify(replyParameters) } : {}) }, plan.fileField, plan.filePath, plan.fileName));
-            const messageId = result && typeof result === "object" &&
+            const result = await withTelegramReplyParameters(turn.chatId, turn.replyToMessageId, turn.target, (replyParameters) => deps.sendMultipart(plan.method, {
+                ...plan.fields,
+                ...(replyParameters
+                    ? { reply_parameters: JSON.stringify(replyParameters) }
+                    : {}),
+            }, plan.fileField, plan.filePath, plan.fileName));
+            const messageId = result &&
+                typeof result === "object" &&
                 Number.isInteger(result.message_id)
                 ? result.message_id
                 : undefined;
@@ -162,8 +169,16 @@ function formatTelegramOutboundAttachmentToolResultText(count, mode = "queued") 
     const verb = mode === "queued" ? "Queued" : "Sent";
     return ["", `${verb} ${count} Telegram attachment(s).`].join("\n");
 }
-function formatTelegramOutboundMessageToolResultText(chatId) {
-    return ["", `Sent Telegram message to ${chatId}.`].join("\n");
+function buildTelegramOutboundMessageToolResult(chatId, messageId) {
+    return {
+        content: [
+            {
+                type: "text",
+                text: ["", `Sent Telegram message to ${chatId}.`].join("\n"),
+            },
+        ],
+        details: { chatId, messageId },
+    };
 }
 function getTelegramMultipartTargetFields(target) {
     if (!target)
@@ -280,10 +295,9 @@ export function registerTelegramOutboundMessageTool(pi, deps) {
                 minLength: 1,
                 description: "Local single-file channel upload: .jpg/.jpeg/.png/.webp photo or .mp4 video; the text becomes its caption (max 1024 characters). Albums and other media types are rejected.",
             })),
-            chat_id: Type.Optional(Type.Union([
-                Type.Number(),
-                Type.String({ pattern: "^@[A-Za-z0-9_]{5,32}$" }),
-            ], { description: "Optional exact Telegram chat id or public channel @username" })),
+            chat_id: Type.Optional(Type.Union([Type.Number(), Type.String({ pattern: "^@[A-Za-z0-9_]{5,32}$" })], {
+                description: "Optional exact Telegram chat id or public channel @username",
+            })),
             thread_id: Type.Optional(Type.Number({
                 description: "Optional Telegram topic thread id with chat_id",
             })),
@@ -318,11 +332,12 @@ export function registerTelegramOutboundMessageTool(pi, deps) {
             }
             catch (error) {
                 const isChannelTarget = typeof params.chat_id === "string" || params.channel === true;
-                const reportableError = isChannelTarget &&
-                    !isTelegramChannelPostValidationError(error)
+                const reportableError = isChannelTarget && !isTelegramChannelPostValidationError(error)
                     ? new Error("Telegram channel publication failed; inspect the retained local record before retrying.")
                     : error;
-                deps.recordRuntimeEvent?.("message", reportableError, { phase: "direct" });
+                deps.recordRuntimeEvent?.("message", reportableError, {
+                    phase: "direct",
+                });
                 throw formatTelegramOutboundToolError(reportableError);
             }
         },
@@ -435,9 +450,7 @@ export async function deliverTelegramGuestCachedAttachment(options) {
         await options.answerGuestQuery(options.guestQueryId, result);
     }
     catch (error) {
-        if (!answerAttempted &&
-            options.answerGuestText &&
-            options.fallbackText) {
+        if (!answerAttempted && options.answerGuestText && options.fallbackText) {
             answerAttempted = true;
             await options.answerGuestText(options.guestQueryId, options.fallbackText);
         }
@@ -464,10 +477,14 @@ export async function sendTelegramOutboundMessage(options) {
     assertTelegramDirectDeliveryAllowed(options.canSendDirect);
     const activeTurn = options.getActiveTurn?.();
     if (typeof options.chatId === "string" || options.channel === true) {
-        if (!((typeof options.chatId === "string" && /^@[A-Za-z0-9_]{5,32}$/u.test(options.chatId)) ||
-            (typeof options.chatId === "number" && Number.isSafeInteger(options.chatId) && options.chatId < 0)) ||
+        if (!((typeof options.chatId === "string" &&
+            /^@[A-Za-z0-9_]{5,32}$/u.test(options.chatId)) ||
+            (typeof options.chatId === "number" &&
+                Number.isSafeInteger(options.chatId) &&
+                options.chatId < 0)) ||
             options.threadId !== undefined ||
-            options.target !== undefined || options.agentThread !== undefined) {
+            options.target !== undefined ||
+            options.agentThread !== undefined) {
             throw new Error("Telegram channel delivery requires one exact @username or negative numeric channel ID without a thread target.");
         }
         const plan = options.planMessage(options.text);
@@ -476,18 +493,13 @@ export async function sendTelegramOutboundMessage(options) {
                 throw new TelegramChannelPostValidationError("Telegram channel media delivery requires direct leader transport ownership and operation identity.");
             }
             const messageId = await options.sendChannelMediaMessage(options.chatId, options.media, plan.markdown, { operationId: options.operationId, replyMarkup: plan.replyMarkup });
-            return { content: [{ type: "text",
-                        text: formatTelegramOutboundMessageToolResultText(options.chatId) }],
-                details: { chatId: options.chatId, messageId } };
+            return buildTelegramOutboundMessageToolResult(options.chatId, messageId);
         }
         if (!options.sendChannelMarkdownMessage || !options.operationId) {
             throw new Error("Telegram channel delivery requires direct leader transport ownership and operation identity.");
         }
-        const messageId = await options.sendChannelMarkdownMessage(options.chatId, plan.markdown, { operationId: options.operationId,
-            replyMarkup: plan.replyMarkup });
-        return { content: [{ type: "text",
-                    text: formatTelegramOutboundMessageToolResultText(options.chatId) }],
-            details: { chatId: options.chatId, messageId } };
+        const messageId = await options.sendChannelMarkdownMessage(options.chatId, plan.markdown, { operationId: options.operationId, replyMarkup: plan.replyMarkup });
+        return buildTelegramOutboundMessageToolResult(options.chatId, messageId);
     }
     if (options.media !== undefined) {
         throw new TelegramChannelPostValidationError("telegram_message media uploads require channel delivery with an exact @username or negative numeric channel ID and channel: true.");
@@ -499,7 +511,7 @@ export async function sendTelegramOutboundMessage(options) {
         : activeTurn &&
             options.resolveAgentTarget &&
             options.routeAgentMessage &&
-            ((options.target?.threadId !== undefined) ||
+            (options.target?.threadId !== undefined ||
                 (options.chatId !== undefined && options.threadId !== undefined))
             ? {
                 chatId: options.target?.chatId ?? options.chatId,
@@ -547,15 +559,7 @@ export async function sendTelegramOutboundMessage(options) {
             text: options.text,
         });
     }
-    return {
-        content: [
-            {
-                type: "text",
-                text: formatTelegramOutboundMessageToolResultText(chatId),
-            },
-        ],
-        details: { chatId, messageId },
-    };
+    return buildTelegramOutboundMessageToolResult(chatId, messageId);
 }
 export async function sendTelegramOutboundFiles(options) {
     assertTelegramDirectDeliveryAllowed(options.canSendDirect);
@@ -599,7 +603,8 @@ export function createTelegramQueuedOutboundAttachmentSender(deps) {
     return async (turn, options) => {
         await sendQueuedTelegramOutboundAttachments(turn, {
             ...deps,
-            isDeliveryActive: () => deps.isDeliveryActive?.() !== false && options?.isDeliveryActive?.() !== false,
+            isDeliveryActive: () => deps.isDeliveryActive?.() !== false &&
+                options?.isDeliveryActive?.() !== false,
             maxAttachmentSizeBytes: deps.maxAttachmentSizeBytes ?? TELEGRAM_OUTBOUND_ATTACHMENT_MAX_BYTES,
         });
     };
@@ -622,7 +627,9 @@ export async function sendQueuedTelegramOutboundAttachments(turn, deps) {
             const fieldName = isPhoto ? "photo" : "document";
             await withTelegramReplyParameters(turn.chatId, turn.replyToMessageId, turn.target, (replyParameters) => deps.sendMultipart(method, {
                 chat_id: String(turn.chatId),
-                ...(replyParameters ? { reply_parameters: JSON.stringify(replyParameters) } : {}),
+                ...(replyParameters
+                    ? { reply_parameters: JSON.stringify(replyParameters) }
+                    : {}),
                 ...getTelegramMultipartTargetFields(turn.target),
             }, fieldName, attachment.path, attachment.fileName));
         }

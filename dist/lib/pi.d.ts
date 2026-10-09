@@ -42,6 +42,8 @@ export interface PiSettingsManager {
 }
 export type PiSlashCommandInfo = SlashCommandInfo;
 export type PiRunMode = "tui" | "rpc" | "json" | "print";
+/** Pi rejects a context captured before session replacement with a stale-context error; this is not a domain failure. */
+export declare function isPiStaleContextError(error: unknown): boolean;
 export declare function getExtensionContextMode(ctx: unknown): PiRunMode | undefined;
 export declare function isExtensionContextPassiveRunMode(ctx: unknown): boolean;
 export declare function canStartPollingInExtensionContext(ctx: unknown): boolean;

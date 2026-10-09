@@ -16,6 +16,11 @@ import {
   type TelegramModelSwitchContinuationSource,
   type ThinkingLevel,
 } from "./model.ts";
+import type { TelegramTarget } from "./target.ts";
+import {
+  TelegramApiAuthorityError,
+  type TelegramApiCallOptions,
+} from "./telegram-api.ts";
 
 const TELEGRAM_MODEL_MENU_CACHE_TTL_MS = 5000;
 const TELEGRAM_MODEL_MENU_STATE_TTL_MS = 10 * 60 * 1000;
@@ -141,8 +146,70 @@ export interface TelegramMenuMessageRuntimeDeps {
     text: string,
     mode: "markdown" | "html" | "plain",
     replyMarkup: TelegramReplyMarkup,
-    options?: { target?: { chatId: number; threadId?: number } },
+    options?: { target?: TelegramTarget } & Pick<
+      TelegramApiCallOptions,
+      "assertAuthority"
+    >,
   ) => Promise<number | undefined>;
+}
+
+/** Per-open delivery lifetime; never retain this guard in stored callback state. */
+export function createTelegramMenuDelivery<TModel extends MenuModel>(
+  target: TelegramTarget,
+  options: Pick<TelegramApiCallOptions, "assertAuthority"> | undefined,
+  deps: Pick<TelegramMenuMessageRuntimeDeps, "sendInteractiveMessage"> & {
+    storeModelMenuState: (state: TelegramModelMenuState<TModel>) => void;
+  },
+) {
+  const assertAuthority = options?.assertAuthority,
+    capturedTarget = { ...target };
+  const sendInteractiveMessage = deps.sendInteractiveMessage,
+    storeModelMenuState = deps.storeModelMenuState;
+  let requestIssued = false;
+  const assertCurrent = () => {
+    try {
+      assertAuthority?.();
+    } catch {
+      throw new TelegramApiAuthorityError(requestIssued);
+    }
+  };
+  assertCurrent();
+  return {
+    assertCurrent,
+    assertAuthority,
+    sendInteractiveMessage: async (
+      ...args: Parameters<
+        TelegramMenuMessageRuntimeDeps["sendInteractiveMessage"]
+      >
+    ) => {
+      assertCurrent();
+      const [chatId, text, mode, replyMarkup, sendOptions] = args;
+      const messageId = await sendInteractiveMessage(
+        assertAuthority ? capturedTarget.chatId : chatId,
+        text,
+        mode,
+        replyMarkup,
+        assertAuthority
+          ? { ...sendOptions, target: { ...capturedTarget }, assertAuthority }
+          : sendOptions,
+      );
+      requestIssued = true;
+      assertCurrent();
+      return messageId;
+    },
+    storeModelMenuState: (state: TelegramModelMenuState<TModel>) => {
+      assertCurrent();
+      if (
+        assertAuthority &&
+        (state.chatId !== capturedTarget.chatId ||
+          state.threadId !== capturedTarget.threadId)
+      ) {
+        throw new TelegramApiAuthorityError(requestIssued);
+      }
+      storeModelMenuState(state);
+      assertCurrent();
+    },
+  };
 }
 
 export type TelegramModelMenuCallbackDeps<
@@ -322,7 +389,8 @@ function applyTelegramMenuRenderPayload(
   return payload;
 }
 
-async function editTelegramMenuMessage(
+/** Apply the payload mode to state, then edit the existing menu message in place. */
+export async function editTelegramMenuMessage(
   state: TelegramModelMenuState,
   payload: TelegramMenuRenderPayload,
   deps: TelegramMenuMessageRuntimeDeps,
@@ -337,7 +405,8 @@ async function editTelegramMenuMessage(
   );
 }
 
-function sendTelegramMenuMessage(
+/** Apply the payload mode to state, then send a fresh menu message to its exact chat/Thread. */
+export function sendTelegramMenuMessage(
   state: TelegramModelMenuState,
   payload: TelegramMenuRenderPayload,
   deps: TelegramMenuMessageRuntimeDeps,
@@ -661,9 +730,9 @@ function applyTelegramModelDetailSelection(
   return "changed";
 }
 
-function getTelegramSelectedDetailModel<
-  TModel extends MenuModel = MenuModel,
->(state: TelegramModelMenuState<TModel>): TelegramMenuSelectionResult<TModel> {
+function getTelegramSelectedDetailModel<TModel extends MenuModel = MenuModel>(
+  state: TelegramModelMenuState<TModel>,
+): TelegramMenuSelectionResult<TModel> {
   const indexedSelection = getTelegramModelSelection(
     state,
     state.selectedModelIndex?.toString(),
@@ -810,7 +879,7 @@ export function buildTelegramModelCallbackPlan<
       action.value,
     );
     if (detailResult === "invalid") {
-      return { kind: "answer", text: "Selected model is no longer available." };
+      return { kind: "answer", text: "Selected model is no longer available" };
     }
     return { kind: "update-menu" };
   }
@@ -822,12 +891,12 @@ export function buildTelegramModelCallbackPlan<
     if (params.state.canMutateScope === false) {
       return {
         kind: "answer",
-        text: "Model scope is controlled by CLI --models.",
+        text: "Model scope is controlled by CLI --models",
       };
     }
     const selectionResult = getTelegramSelectedDetailModel(params.state);
     if (selectionResult.kind !== "selected") {
-      return { kind: "answer", text: "Selected model is no longer available." };
+      return { kind: "answer", text: "Selected model is no longer available" };
     }
     const model = selectionResult.selection.model;
     const enabled =
@@ -854,10 +923,10 @@ export function buildTelegramModelCallbackPlan<
       ? getTelegramSelectedDetailModel(params.state)
       : getTelegramModelSelection(params.state, action.value);
   if (selectionResult.kind === "invalid") {
-    return { kind: "answer", text: "Invalid model selection." };
+    return { kind: "answer", text: "Invalid model selection" };
   }
   if (selectionResult.kind === "missing") {
-    return { kind: "answer", text: "Selected model is no longer available." };
+    return { kind: "answer", text: "Selected model is no longer available" };
   }
   const selection = selectionResult.selection;
   if (modelsMatch(selection.model, params.activeModel)) {
@@ -877,7 +946,7 @@ export function buildTelegramModelCallbackPlan<
     if (!params.canRestartBusyRun) {
       return {
         kind: "answer",
-        text: "Pi is busy. Send /abort, /next, or /stop.",
+        text: "Pi is busy. Send /abort, /next, or /stop",
       };
     }
     return {
@@ -940,7 +1009,7 @@ export async function handleTelegramModelMenuCallbackAction<
     if (!deps.persistScopedModelPatterns) {
       await deps.answerCallbackQuery(
         callbackQueryId,
-        "Scoped model persistence is unavailable.",
+        "Scoped model persistence is unavailable",
       );
       return true;
     }
@@ -959,7 +1028,7 @@ export async function handleTelegramModelMenuCallbackAction<
   }
   const changed = await deps.setModel(plan.selection.model);
   if (changed === false) {
-    await deps.answerCallbackQuery(callbackQueryId, "Model is not available.");
+    await deps.answerCallbackQuery(callbackQueryId, "Model is not available");
     return true;
   }
   deps.setCurrentModel(plan.selection.model);
@@ -991,7 +1060,7 @@ export async function handleTelegramModelMenuCallbackAction<
     if (!restarted) {
       await deps.answerCallbackQuery(
         callbackQueryId,
-        "Pi is busy. Send /abort, /next, or /stop.",
+        "Pi is busy. Send /abort, /next, or /stop",
       );
       return true;
     }
@@ -1100,9 +1169,7 @@ function buildModelDetailMenuReplyMarkup(
   };
 }
 
-function buildModelDetailMenuText(
-  state: TelegramModelMenuState,
-): string {
+function buildModelDetailMenuText(state: TelegramModelMenuState): string {
   const selection = getTelegramSelectedDetailModel(state);
   if (selection.kind !== "selected") return MODEL_DETAIL_MENU_TITLE;
   const model = selection.selection.model;

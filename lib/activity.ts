@@ -20,10 +20,7 @@ import {
 const TELEGRAM_ACTIVITY_REGISTRY_KEY = "__piTelegramActivityRegistry__";
 
 export type TelegramActivitySource =
-  | "telegram"
-  | "local"
-  | "autonomous"
-  | "unknown";
+  "telegram" | "local" | "autonomous" | "unknown";
 
 export type TelegramActivityTarget = Readonly<TelegramDeliveryTarget>;
 
@@ -38,61 +35,61 @@ export interface TelegramActivityEnvelope {
 
 export type TelegramActivityPayload =
   | { type: "agent-start" }
-    | {
-        type: "assistant-text-delta";
-        contentIndex: number;
-        delta: string;
-      }
-    | {
-        type: "assistant-segment";
-        contentIndex: number;
-        text: string;
-        placement: "intermediate" | "final" | "terminal-partial";
-      }
-    | {
-        type: "reasoning-delta";
-        contentIndex: number;
-        delta: string;
-      }
-    | {
-        type: "reasoning-end";
-        contentIndex: number;
-        text: string;
-      }
-    | {
-        type: "tool-start";
-        toolCallId: string;
-        toolName: string;
-        args: unknown;
-      }
-    | {
-        type: "tool-update";
-        toolCallId: string;
-        toolName: string;
-        update: unknown;
-      }
-    | {
-        type: "tool-end";
-        toolCallId: string;
-        toolName: string;
-        result: unknown;
-        isError: boolean;
-      }
-    | {
-        type: "compaction-start";
-        reason: "manual" | "threshold" | "overflow" | "unknown";
-      }
-    | {
-        type: "compaction-end";
-        reason: "manual" | "threshold" | "overflow" | "unknown";
-      }
-    | {
-        type: "ui-prompt-start";
-        kind: "select" | "confirm" | "input" | "editor" | "custom";
-        title?: string;
-      }
-    | { type: "ui-prompt-end" }
-    | { type: "agent-end" }
+  | {
+      type: "assistant-text-delta";
+      contentIndex: number;
+      delta: string;
+    }
+  | {
+      type: "assistant-segment";
+      contentIndex: number;
+      text: string;
+      placement: "intermediate" | "final" | "terminal-partial";
+    }
+  | {
+      type: "reasoning-delta";
+      contentIndex: number;
+      delta: string;
+    }
+  | {
+      type: "reasoning-end";
+      contentIndex: number;
+      text: string;
+    }
+  | {
+      type: "tool-start";
+      toolCallId: string;
+      toolName: string;
+      args: unknown;
+    }
+  | {
+      type: "tool-update";
+      toolCallId: string;
+      toolName: string;
+      update: unknown;
+    }
+  | {
+      type: "tool-end";
+      toolCallId: string;
+      toolName: string;
+      result: unknown;
+      isError: boolean;
+    }
+  | {
+      type: "compaction-start";
+      reason: "manual" | "threshold" | "overflow" | "unknown";
+    }
+  | {
+      type: "compaction-end";
+      reason: "manual" | "threshold" | "overflow" | "unknown";
+    }
+  | {
+      type: "ui-prompt-start";
+      kind: "select" | "confirm" | "input" | "editor" | "custom";
+      title?: string;
+    }
+  | { type: "ui-prompt-end" }
+  | { type: "agent-end" }
   | { type: "agent-settled" };
 
 export type TelegramActivityEvent = TelegramActivityEnvelope &
@@ -135,8 +132,7 @@ export interface TelegramActivityHandlerRegistration {
   ) => void | Promise<void>;
 }
 
-interface RegisteredTelegramActivityHandler
-  extends TelegramActivityHandlerRegistration {
+interface RegisteredTelegramActivityHandler extends TelegramActivityHandlerRegistration {
   id: string;
   order: number;
 }
@@ -257,10 +253,7 @@ function canCoalesceActivityEvents(
   previous: TelegramActivityEvent,
   next: TelegramActivityEvent,
 ): boolean {
-  if (
-    previous.activityId !== next.activityId ||
-    previous.type !== next.type
-  ) {
+  if (previous.activityId !== next.activityId || previous.type !== next.type) {
     return false;
   }
   if (
@@ -269,10 +262,7 @@ function canCoalesceActivityEvents(
   ) {
     return previous.contentIndex === next.contentIndex;
   }
-  if (
-    previous.type === "reasoning-delta" &&
-    next.type === "reasoning-delta"
-  ) {
+  if (previous.type === "reasoning-delta" && next.type === "reasoning-delta") {
     return previous.contentIndex === next.contentIndex;
   }
   if (previous.type === "tool-update" && next.type === "tool-update") {
@@ -291,10 +281,7 @@ function coalesceActivityEvents(
   ) {
     return { ...next, delta: previous.delta + next.delta };
   }
-  if (
-    previous.type === "reasoning-delta" &&
-    next.type === "reasoning-delta"
-  ) {
+  if (previous.type === "reasoning-delta" && next.type === "reasoning-delta") {
     return { ...next, delta: previous.delta + next.delta };
   }
   return next;
@@ -302,18 +289,21 @@ function coalesceActivityEvents(
 
 /** @internal */
 export interface TelegramActivityDispatcher {
+  hasPending?: () => boolean;
   dispatch: (event: TelegramActivityEvent) => void;
   stop: () => void;
 }
 
 /** @internal */
-export function createTelegramActivityDispatcher(deps: {
-  recordFailure?: (
-    handlerId: string,
-    event: TelegramActivityEvent,
-    error: unknown,
-  ) => void;
-} = {}): TelegramActivityDispatcher {
+export function createTelegramActivityDispatcher(
+  deps: {
+    recordFailure?: (
+      handlerId: string,
+      event: TelegramActivityEvent,
+      error: unknown,
+    ) => void;
+  } = {},
+): TelegramActivityDispatcher {
   const queues = new Map<string, TelegramActivityHandlerQueue>();
   let stopped = false;
   const drain = async (queue: TelegramActivityHandlerQueue): Promise<void> => {
@@ -335,12 +325,14 @@ export function createTelegramActivityDispatcher(deps: {
         try {
           await queue.registration.handle(
             event,
-            createTelegramActivityContext(event, () =>
-              queue.active &&
-              !stopped &&
-              getOrCreateTelegramActivityRegistry().handlers.get(
-                queue.registration.id,
-              ) === queue.registration,
+            createTelegramActivityContext(
+              event,
+              () =>
+                queue.active &&
+                !stopped &&
+                getOrCreateTelegramActivityRegistry().handlers.get(
+                  queue.registration.id,
+                ) === queue.registration,
             ),
           );
         } catch (error) {
@@ -352,6 +344,10 @@ export function createTelegramActivityDispatcher(deps: {
     }
   };
   return {
+    hasPending: () =>
+      Array.from(queues.values()).some(
+        (queue) => queue.active && (queue.running || queue.events.length > 0),
+      ),
     dispatch(event) {
       if (stopped) return;
       for (const registration of getTelegramActivityHandlers()) {
@@ -405,6 +401,7 @@ export function createTelegramActivityBridgeRuntime(deps: {
   let runtime: TelegramActivityRuntime | undefined;
   const getRuntime = (): TelegramActivityRuntime | undefined => runtime;
   return {
+    hasPending: () => getRuntime()?.hasPending?.(),
     onSessionStart() {
       runtime?.onSessionShutdown();
       runtime = createTelegramActivityRuntime({
@@ -470,10 +467,7 @@ export function createTelegramActivityBridgeRuntime(deps: {
 }
 
 export type TelegramActivityInputSource =
-  | "interactive"
-  | "rpc"
-  | "extension"
-  | "unknown";
+  "interactive" | "rpc" | "extension" | "unknown";
 
 export type TelegramAssistantStreamEvent =
   | { type: "start" }
@@ -491,9 +485,13 @@ export type TelegramAssistantStreamEvent =
 
 /** @internal */
 export interface TelegramActivityRuntime {
+  hasPending?: () => boolean | undefined;
   onSessionStart?: () => void;
   recordInputSource: (source: TelegramActivityInputSource) => void;
-  onAgentStart: (activeTelegramTarget?: TelegramActivityTarget, replyToMessageId?: number) => void;
+  onAgentStart: (
+    activeTelegramTarget?: TelegramActivityTarget,
+    replyToMessageId?: number,
+  ) => void;
   onAssistantEvent: (event: TelegramAssistantStreamEvent) => void;
   onAssistantMessageEnd: (stopReason?: string) => void;
   onToolStart: (event: {
@@ -586,7 +584,9 @@ export function createTelegramActivityRuntime(deps: {
       sequence,
       source: activitySource,
       ...(activityTarget ? { target: activityTarget } : {}),
-      ...(activityReplyToMessageId !== undefined ? { replyToMessageId: activityReplyToMessageId } : {}),
+      ...(activityReplyToMessageId !== undefined
+        ? { replyToMessageId: activityReplyToMessageId }
+        : {}),
       timestamp: now(),
     } as TelegramActivityEvent;
     try {
@@ -628,13 +628,15 @@ export function createTelegramActivityRuntime(deps: {
     if (shouldClearActivity) clearActivity();
   };
   return {
+    hasPending: () => deps.dispatcher.hasPending?.(),
     recordInputSource(source) {
       pendingInputSource = source;
     },
     onAgentStart(activeTelegramTarget, replyToMessageId) {
       abandonCompaction();
       ensureActivity(activeTelegramTarget);
-      activityReplyToMessageId = activitySource === "telegram" ? replyToMessageId : undefined;
+      activityReplyToMessageId =
+        activitySource === "telegram" ? replyToMessageId : undefined;
       emit({ type: "agent-start" });
     },
     onAssistantEvent(event) {
@@ -750,21 +752,33 @@ export interface TelegramActivityPublicationReservation {
   cancel: () => void;
 }
 
+export interface TelegramActivityPublicationWork {
+  settle(outcome: "settled" | "unconfirmed"): void;
+}
+
 export interface TelegramActivityPublicationRuntime {
   enqueue: (task: () => Promise<void>) => Promise<void>;
   reserve: () => TelegramActivityPublicationReservation;
+  hasPending: () => boolean;
+  /** Observation only; detached work never occupies the ordered publication tail. */
+  beginWork: () => TelegramActivityPublicationWork;
+  hasUnconfirmed: () => boolean;
   reset: () => void;
 }
 
 export function createTelegramActivityPublicationRuntime(): TelegramActivityPublicationRuntime {
   let generation = 0;
   let tail = Promise.resolve();
+  let outstanding = 0,
+    unconfirmed = false;
   const pending = new Set<() => void>();
   const reserve = (): TelegramActivityPublicationReservation => {
     const admittedGeneration = generation;
     let state: "pending" | "published" | "cancelled" = "pending";
     let resolve!: (task: (() => Promise<void>) | undefined) => void;
-    const ready = new Promise<(() => Promise<void>) | undefined>((accept) => { resolve = accept; });
+    const ready = new Promise<(() => Promise<void>) | undefined>((accept) => {
+      resolve = accept;
+    });
     const cancel = () => {
       if (state !== "pending") return;
       state = "cancelled";
@@ -772,15 +786,23 @@ export function createTelegramActivityPublicationRuntime(): TelegramActivityPubl
       resolve(undefined);
     };
     pending.add(cancel);
-    const result = tail.then(async () => {
-      const task = await ready;
-      if (admittedGeneration === generation && task) await task();
-    });
+    outstanding += 1;
+    const result = tail
+      .then(async () => {
+        const task = await ready;
+        if (admittedGeneration === generation && task) await task();
+      })
+      .finally(() => {
+        outstanding -= 1;
+      });
     tail = result.catch(() => {});
     return {
       publish(task) {
         if (state === "cancelled") return result;
-        if (state === "published") return Promise.reject(new Error("Publication reservation already published."));
+        if (state === "published")
+          return Promise.reject(
+            new Error("Publication reservation already published."),
+          );
         state = "published";
         pending.delete(cancel);
         resolve(task);
@@ -792,8 +814,25 @@ export function createTelegramActivityPublicationRuntime(): TelegramActivityPubl
   return {
     reserve,
     enqueue: (task) => reserve().publish(task),
+    hasPending: () => outstanding > 0,
+    hasUnconfirmed: () => unconfirmed,
+    beginWork() {
+      const admittedGeneration = generation;
+      let settled = false;
+      outstanding += 1;
+      return {
+        settle(outcome) {
+          if (settled) return;
+          settled = true;
+          outstanding -= 1;
+          if (outcome === "unconfirmed" && admittedGeneration === generation)
+            unconfirmed = true;
+        },
+      };
+    },
     reset() {
       generation += 1;
+      unconfirmed = false;
       for (const cancel of pending) cancel();
       tail = Promise.resolve();
     },
@@ -816,8 +855,12 @@ export interface TelegramAssistantOutputPreparation {
   settle: () => void;
 }
 
-export function createTelegramAssistantOutputRuntime<TAuthority = undefined>(deps: {
-  prepareSend?: (event: TelegramAssistantSegmentEvent) => TelegramAssistantOutputPreparation | undefined;
+export function createTelegramAssistantOutputRuntime<
+  TAuthority = undefined,
+>(deps: {
+  prepareSend?: (
+    event: TelegramAssistantSegmentEvent,
+  ) => TelegramAssistantOutputPreparation | undefined;
   enqueue?: TelegramActivityPublicationRuntime["enqueue"];
   captureAuthority?: () => TAuthority;
   isAuthorityActive?: (authority: TAuthority) => boolean;
@@ -865,7 +908,8 @@ export function createTelegramAssistantOutputRuntime<TAuthority = undefined>(dep
       const admittedGeneration = generation;
       const admittedAuthority = deps.captureAuthority?.();
       const preparation = deps.prepareSend?.(event);
-      const enqueue = deps.enqueue ?? ((task: () => Promise<void>) => tail.then(task));
+      const enqueue =
+        deps.enqueue ?? ((task: () => Promise<void>) => tail.then(task));
       tail = enqueue(async () => {
         const isAdmittedAuthorityActive = () =>
           running &&

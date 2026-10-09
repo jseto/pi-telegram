@@ -5,7 +5,7 @@
  */
 import { markTelegramBusAggregateDelivery } from "./bus.js";
 import { assertTelegramInlineKeyboardCallbackData, } from "./keyboard.js";
-import { withTelegramReplyParameters, renderTelegramMessage, } from "./replies.js";
+import { renderTelegramMessage, withTelegramReplyParameters, } from "./replies.js";
 import { areTelegramTargetsEqual as areDeliveryTargetsEqual, getTelegramTargetThreadParams, } from "./target.js";
 import { getTelegramApiRetryAfterMs, isRetryableTelegramApiError, isTelegramApiCommitUnknownError, isTelegramMessageUnavailableError, } from "./telegram-api.js";
 const TELEGRAM_DELIVERY_RUNTIME_KEY = "__piTelegramDeliveryRuntime__";
@@ -26,6 +26,7 @@ export function createTelegramDeliveryLifecycleHooks(createRuntime) {
         runtime = undefined;
     };
     return {
+        hasPendingTarget: (target) => runtime?.hasPendingTarget?.(target),
         onSessionStart: async () => {
             stopCurrentRuntime();
             runtime = createRuntime();
@@ -167,7 +168,7 @@ function resolveTelegramDeliveryTarget(scope, deps) {
 }
 function createTelegramDeliveryTargetQueue() {
     const queues = new Map();
-    return async function run(target, operation) {
+    async function run(target, operation) {
         const key = targetKey(target);
         const previous = queues.get(key) ?? Promise.resolve();
         const current = previous.then(operation, operation);
@@ -180,6 +181,10 @@ function createTelegramDeliveryTargetQueue() {
             if (queues.get(key) === settled)
                 queues.delete(key);
         }
+    }
+    return {
+        run,
+        hasPendingTarget: (target) => queues.has(targetKey(target)),
     };
 }
 function getChunkTransportOptions(view, index, chunkCount, replyToMessageId, editing = false) {
@@ -198,7 +203,8 @@ function getChunkTransportOptions(view, index, chunkCount, replyToMessageId, edi
 export function createTelegramDeliveryRuntime(deps) {
     let active = true;
     const handleBindings = new WeakMap();
-    const runForTarget = createTelegramDeliveryTargetQueue();
+    const targetQueue = createTelegramDeliveryTargetQueue();
+    const runForTarget = targetQueue.run;
     const render = (view) => {
         const chunks = deps.renderView(view);
         if (chunks.length === 0 ||
@@ -247,6 +253,7 @@ export function createTelegramDeliveryRuntime(deps) {
     };
     return {
         generation: deps.generation,
+        hasPendingTarget: targetQueue.hasPendingTarget,
         shutdown() {
             active = false;
         },
@@ -420,10 +427,14 @@ export function createTelegramBridgeDeliveryRuntime(deps) {
                 const body = {
                     chat_id: target.chatId,
                     text: chunk.text,
-                    ...(chunk.parseMode === "html" ? { parse_mode: "HTML" } : {}),
+                    ...(chunk.parseMode === "html"
+                        ? { parse_mode: "HTML" }
+                        : {}),
                     ...getTelegramTargetThreadParams(target),
                     ...(replyParameters ? { reply_parameters: replyParameters } : {}),
-                    ...(options.replyMarkup ? { reply_markup: options.replyMarkup } : {}),
+                    ...(options.replyMarkup
+                        ? { reply_markup: options.replyMarkup }
+                        : {}),
                 };
                 return deps.api.sendMessage(target.threadId === undefined
                     ? markTelegramBusAggregateDelivery(body)
@@ -514,17 +525,6 @@ export async function sendTelegramView(view, options) {
     if (invalid)
         return invalid;
     return runDeliveryOperation((runtime) => runtime.sendView(view, options));
-}
-/** @internal Edit an exact Telegram message through the currently bound runtime generation. */
-export async function editTelegramTargetView(target, messageId, view) {
-    const invalid = validateView(view);
-    if (invalid)
-        return invalid;
-    return runDeliveryOperation((runtime) => runtime.editView({
-        target: { ...target },
-        messageIds: [messageId],
-        generation: runtime.generation,
-    }, view));
 }
 export async function editTelegramView(handle, view) {
     const invalid = validateView(view);

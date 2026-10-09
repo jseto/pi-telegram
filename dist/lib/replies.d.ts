@@ -3,25 +3,13 @@
  * Zones: telegram outbound, native rich markdown, UI/compat rendering transport
  * Owns native assistant replies, rendered UI delivery, guest placeholder rotation, reply transport wiring, and plain text replies
  */
-import { type TelegramTarget } from "./target.ts";
-import type { TelegramInputRichMessage, TelegramReplyParameters, TelegramSendRichMessageBody, TelegramSentMessage } from "./telegram-api.ts";
 import { renderTelegramMessage, type TelegramRenderedChunk, type TelegramRenderMode } from "./rendering.ts";
+import { type TelegramTarget } from "./target.ts";
+import type { TelegramApiCallOptions, TelegramInputRichMessage, TelegramReplyParameters, TelegramSendRichMessageBody, TelegramSentMessage } from "./telegram-api.ts";
 export { renderTelegramMessage, type TelegramRenderedChunk, type TelegramRenderMode, };
 export declare function renderTelegramMarkdownToHtmlDraft(markdown: string): string;
 export declare const TELEGRAM_RICH_MESSAGE_MAX_CHARS = 32768;
 export declare const TELEGRAM_RICH_MESSAGE_MAX_BLOCKS = 500;
-/** Non-persistent reply deduplication for a single agent turn.
- *  First reply to a prompt gets `reply_parameters.message_id`;
- *  subsequent replies in the same turn skip it to avoid stacking
- *  duplicate reply headers in the chat viewport. */
-export interface ReplyDedupRuntime {
-    /** Returns true if this is the first reply for the given prompt
-     *  message id in the current turn. Side-effect: marks it replied. */
-    shouldReply(promptMessageId: number): boolean;
-    /** Reset the tracker when a new prompt enters the queue. */
-    reset(): void;
-}
-export declare function createReplyDedupRuntime(): ReplyDedupRuntime;
 export declare function resetTransportReplyDedup(): void;
 /** Keeps a successfully published transition notice as the first reply of the
  * next agent turn. The following agent-start reset consumes this one-shot
@@ -67,7 +55,7 @@ export interface TelegramReplyDeliveryDeps<TReplyMarkup> {
         reply_parameters?: TelegramReplyParameters;
         reply_to_message_id?: number;
         message_thread_id?: number;
-    }) => Promise<TelegramSentMessage>;
+    }, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<TelegramSentMessage>;
     editMessage: (body: {
         chat_id: number;
         message_id: number;
@@ -76,9 +64,9 @@ export interface TelegramReplyDeliveryDeps<TReplyMarkup> {
         parse_mode?: "HTML";
         reply_markup?: TReplyMarkup;
         message_thread_id?: number;
-    }) => Promise<unknown>;
+    }, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<unknown>;
 }
-export interface TelegramReplyTargetOptions {
+export interface TelegramReplyTargetOptions extends Pick<TelegramApiCallOptions, "assertAuthority"> {
     target?: TelegramTarget;
     replyToMessageId?: number;
 }
@@ -109,11 +97,18 @@ export interface TelegramReplyRuntimeDeps<TReplyMarkup = unknown> {
     } & TelegramReplyTargetOptions) => Promise<number | undefined>;
 }
 export declare function sendTelegramPlainReply(text: string, deps: TelegramReplyRuntimeDeps, options?: TelegramTextReplyOptions): Promise<number | undefined>;
+/** An open fenced code block: its marker character and the minimum closing run length. */
+export interface TelegramMarkdownFence {
+    marker: "`" | "~";
+    length: number;
+}
+export declare function parseTelegramMarkdownFenceOpening(line: string): TelegramMarkdownFence | undefined;
+export declare function isTelegramMarkdownFenceClosing(line: string, fence: TelegramMarkdownFence): boolean;
 export declare function normalizeTelegramNativeMarkdown(markdown: string): string;
 export declare function splitTelegramNativeMarkdown(markdown: string): string[];
 export declare function sendTelegramNativeMarkdownReply<TReplyMarkup = unknown>(chatId: number, replyToMessageId: number | undefined, markdown: string, deps: {
     recordOwnership?: TelegramReplyOwnershipRecorder["record"];
-    sendRichMessage: (body: TelegramSendRichMessageBody) => Promise<TelegramSentMessage>;
+    sendRichMessage: (body: TelegramSendRichMessageBody, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<TelegramSentMessage>;
 }, options?: TelegramReplyTargetOptions & {
     replyMarkup?: TReplyMarkup;
 }): Promise<number | undefined>;
@@ -125,14 +120,14 @@ export interface TelegramRenderedMessageRuntimeDeps<TReplyMarkup> {
     replyTransport: TelegramReplyTransport<TReplyMarkup>;
     recordOwnership?: TelegramReplyOwnershipRecorder["record"];
     getAssistantRenderingMode?: () => TelegramAssistantRenderingMode;
-    sendRichMessage: (body: TelegramSendRichMessageBody) => Promise<TelegramSentMessage>;
+    sendRichMessage: (body: TelegramSendRichMessageBody, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<TelegramSentMessage>;
 }
 export interface TelegramRenderedMessageRuntime<TReplyMarkup> {
     sendTextReply: (chatId: number, replyToMessageId: number | undefined, text: string, options?: TelegramTextReplyOptions) => Promise<number | undefined>;
     sendMarkdownReply: (chatId: number, replyToMessageId: number | undefined, markdown: string, options?: TelegramReplyTargetOptions & {
         replyMarkup?: TReplyMarkup;
     }) => Promise<number | undefined>;
-    editInteractiveMessage: (chatId: number, messageId: number, text: string, mode: TelegramRenderMode, replyMarkup: TReplyMarkup) => Promise<void>;
+    editInteractiveMessage: (chatId: number, messageId: number, text: string, mode: TelegramRenderMode, replyMarkup: TReplyMarkup, options?: TelegramReplyTargetOptions) => Promise<void>;
     sendInteractiveMessage: (chatId: number, text: string, mode: TelegramRenderMode, replyMarkup: TReplyMarkup, options?: TelegramReplyTargetOptions) => Promise<number | undefined>;
     sendSectionRichMessage: (chatId: number, message: TelegramInputRichMessage, options?: TelegramReplyTargetOptions) => Promise<number>;
 }
@@ -144,13 +139,10 @@ export interface TelegramRenderedMessageDeliveryRuntimeDeps<TReplyMarkup> extend
         mode?: TelegramRenderMode;
     }) => TelegramRenderedChunk[];
     getAssistantRenderingMode?: () => TelegramAssistantRenderingMode;
-    sendRichMessage: (body: TelegramSendRichMessageBody) => Promise<TelegramSentMessage>;
+    sendRichMessage: (body: TelegramSendRichMessageBody, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<TelegramSentMessage>;
 }
 export declare function createTelegramRenderedMessageDeliveryRuntime<TReplyMarkup>(deps: TelegramRenderedMessageDeliveryRuntimeDeps<TReplyMarkup>): TelegramRenderedMessageDeliveryRuntime<TReplyMarkup>;
 export declare function createTelegramRenderedMessageRuntime<TReplyMarkup>(deps: TelegramRenderedMessageRuntimeDeps<TReplyMarkup>): TelegramRenderedMessageRuntime<TReplyMarkup>;
-/** Wrap a sendTextReply with reply dedup so only the first message
- *  in a turn carries reply metadata. */
-export declare function dedupSendTextReply(dedup: ReplyDedupRuntime, inner: (chatId: number, replyToMessageId: number | undefined, text: string, options?: TelegramTextReplyOptions) => Promise<number | undefined>): (chatId: number, replyToMessageId: number, text: string, options?: TelegramTextReplyOptions) => Promise<number | undefined>;
 /**
  * Guest reply sender: answers guest queries with native Rich Markdown content.
  * Guest queries use InlineQueryResult input_message_content rather than chat

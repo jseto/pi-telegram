@@ -49,6 +49,7 @@ export type TelegramDeliveryChatAction = "typing" | "upload_document" | "upload_
 /** @internal */
 export interface TelegramDeliveryRuntime {
     readonly generation: string;
+    hasPendingTarget?: (target: TelegramDeliveryTarget) => boolean;
     shutdown: () => void;
     sendView: (view: TelegramDeliveryView, options: SendTelegramViewOptions) => Promise<TelegramDeliveryResult<TelegramDeliveryHandle>>;
     editView: (handle: TelegramDeliveryHandle, view: TelegramDeliveryView) => Promise<TelegramDeliveryResult<TelegramDeliveryHandle>>;
@@ -100,6 +101,7 @@ export interface TelegramBridgeDeliveryRuntimeDeps {
 export declare function createTelegramDeliveryLifecycleHooks(createRuntime: () => TelegramDeliveryRuntime): {
     onSessionStart: () => Promise<void>;
     onSessionShutdown: () => Promise<void>;
+    hasPendingTarget: (target: TelegramDeliveryTarget) => boolean | undefined;
 };
 export declare function createTelegramDeliveryGenerationSeed(instanceId: string): string;
 /** @internal */
@@ -152,8 +154,6 @@ export declare function clearTelegramDeliveryRuntime(): void;
 /** @internal */
 export declare function isTelegramDeliveryHandleCurrent(handle: TelegramDeliveryHandle): boolean;
 export declare function sendTelegramView(view: TelegramDeliveryView, options: SendTelegramViewOptions): Promise<TelegramDeliveryResult<TelegramDeliveryHandle>>;
-/** @internal Edit an exact Telegram message through the currently bound runtime generation. */
-export declare function editTelegramTargetView(target: TelegramDeliveryTarget, messageId: number, view: TelegramDeliveryView): Promise<TelegramDeliveryResult<TelegramDeliveryHandle>>;
 export declare function editTelegramView(handle: TelegramDeliveryHandle, view: TelegramDeliveryView): Promise<TelegramDeliveryResult<TelegramDeliveryHandle>>;
 export declare function deleteTelegramView(handle: TelegramDeliveryHandle): Promise<TelegramDeliveryResult<void>>;
 export declare function sendTelegramChatAction(action: TelegramDeliveryChatAction, options: {

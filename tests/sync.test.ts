@@ -25,7 +25,6 @@ import {
   markTelegramSyncSliceSuspect,
   recoverStaleTelegramTopicApiError,
   settleStaleTelegramTopicExecutionFailure,
-  shouldReconcileTelegramSync,
 } from "../lib/sync.ts";
 import { TelegramApiStaleTargetError } from "../lib/telegram-api.ts";
 import {
@@ -76,26 +75,6 @@ test("Telegram sync state runtime owns transitions and nested provisioning activ
   provisioning.end();
   provisioning.end();
   assert.equal(provisioning.isActive(), false);
-});
-
-test("Telegram sync reconciliation is demand-driven, not per ordinary action", () => {
-  for (const trigger of [
-    "startup",
-    "reload",
-    "topic-lifecycle",
-    "stale-api-error",
-    "setup-change",
-    "pairing-change",
-    "follower-register",
-    "follower-prune",
-    "status-request",
-    "leader-health-tick",
-  ] as const) {
-    assert.equal(shouldReconcileTelegramSync(trigger), true);
-  }
-
-  assert.equal(shouldReconcileTelegramSync("ordinary-message"), false);
-  assert.equal(shouldReconcileTelegramSync("ordinary-send"), false);
 });
 
 function createTopicStore(

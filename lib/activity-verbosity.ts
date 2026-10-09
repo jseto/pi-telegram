@@ -4,11 +4,15 @@
  * Owns persistent bounded thinking and tool disclosures; excludes activity normalization, assistant answer rendering, and transport authority policy
  */
 
-import type { TelegramActivityEvent, TelegramActivityPublicationRuntime } from "./activity.ts";
+import type {
+  TelegramActivityEvent,
+  TelegramActivityPublicationRuntime,
+} from "./activity.ts";
+import { escapeHtml, renderTelegramInlineMarkdownHtml } from "./rendering.ts";
 import {
-  escapeHtml,
-  renderTelegramInlineMarkdownHtml,
-} from "./rendering.ts";
+  areTelegramTargetsEqual as targetEquals,
+  type TelegramTarget,
+} from "./target.ts";
 import type {
   TelegramEditMessageTextBody,
   TelegramInputRichBlock,
@@ -17,7 +21,6 @@ import type {
   TelegramSendRichMessageBody,
   TelegramSentMessage,
 } from "./telegram-api.ts";
-import { areTelegramTargetsEqual as targetEquals, type TelegramTarget } from "./target.ts";
 
 const TELEGRAM_ACTIVITY_DETAIL_MAX_CHARS = 1_200;
 const TELEGRAM_ACTIVITY_MESSAGE_MAX_CHARS = 3_900;
@@ -55,10 +58,7 @@ interface ReasoningMessage {
 function redactActivityText(text: string): string {
   return text
     .replace(/\b\d{8,12}:[A-Za-z0-9_-]{30,}\b/g, "[REDACTED_BOT_TOKEN]")
-    .replace(
-      /\b(Bearer\s+)[A-Za-z0-9._~+/=-]{16,}\b/gi,
-      "$1[REDACTED]",
-    )
+    .replace(/\b(Bearer\s+)[A-Za-z0-9._~+/=-]{16,}\b/gi, "$1[REDACTED]")
     .replace(
       /(["']?(?:api[_-]?key|token|password|secret)["']?\s*[:=]\s*["']?)[^"',\s}]+/gi,
       "$1[REDACTED]",
@@ -89,9 +89,7 @@ function formatActivityJson(value: unknown, depth = 0): string[] {
             lines[lines.length - 1] += ",";
           }
         });
-        lines.push(
-          index < value.length - 1 ? `${indent}}, {` : `${indent}}]`,
-        );
+        lines.push(index < value.length - 1 ? `${indent}}, {` : `${indent}}]`);
       });
       return lines;
     }
@@ -130,17 +128,14 @@ function serializeActivityValue(value: unknown): string {
   let text: string;
   try {
     const normalized =
-      JSON.stringify(
-        value,
-        (_key, nested) => {
-          if (typeof nested === "bigint") return nested.toString();
-          if (nested && typeof nested === "object") {
-            if (seen.has(nested)) return "[Circular]";
-            seen.add(nested);
-          }
-          return nested;
-        },
-      ) ?? JSON.stringify(String(value));
+      JSON.stringify(value, (_key, nested) => {
+        if (typeof nested === "bigint") return nested.toString();
+        if (nested && typeof nested === "object") {
+          if (seen.has(nested)) return "[Circular]";
+          seen.add(nested);
+        }
+        return nested;
+      }) ?? JSON.stringify(String(value));
     text = formatActivityJson(JSON.parse(normalized)).join("\n");
   } catch {
     text = JSON.stringify(String(value));
@@ -185,18 +180,12 @@ function renderToolActivityHtml(tool: ToolActivity): string {
     evidence.push(`… [${tool.droppedUpdates} earlier updates omitted]`);
   }
   tool.updates.forEach((update, index) => {
-    evidence.push(
-      `"update ${tool.droppedUpdates + index + 1}": ${update}`,
-    );
+    evidence.push(`"update ${tool.droppedUpdates + index + 1}": ${update}`);
   });
   if (tool.complete && tool.result !== undefined) {
     evidence.push(`"${tool.isError ? "error" : "result"}": ${tool.result}`);
   }
-  const status = tool.complete
-    ? tool.isError
-      ? "failed"
-      : "done"
-    : "running";
+  const status = tool.complete ? (tool.isError ? "failed" : "done") : "running";
   return [
     `<b>${escapeHtml(formatToolActivityLabel(tool.name))}:</b> <code>${status}</code>`,
     `<blockquote expandable>${escapeActivityEvidenceHtml(evidence.join("\n\n"))}</blockquote>`,
@@ -225,11 +214,7 @@ function createToolActivityDetail(
 function renderToolActivityRichBlocks(
   tool: ToolActivity,
 ): TelegramInputRichBlock[] {
-  const status = tool.complete
-    ? tool.isError
-      ? "failed"
-      : "done"
-    : "running";
+  const status = tool.complete ? (tool.isError ? "failed" : "done") : "running";
   const evidenceBlocks: TelegramInputRichBlock[] = [
     createToolActivityDetail("arguments", tool.args, true),
   ];
@@ -278,7 +263,9 @@ function toolMessageSize(tools: readonly ToolActivity[]): number {
 }
 
 function isKnownSafeRichActivityRejection(error: unknown): boolean {
-  return error instanceof Error && /HTTP 400: Bad Request:/i.test(error.message);
+  return (
+    error instanceof Error && /HTTP 400: Bad Request:/i.test(error.message)
+  );
 }
 
 export function renderTelegramThinkingActivityHtml(text: string): string {
@@ -290,32 +277,6 @@ export interface TelegramActivityVerbosityRuntime {
   reset: () => void;
   stop: () => void;
   waitForIdle: () => Promise<void>;
-}
-
-export interface TelegramActivityVerbosityBinding
-  extends TelegramActivityVerbosityRuntime {
-  bind: (runtime: TelegramActivityVerbosityRuntime) => void;
-}
-
-export function createTelegramActivityVerbosityBinding(): TelegramActivityVerbosityBinding {
-  let runtime: TelegramActivityVerbosityRuntime | undefined;
-  return {
-    bind(next) {
-      runtime = next;
-    },
-    accept(event) {
-      runtime?.accept(event);
-    },
-    reset() {
-      runtime?.reset();
-    },
-    stop() {
-      runtime?.stop();
-    },
-    waitForIdle() {
-      return runtime?.waitForIdle() ?? Promise.resolve();
-    },
-  };
 }
 
 export function createTelegramActivityVerbosityRuntime<TAuthority>(deps: {
@@ -391,8 +352,14 @@ export function createTelegramActivityVerbosityRuntime<TAuthority>(deps: {
   };
   const hasAuthority = (): boolean =>
     authority !== undefined && deps.isAuthorityActive(authority);
-  const isCurrent = (acceptedGeneration: number, admittedAuthority: TAuthority | undefined): boolean =>
-    active && generation === acceptedGeneration && admittedAuthority !== undefined && deps.isAuthorityActive(admittedAuthority);
+  const isCurrent = (
+    acceptedGeneration: number,
+    admittedAuthority: TAuthority | undefined,
+  ): boolean =>
+    active &&
+    generation === acceptedGeneration &&
+    admittedAuthority !== undefined &&
+    deps.isAuthorityActive(admittedAuthority);
   const ensureActivity = (
     event: TelegramActivityEvent,
     admittedTarget: TelegramTarget | undefined,
@@ -433,7 +400,9 @@ export function createTelegramActivityVerbosityRuntime<TAuthority>(deps: {
       );
       body = renderTelegramThinkingActivityHtml(text);
       if (body.length <= TELEGRAM_ACTIVITY_MESSAGE_MAX_CHARS) break;
-      retained = retained.slice(-Math.max(1, Math.floor(retained.length * 0.75)));
+      retained = retained.slice(
+        -Math.max(1, Math.floor(retained.length * 0.75)),
+      );
     } while (retained.length > 1);
     const canEdit =
       reasoningMessage && targetEquals(reasoningMessage.target, target);
@@ -481,9 +450,8 @@ export function createTelegramActivityVerbosityRuntime<TAuthority>(deps: {
     acceptedGeneration: number,
   ) => {
     if (reasoningFlushTimer || reasoningBlocked) return;
-    const elapsed = reasoningMessageFrames === 0
-      ? 0
-      : getNowMs() - lastReasoningPublishMs;
+    const elapsed =
+      reasoningMessageFrames === 0 ? 0 : getNowMs() - lastReasoningPublishMs;
     const delayMs = Math.max(0, TELEGRAM_REASONING_MIN_INTERVAL_MS - elapsed);
     const schedule = deps.setReasoningTimeout ?? setTimeout;
     reasoningFlushTimer = schedule(() => {
@@ -493,10 +461,12 @@ export function createTelegramActivityVerbosityRuntime<TAuthority>(deps: {
         if (
           !isCurrent(acceptedGeneration, admittedAuthority) ||
           reasoningChars <= lastReasoningMessageChars
-        ) return;
+        )
+          return;
         await publishReasoning(event, acceptedGeneration);
       };
-      const enqueue = deps.enqueue ?? ((next: () => Promise<void>) => tail.then(next));
+      const enqueue =
+        deps.enqueue ?? ((next: () => Promise<void>) => tail.then(next));
       tail = enqueue(task).catch((error) => {
         deps.recordFailure?.("reasoning-send", event, error);
       });
@@ -721,10 +691,7 @@ export function createTelegramActivityVerbosityRuntime<TAuthority>(deps: {
     }
     if (event.type === "agent-end" || event.type === "agent-settled") {
       clearReasoningFlushTimer();
-      if (
-        reasoningChars > lastReasoningMessageChars &&
-        !reasoningBlocked
-      ) {
+      if (reasoningChars > lastReasoningMessageChars && !reasoningBlocked) {
         await publishReasoning(event, acceptedGeneration);
       }
       if (!isCurrent(acceptedGeneration, admittedAuthority)) return;
@@ -738,14 +705,24 @@ export function createTelegramActivityVerbosityRuntime<TAuthority>(deps: {
       const resolvedTarget = deps.resolveTarget(event);
       const admittedTarget = resolvedTarget ? { ...resolvedTarget } : undefined;
       const admittedAuthority = deps.captureAuthority();
-      const enqueue = deps.enqueue ?? ((task: () => Promise<void>) => tail.then(task));
+      const enqueue =
+        deps.enqueue ?? ((task: () => Promise<void>) => tail.then(task));
       tail = enqueue(async () => {
-          if (!active || generation !== acceptedGeneration || !deps.isAuthorityActive(admittedAuthority)) return;
-          await process(event, acceptedGeneration, admittedTarget, admittedAuthority);
-        })
-        .catch((error) => {
-          deps.recordFailure?.("tool-send", event, error);
-        });
+        if (
+          !active ||
+          generation !== acceptedGeneration ||
+          !deps.isAuthorityActive(admittedAuthority)
+        )
+          return;
+        await process(
+          event,
+          acceptedGeneration,
+          admittedTarget,
+          admittedAuthority,
+        );
+      }).catch((error) => {
+        deps.recordFailure?.("tool-send", event, error);
+      });
     },
     reset() {
       generation += 1;
