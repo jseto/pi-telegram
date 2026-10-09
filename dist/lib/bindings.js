@@ -3,14 +3,17 @@
  * Zones: telegram, pi agent, orchestration
  * Owns pi-facing tool, command, and lifecycle hook registration for the entrypoint
  */
-import * as Activity from "./activity.js";
 import * as ActivityVerbosity from "./activity-verbosity.js";
+import * as Activity from "./activity.js";
+import * as BusApi from "./bus-api.js";
 import * as ChannelPosts from "./channel-posts.js";
 import * as CommandTemplates from "./command-templates.js";
 import * as Commands from "./commands.js";
 import * as Config from "./config.js";
 import * as Delivery from "./delivery.js";
+import * as GenerativeApps from "./generative-apps.js";
 import * as Lifecycle from "./lifecycle.js";
+import * as Menu from "./menu.js";
 import * as OutboundAttachments from "./outbound-attachments.js";
 import * as OutboundHandlers from "./outbound.js";
 import * as Pi from "./pi.js";
@@ -21,7 +24,91 @@ import * as Routing from "./routing.js";
 import * as Runtime from "./runtime.js";
 import * as Setup from "./setup.js";
 import * as TelegramApi from "./telegram-api.js";
-import * as GenerativeApps from "./generative-apps.js";
+/** Compose any registered held command over captured recipient effects; no ordinary follower API fallback. */
+export function createTelegramFollowerSelectedCommandBinding(deps) {
+    const { ctx, operationId, registrationGeneration, name, recipient, command, deliver, recordOwnership, } = deps, target = { ...deps.target };
+    const prepare = command.prepareHeldCommand, canPrepare = command.canPrepareHeldCommand;
+    const isCurrent = recipient.isCurrent, assertRecipientCurrent = recipient.assertRecipientCurrent, menu = deps.menu, menuPorts = menu && { ...menu };
+    if ([
+        prepare,
+        canPrepare,
+        isCurrent,
+        assertRecipientCurrent,
+        deliver,
+        recordOwnership,
+    ].some((port) => typeof port !== "function") ||
+        (menuPorts &&
+            [
+                menuPorts.getModelMenuState,
+                menuPorts.storeModelMenuState,
+                menuPorts.getActiveModel,
+                menuPorts.getThinkingLevel,
+                menuPorts.buildStatusHtml,
+                menuPorts.isIdle,
+                menuPorts.canOfferInFlightModelSwitch,
+            ].some((port) => typeof port !== "function")))
+        return undefined;
+    const portsCurrent = () => deps.ctx === ctx &&
+        deps.operationId === operationId &&
+        deps.registrationGeneration === registrationGeneration &&
+        deps.name === name &&
+        deps.recipient === recipient &&
+        recipient.isCurrent === isCurrent &&
+        recipient.assertRecipientCurrent === assertRecipientCurrent &&
+        deps.command === command &&
+        command.prepareHeldCommand === prepare &&
+        command.canPrepareHeldCommand === canPrepare &&
+        deps.deliver === deliver &&
+        deps.recordOwnership === recordOwnership &&
+        deps.menu === menu &&
+        (!menuPorts ||
+            Object.entries(menuPorts).every(([key, value]) => Reflect.get(menu, key) === value));
+    const current = () => portsCurrent() && isCurrent.call(recipient) && portsCurrent();
+    if (!current())
+        return undefined;
+    const api = BusApi.createTelegramSelectedMenuTextApi({
+        operationId,
+        registrationGeneration,
+        target,
+        assertAuthority: assertRecipientCurrent,
+        deliver,
+    });
+    const rendered = Replies.createTelegramRenderedMessageDeliveryRuntime({
+        sendMessage: api.sendMessage,
+        editMessage: api.editMessageText,
+        recordOwnership,
+        async sendRichMessage() {
+            throw new Error("Selected command has no rich or ordinary API fallback.");
+        },
+    });
+    const menus = menuPorts &&
+        Menu.createTelegramMenuActionRuntime({
+            ...menuPorts,
+            sendTextReply: rendered.sendTextReply,
+            sendInteractiveMessage: rendered.sendInteractiveMessage,
+            editInteractiveMessage: rendered.editInteractiveMessage,
+        });
+    const effects = {
+        sendTextReply: rendered.sendTextReply,
+        ...(menus ? { showStatus: menus.sendStatusMessage } : {}),
+    };
+    if (!canPrepare.call(command, name, effects) || !current())
+        return undefined;
+    return {
+        isCurrent: current,
+        assertRecipientCurrent,
+        prepare(readiness, context, input) {
+            if (!current() ||
+                context !== ctx ||
+                input.target.chatId !== target.chatId ||
+                input.target.threadId !== target.threadId ||
+                input.assertRecipientCurrent !== assertRecipientCurrent)
+                return undefined;
+            const plan = prepare.call(command, name, readiness, context, input, effects);
+            return current() ? plan : undefined;
+        },
+    };
+}
 export function createTelegramQueueBindingRuntime(deps) {
     const settleDiscardedItems = (items, ctx) => {
         const durableItems = items.filter((item) => (item.admissionReceipts?.length ?? 0) > 0);
@@ -100,7 +187,9 @@ export function createTelegramQueueBindingRuntime(deps) {
 export function createTelegramGenerativeAppLiveSurfaceBinding() {
     let current;
     return {
-        get() { return current; },
+        get() {
+            return current;
+        },
         set(runtime) {
             current?.shutdown();
             current = runtime;
@@ -314,6 +403,9 @@ export function createTelegramActivityBindingRuntime(deps) {
         publicationRuntime: {
             enqueue: publication.enqueue,
             reserve: publication.reserve,
+            hasPending: publication.hasPending,
+            beginWork: publication.beginWork,
+            hasUnconfirmed: publication.hasUnconfirmed,
             capture() {
                 const authority = assistantOutputBinding.authority.captureAuthority();
                 return {
@@ -324,7 +416,37 @@ export function createTelegramActivityBindingRuntime(deps) {
         },
     };
 }
-export function registerTelegramCommandsAndTools({ pi, agentDir, configStore, persistConfig, setup, activeTurnRuntime, lockedPollingRuntime, stopPolling, recoverPollingStart, getDisconnectThreadName, onTransportChanged, getStatusLines, buttonActionStore, sendMarkdownReply, sendChannelMarkdownMessage, sendChannelMediaMessage, listChannelPosts, mutateChannelPost, callMultipart, getDefaultChatId, getDefaultTarget, resolveAgentTarget, routeAgentMessage, canSendDirect, setGenerativeAppLiveSurfaceRuntime, recordRuntimeEvent, updateStatus, isContextCurrent, getSessionGeneration, connectionIntent, }) {
+/** Fresh current work projection; a snapshot is not a cleanup grant or target-application ACK. */
+export function createTelegramLiveTargetWorkObserver(deps) {
+    return (target, ctx) => {
+        const work = Queue.observeTelegramTargetQueueWork(target, deps.activeTurn.get(), deps.queue.getQueuedItems());
+        const flags = [
+            deps.isIdle(ctx),
+            deps.hasPendingMessages(ctx),
+            deps.lifecycle.hasDispatchPending(),
+            deps.lifecycle.isCompactionInProgress(),
+            deps.hasPendingControl(),
+        ];
+        const tools = deps.lifecycle.getActiveToolExecutions();
+        const publication = deps.publication.hasPending(), unconfirmed = deps.publication.hasUnconfirmed?.(), activity = deps.activity.hasPending?.(), delivery = deps.delivery.hasPendingTarget(target), api = deps.api.hasPendingTarget(target);
+        const unknown = work.unknown ||
+            flags.some((flag) => typeof flag !== "boolean") ||
+            !Number.isSafeInteger(tools) ||
+            tools < 0 ||
+            unconfirmed !== false ||
+            [publication, activity, delivery, api].some((flag) => typeof flag !== "boolean");
+        return {
+            sessionBusy: flags[0] !== true || flags.slice(1).some(Boolean) || tools > 0,
+            targetWork: work.protected,
+            deliveryPending: publication === true ||
+                activity === true ||
+                delivery === true ||
+                api === true,
+            unknown,
+        };
+    };
+}
+export function registerTelegramCommandsAndTools({ pi, agentDir, configStore, persistConfig, setup, activeTurnRuntime, lockedPollingRuntime, stopPolling, getDisconnectThreadName, onTransportChanged, getStatusLines, buttonActionStore, sendMarkdownReply, sendChannelMarkdownMessage, sendChannelMediaMessage, listChannelPosts, mutateChannelPost, callMultipart, getDefaultChatId, getDefaultTarget, resolveAgentTarget, routeAgentMessage, canSendDirect, setGenerativeAppLiveSurfaceRuntime, recordRuntimeEvent, updateStatus, isContextCurrent, getSessionGeneration, connectionIntent, }) {
     GenerativeApps.registerTelegramBindTool(pi, {
         agentDir,
         getActiveProfileName: configStore.getActiveProfileName,
@@ -334,13 +456,18 @@ export function registerTelegramCommandsAndTools({ pi, agentDir, configStore, pe
             : {}),
         isDeliveryHandleCurrent: Delivery.isTelegramDeliveryHandleCurrent,
         editView: (handle, view) => Delivery.editTelegramView(handle, view),
-        planOutput: OutboundHandlers.createTelegramOutboundReplyPlanner(buttonActionStore, Config.createTelegramConfigControls(configStore).getAssistantRenderingMode),
+        planOutput: OutboundHandlers.createTelegramOutboundReplyPlanner(buttonActionStore, Config.createTelegramConfigControls(configStore)
+            .getAssistantRenderingMode),
         sendMarkdownReply,
         sendView: (view, options) => Delivery.sendTelegramView(view, options),
         recordRuntimeEvent,
     });
-    ChannelPosts.registerTelegramChannelPostMutationTool(pi, { mutate: mutateChannelPost });
-    ChannelPosts.registerTelegramChannelPostListTool(pi, { list: listChannelPosts });
+    ChannelPosts.registerTelegramChannelPostMutationTool(pi, {
+        mutate: mutateChannelPost,
+    });
+    ChannelPosts.registerTelegramChannelPostListTool(pi, {
+        list: listChannelPosts,
+    });
     OutboundAttachments.registerTelegramOutboundAttachmentTool(pi, {
         getActiveTurn: activeTurnRuntime.get,
         getDefaultChatId,
@@ -356,7 +483,8 @@ export function registerTelegramCommandsAndTools({ pi, agentDir, configStore, pe
         resolveAgentTarget,
         routeAgentMessage,
         canSendDirect,
-        planMessage: OutboundHandlers.createTelegramOutboundReplyPlanner(buttonActionStore, Config.createTelegramConfigControls(configStore).getAssistantRenderingMode),
+        planMessage: OutboundHandlers.createTelegramOutboundReplyPlanner(buttonActionStore, Config.createTelegramConfigControls(configStore)
+            .getAssistantRenderingMode),
         sendMarkdownMessage: (chatId, markdown, options) => sendMarkdownReply(chatId, undefined, markdown, options),
         sendChannelMarkdownMessage,
         sendChannelMediaMessage,
@@ -456,7 +584,6 @@ export function registerTelegramCommandsAndTools({ pi, agentDir, configStore, pe
         startPolling: lockedPollingRuntime.start,
         recordConnectionEvent: (error, phase) => recordRuntimeEvent("connection", error, { phase }),
         stopPolling: stopPolling ?? lockedPollingRuntime.stop,
-        recoverPollingStart,
         getDisconnectThreadName,
         queueAgentConnectionContext,
         updateStatus,
@@ -599,7 +726,9 @@ export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, 
         pendingFinalPublication = undefined;
     };
     const recordPublicationFailure = (error) => {
-        recordRuntimeEvent("delivery", error, { phase: "agent-end-background-delivery" });
+        recordRuntimeEvent("delivery", error, {
+            phase: "agent-end-background-delivery",
+        });
     };
     const scheduleActiveTurnDelivery = (task) => {
         void publicationRuntime.enqueue(task).catch(recordPublicationFailure);
@@ -630,7 +759,8 @@ export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, 
         getActiveTurn: activeTurnRuntime.get,
         loadConfig: configStore.load,
         extractAssistant: Replies.extractRunAssistantMessage,
-        isAssistantAlreadyPublished: (assistant) => !!assistant.text && assistantOutputRuntime.hasAdmittedTelegramIntermediate(assistant.text),
+        isAssistantAlreadyPublished: (assistant) => !!assistant.text &&
+            assistantOutputRuntime.hasAdmittedTelegramIntermediate(assistant.text),
         getFoldQueuedPromptsIntoHistory: lifecycle.shouldFoldQueuedPromptsIntoHistory,
         resetRuntimeState: agentEndResetter,
         isSessionActive: isSessionContextActive,
@@ -647,7 +777,9 @@ export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, 
                 pending?.reservation.cancel();
             const reservation = matches && pending ? pending.reservation : publicationRuntime.reserve();
             return {
-                schedule: (task) => { void reservation.publish(task).catch(recordPublicationFailure); },
+                schedule: (task) => {
+                    void reservation.publish(task).catch(recordPublicationFailure);
+                },
                 cancel: reservation.cancel,
             };
         },
@@ -673,8 +805,7 @@ export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, 
         setActiveToolExecutions: lifecycle.setActiveToolExecutions,
         triggerPendingModelSwitchAbort: modelSwitchController.triggerPendingAbort,
     });
-    Lifecycle.setResetTransportReplyDedup(Replies.resetTransportReplyDedup);
-    const agentStartWithDedupReset = Lifecycle.createAgentStartDedupHook(agentLifecycleHooks.onAgentStart, scheduleActiveTurnDelivery);
+    const agentStartWithDedupReset = Lifecycle.createAgentStartDedupHook(agentLifecycleHooks.onAgentStart, Replies.resetTransportReplyDedup, scheduleActiveTurnDelivery);
     let uiPromptActive = false;
     const startAgentActivityTypingLoop = (ctx) => {
         if (uiPromptActive || !canSendAgentActivity(ctx))
@@ -705,7 +836,9 @@ export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, 
             if (turn && isTurnTransportActive?.(turn) === false)
                 return;
             try {
-                await sendMarkdownReply(target.chatId, replyToMessageId, text, { target });
+                await sendMarkdownReply(target.chatId, replyToMessageId, text, {
+                    target,
+                });
             }
             catch (error) {
                 recordRuntimeEvent("delivery", error, { phase: "compaction-notice" });
@@ -879,16 +1012,25 @@ export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, 
                 previewRuntime.seal();
                 activityRuntime.onAssistantMessageEnd(event.message.stopReason);
             }
-            if (event.message.role !== "assistant" || event.message.stopReason === "toolUse" || event.message.stopReason === "aborted")
+            if (event.message.role !== "assistant" ||
+                event.message.stopReason === "toolUse" ||
+                event.message.stopReason === "aborted")
                 return;
             const turn = activeTurnRuntime.get();
             if (!turn || turn.guestQueryId || pendingFinalPublication?.turn === turn)
                 return;
             cancelPendingFinalPublication();
-            const assistant = Replies.extractLatestAssistantMessageText([event.message]);
-            if (!assistant.text && assistant.stopReason !== "error" && turn.queuedAttachments.length === 0)
+            const assistant = Replies.extractLatestAssistantMessageText([
+                event.message,
+            ]);
+            if (!assistant.text &&
+                assistant.stopReason !== "error" &&
+                turn.queuedAttachments.length === 0)
                 return;
-            pendingFinalPublication = { turn, reservation: publicationRuntime.reserve() };
+            pendingFinalPublication = {
+                turn,
+                reservation: publicationRuntime.reserve(),
+            };
         },
         onUiPromptStart(event, ctx) {
             if (!isSessionContextActive(ctx))
@@ -911,7 +1053,8 @@ export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, 
         async onAgentEnd(event, ctx) {
             if (!isSessionContextActive(ctx))
                 return;
-            if (pendingFinalPublication && pendingFinalPublication.turn !== activeTurnRuntime.get()) {
+            if (pendingFinalPublication &&
+                pendingFinalPublication.turn !== activeTurnRuntime.get()) {
                 cancelPendingFinalPublication();
                 return;
             }

@@ -91,16 +91,14 @@ function createTelegramActivityContext(event, isActive) {
     };
 }
 function canCoalesceActivityEvents(previous, next) {
-    if (previous.activityId !== next.activityId ||
-        previous.type !== next.type) {
+    if (previous.activityId !== next.activityId || previous.type !== next.type) {
         return false;
     }
     if (previous.type === "assistant-text-delta" &&
         next.type === "assistant-text-delta") {
         return previous.contentIndex === next.contentIndex;
     }
-    if (previous.type === "reasoning-delta" &&
-        next.type === "reasoning-delta") {
+    if (previous.type === "reasoning-delta" && next.type === "reasoning-delta") {
         return previous.contentIndex === next.contentIndex;
     }
     if (previous.type === "tool-update" && next.type === "tool-update") {
@@ -113,8 +111,7 @@ function coalesceActivityEvents(previous, next) {
         next.type === "assistant-text-delta") {
         return { ...next, delta: previous.delta + next.delta };
     }
-    if (previous.type === "reasoning-delta" &&
-        next.type === "reasoning-delta") {
+    if (previous.type === "reasoning-delta" && next.type === "reasoning-delta") {
         return { ...next, delta: previous.delta + next.delta };
     }
     return next;
@@ -152,6 +149,7 @@ export function createTelegramActivityDispatcher(deps = {}) {
         }
     };
     return {
+        hasPending: () => Array.from(queues.values()).some((queue) => queue.active && (queue.running || queue.events.length > 0)),
         dispatch(event) {
             if (stopped)
                 return;
@@ -194,6 +192,7 @@ export function createTelegramActivityBridgeRuntime(deps) {
     let runtime;
     const getRuntime = () => runtime;
     return {
+        hasPending: () => getRuntime()?.hasPending?.(),
         onSessionStart() {
             runtime?.onSessionShutdown();
             runtime = createTelegramActivityRuntime({
@@ -298,7 +297,9 @@ export function createTelegramActivityRuntime(deps) {
             sequence,
             source: activitySource,
             ...(activityTarget ? { target: activityTarget } : {}),
-            ...(activityReplyToMessageId !== undefined ? { replyToMessageId: activityReplyToMessageId } : {}),
+            ...(activityReplyToMessageId !== undefined
+                ? { replyToMessageId: activityReplyToMessageId }
+                : {}),
             timestamp: now(),
         };
         try {
@@ -342,13 +343,15 @@ export function createTelegramActivityRuntime(deps) {
             clearActivity();
     };
     return {
+        hasPending: () => deps.dispatcher.hasPending?.(),
         recordInputSource(source) {
             pendingInputSource = source;
         },
         onAgentStart(activeTelegramTarget, replyToMessageId) {
             abandonCompaction();
             ensureActivity(activeTelegramTarget);
-            activityReplyToMessageId = activitySource === "telegram" ? replyToMessageId : undefined;
+            activityReplyToMessageId =
+                activitySource === "telegram" ? replyToMessageId : undefined;
             emit({ type: "agent-start" });
         },
         onAssistantEvent(event) {
@@ -470,12 +473,15 @@ export function createTelegramActivityRuntime(deps) {
 export function createTelegramActivityPublicationRuntime() {
     let generation = 0;
     let tail = Promise.resolve();
+    let outstanding = 0, unconfirmed = false;
     const pending = new Set();
     const reserve = () => {
         const admittedGeneration = generation;
         let state = "pending";
         let resolve;
-        const ready = new Promise((accept) => { resolve = accept; });
+        const ready = new Promise((accept) => {
+            resolve = accept;
+        });
         const cancel = () => {
             if (state !== "pending")
                 return;
@@ -484,10 +490,15 @@ export function createTelegramActivityPublicationRuntime() {
             resolve(undefined);
         };
         pending.add(cancel);
-        const result = tail.then(async () => {
+        outstanding += 1;
+        const result = tail
+            .then(async () => {
             const task = await ready;
             if (admittedGeneration === generation && task)
                 await task();
+        })
+            .finally(() => {
+            outstanding -= 1;
         });
         tail = result.catch(() => { });
         return {
@@ -507,8 +518,26 @@ export function createTelegramActivityPublicationRuntime() {
     return {
         reserve,
         enqueue: (task) => reserve().publish(task),
+        hasPending: () => outstanding > 0,
+        hasUnconfirmed: () => unconfirmed,
+        beginWork() {
+            const admittedGeneration = generation;
+            let settled = false;
+            outstanding += 1;
+            return {
+                settle(outcome) {
+                    if (settled)
+                        return;
+                    settled = true;
+                    outstanding -= 1;
+                    if (outcome === "unconfirmed" && admittedGeneration === generation)
+                        unconfirmed = true;
+                },
+            };
+        },
         reset() {
             generation += 1;
+            unconfirmed = false;
             for (const cancel of pending)
                 cancel();
             tail = Promise.resolve();

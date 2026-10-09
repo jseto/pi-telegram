@@ -5,10 +5,9 @@
  * Transport authority, durable bindings, and queue custody remain with their owners.
  */
 import * as BusFollower from "./bus-follower.ts";
-import * as Queue from "./queue.ts";
 import type { AgentEndEvent, AgentSettledEvent, AgentStartEvent, AssistantMessageEvent, BeforeAgentStartEvent, ExtensionAPI, ExtensionContext, InputEvent, MessageEndEvent, SessionBeforeCompactEvent, SessionCompactEvent, SessionCompactFailedEvent, SessionShutdownEvent, SessionStartEvent, ToolExecutionEndEvent, ToolExecutionStartEvent, ToolExecutionUpdateEvent, UIPromptEndEvent, UIPromptStartEvent } from "./pi.ts";
-export declare function setResetTransportReplyDedup(fn: () => void): void;
-export declare function createAgentStartDedupHook(inner: (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void>, schedulePublication?: (task: () => Promise<void>) => void): (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void>;
+import * as Queue from "./queue.ts";
+export declare function createAgentStartDedupHook(inner: (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void>, resetReplyDedup: () => void, schedulePublication?: (task: () => Promise<void>) => void): (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void>;
 type TelegramBeforeAgentStartEvent = Omit<BeforeAgentStartEvent, "systemPrompt"> & {
     systemPrompt: string | string[];
 };
@@ -202,9 +201,6 @@ export interface TelegramMessageActivityTypingDeps<TContext> {
     recordRuntimeEvent?: (category: string, error: unknown, details?: Record<string, unknown>) => void;
 }
 export declare function createTelegramMessageActivityTypingHooks<TContext extends ExtensionContext>(deps: TelegramMessageActivityTypingDeps<TContext>): Pick<TelegramLifecycleRegistrationDeps, "onMessageStart" | "onMessageUpdate">;
-export declare function createDedupAgentStartHook(dedup: {
-    reset(): void;
-}, inner: (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void>): (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void>;
 export interface TelegramExtraLifecycleHooks {
     onSessionStart?: (event: SessionStartEvent, ctx: ExtensionContext) => Promise<void>;
     onSessionShutdown?: (event: SessionShutdownEvent, ctx: ExtensionContext) => Promise<void>;

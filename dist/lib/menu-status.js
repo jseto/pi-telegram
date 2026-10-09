@@ -4,25 +4,12 @@
  * Owns status-menu payloads, status callback handling, and status-menu message rendering
  */
 import { formatTelegramCommandEmojiPrefix } from "./commands.js";
-import { getTelegramSectionMainMenuRows, } from "./sections.js";
-import { formatStatusButtonLabel, } from "./menu-model.js";
+import { refuseUnavailableTelegramThinkingControls } from "./menu-thinking.js";
+import { editTelegramMenuMessage, formatStatusButtonLabel, sendTelegramMenuMessage, } from "./menu-model.js";
 import { getCanonicalModelId, } from "./model.js";
+import { getTelegramSectionMainMenuRows, } from "./sections.js";
 function isTelegramStatusMenuCallbackAction(data, action) {
     return data === `menu:${action}` || data === `status:${action}`;
-}
-function applyTelegramMenuRenderPayload(state, payload) {
-    state.mode = payload.nextMode;
-    return payload;
-}
-async function editTelegramMenuMessage(state, payload, deps) {
-    const appliedPayload = applyTelegramMenuRenderPayload(state, payload);
-    await deps.editInteractiveMessage(state.chatId, state.messageId, appliedPayload.text, appliedPayload.mode, appliedPayload.replyMarkup);
-}
-function sendTelegramMenuMessage(state, payload, deps) {
-    const appliedPayload = applyTelegramMenuRenderPayload(state, payload);
-    return deps.sendInteractiveMessage(state.chatId, appliedPayload.text, appliedPayload.mode, appliedPayload.replyMarkup, state.threadId !== undefined
-        ? { target: { chatId: state.chatId, threadId: state.threadId } }
-        : undefined);
 }
 export async function openTelegramStatusMenu(deps) {
     const state = await deps.getModelMenuState();
@@ -48,14 +35,8 @@ export async function handleTelegramStatusMenuCallbackAction(callbackQueryId, da
     }
     if (!isTelegramStatusMenuCallbackAction(data, "thinking"))
         return false;
-    if (deps.isVoiceReplyActive?.()) {
-        await deps.answerCallbackQuery(callbackQueryId, "Thinking controls are disabled during voice replies.");
+    if (await refuseUnavailableTelegramThinkingControls(callbackQueryId, activeModel, deps))
         return true;
-    }
-    if (!activeModel?.reasoning) {
-        await deps.answerCallbackQuery(callbackQueryId, "This model has no reasoning controls.");
-        return true;
-    }
     await deps.updateThinkingMenuMessage();
     await deps.answerCallbackQuery(callbackQueryId);
     return true;
@@ -83,10 +64,12 @@ export function buildStatusReplyMarkup(activeModel, currentThinkingLevel, queueI
         },
     ]);
     if (pendingCancellationCount > 0)
-        rows.push([{
+        rows.push([
+            {
                 text: `❌ Pending cancellations: ${pendingCancellationCount}`,
                 callback_data: "reroutecancel:review:open",
-            }]);
+            },
+        ]);
     if (sectionRegistry) {
         const sectionRows = getTelegramSectionMainMenuRows(sectionRegistry);
         for (const row of sectionRows) {

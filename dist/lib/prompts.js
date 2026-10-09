@@ -121,13 +121,8 @@ export function buildTelegramBridgeSystemPrompt(options) {
         : "";
     return {
         systemPrompt: Array.isArray(basePrompt)
-            ? [
-                ...basePrompt,
-                options.localSystemPromptSuffix + telegramSuffix,
-            ]
-            : basePrompt +
-                options.localSystemPromptSuffix +
-                telegramSuffix,
+            ? [...basePrompt, options.localSystemPromptSuffix + telegramSuffix]
+            : basePrompt + options.localSystemPromptSuffix + telegramSuffix,
     };
 }
 export function createTelegramBeforeAgentStartHook(options = {}) {

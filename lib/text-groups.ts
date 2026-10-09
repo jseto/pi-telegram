@@ -7,6 +7,7 @@
 import { setTimeout as waitForTimeout } from "node:timers/promises";
 
 import {
+  createTelegramPendingGroupLifecycle,
   extractTelegramMessageText,
   type TelegramMessageForwardOrigin,
   type TelegramMessageUser,
@@ -47,9 +48,7 @@ export interface TelegramTextGroupState<TMessage, TContext = unknown> {
 export type TelegramForwardCommentBatchPosition = "comment" | "forward";
 
 export interface TelegramTextGroupController<TMessage, TContext = unknown> {
-  prepareUpdateBatch: (
-    updates: readonly { message?: TMessage }[],
-  ) => void;
+  prepareUpdateBatch: (updates: readonly { message?: TMessage }[]) => void;
   getPreparedForwardingPosition: (
     message: TelegramTextGroupMessage,
   ) => TelegramForwardCommentBatchPosition | undefined;
@@ -306,6 +305,7 @@ export function createTelegramTextGroupController<
       : (timer: ReturnType<typeof setTimeout>): void => {
           (timer as unknown as AbortController).abort();
         });
+  const lifecycle = createTelegramPendingGroupLifecycle(groups, clearTimer);
   return {
     prepareUpdateBatch(updates) {
       for (let index = 0; index + 1 < updates.length; index += 1) {
@@ -408,43 +408,9 @@ export function createTelegramTextGroupController<
             : undefined,
       });
     },
-    async flushMessage(messageId) {
-      for (const state of groups.values()) {
-        if (!state.messages.some((message) => message.message_id === messageId)) {
-          continue;
-        }
-        if (state.flushTimer) clearTimer(state.flushTimer);
-        state.flushTimer = undefined;
-        await state.dispatchNow?.();
-        if (
-          state.messages.some((message) => message.message_id === messageId) &&
-          !state.dispatching
-        ) {
-          await state.dispatchNow?.();
-        }
-        return true;
-      }
-      return false;
-    },
-    suspend: () => {
-      for (const state of groups.values()) {
-        state.suspended = true;
-        if (state.flushTimer) clearTimer(state.flushTimer);
-        state.flushTimer = undefined;
-      }
-    },
-    resume: (context) => {
-      for (const state of groups.values()) {
-        state.context = context;
-        state.suspended = false;
-        if (!state.dispatching && !state.flushTimer) state.reschedule?.();
-      }
-    },
+    ...lifecycle,
     clear: () => {
-      for (const state of groups.values()) {
-        if (state.flushTimer) clearTimer(state.flushTimer);
-      }
-      groups.clear();
+      lifecycle.clear();
       plannedForwardCommentStarts.clear();
       plannedForwardCommentEnds.clear();
     },

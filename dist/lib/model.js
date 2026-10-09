@@ -3,6 +3,7 @@
  * Zones: pi agent model control, telegram controls, queue continuation
  * Owns model identity, thinking levels, scoped resolution, current-model state, and in-flight model switching
  */
+import { truncateTelegramQueueSummary, } from "./queue.js";
 import { TELEGRAM_PREFIX } from "./turns.js";
 export const THINKING_LEVELS = [
     "off",
@@ -277,21 +278,6 @@ export function restartTelegramModelSwitchContinuation(state) {
     state.abort();
     return true;
 }
-function truncateTelegramModelSwitchStatusSummary(text, maxWords = 4, maxLength = 32) {
-    const normalized = text.replace(/\s+/g, " ").trim();
-    if (!normalized)
-        return "";
-    const words = normalized.split(" ");
-    let summary = words.slice(0, maxWords).join(" ");
-    if (summary.length === 0)
-        summary = normalized;
-    if (summary.length > maxLength) {
-        summary = summary.slice(0, maxLength).trimEnd();
-    }
-    return summary.length < normalized.length || words.length > maxWords
-        ? `${summary}…`
-        : summary;
-}
 export function buildTelegramModelSwitchContinuationText(telegramPrefix, model, thinkingLevel) {
     const modelLabel = `${model.provider}/${model.id}`;
     const thinkingSuffix = thinkingLevel ? `; thinking: ${thinkingLevel}` : "";
@@ -299,7 +285,7 @@ export function buildTelegramModelSwitchContinuationText(telegramPrefix, model, 
 }
 export function buildTelegramModelSwitchContinuationTurn(options) {
     const modelLabel = `${options.selection.model.provider}/${options.selection.model.id}`;
-    const statusLabel = truncateTelegramModelSwitchStatusSummary(`continue on ${options.selection.model.id}`);
+    const statusLabel = truncateTelegramQueueSummary(`continue on ${options.selection.model.id}`, 4, 32);
     return {
         kind: "prompt",
         chatId: options.turn.chatId,

@@ -5,7 +5,7 @@
  */
 import { readFile } from "node:fs/promises";
 import { basename } from "node:path";
-import { buildCommandTemplateInvocation, expandCommandTemplateConfigs, normalizeCommandTemplateConfig, substituteCommandTemplateToken, } from "./command-templates.js";
+import { buildCommandTemplateInvocation, createCommandTemplateRecovery, getCommandTemplateCompositionSteps, getCommandTemplateConfiguredTimeout, getCommandTemplateStepTimeout, normalizeCommandTemplateConfig, resolveCommandTemplateNumericField, shouldRunCommandTemplateConfig, } from "./command-templates.js";
 import { getTelegramVoiceTranscriptionProviders } from "./voice.js";
 const DEFAULT_INBOUND_HANDLER_TIMEOUT_MS = 120_000;
 const INBOUND_HANDLER_REGISTRY_KEY = "__piTelegramInboundHandlers__";
@@ -155,41 +155,9 @@ export function buildTelegramInboundHandlerInvocation(handler, file, cwd, append
         throw new Error("Inbound handler template is required");
     return buildTelegramInboundTemplateInvocation(handler, file, cwd, appendFileIfMissing);
 }
-function resolveTelegramInboundNumericControlField(value, values, label) {
-    if (value === undefined)
-        return undefined;
-    const resolved = typeof value === "string"
-        ? substituteCommandTemplateToken(value, values, label)
-        : value;
-    if (resolved === "")
-        return undefined;
-    const numeric = Number(resolved);
-    if (!Number.isFinite(numeric) || numeric < 0)
-        throw new Error(`Command template ${label} must be a non-negative number.`);
-    return numeric;
-}
-function getTelegramInboundHandlerConfiguredTimeout(handler) {
-    const timeout = typeof handler === "string" ? undefined : handler.timeout;
-    return resolveTelegramInboundNumericControlField(timeout, {}, "timeout");
-}
 function getTelegramInboundHandlerTimeout(handler) {
-    return (getTelegramInboundHandlerConfiguredTimeout(handler) ??
+    return (getCommandTemplateConfiguredTimeout(handler) ??
         DEFAULT_INBOUND_HANDLER_TIMEOUT_MS);
-}
-function getRemainingTelegramInboundTimeout(timeout, startedAt) {
-    return Math.max(1, timeout - (Date.now() - startedAt));
-}
-function getTelegramInboundInitialCompositionStepTimeout(handler, step) {
-    const timeout = getTelegramInboundHandlerTimeout(handler);
-    const stepTimeout = getTelegramInboundHandlerConfiguredTimeout(step);
-    return stepTimeout === undefined ? timeout : Math.min(stepTimeout, timeout);
-}
-function getTelegramInboundCompositionStepTimeout(handler, step, startedAt) {
-    const remaining = getRemainingTelegramInboundTimeout(getTelegramInboundHandlerTimeout(handler), startedAt);
-    const stepTimeout = getTelegramInboundHandlerConfiguredTimeout(step);
-    return stepTimeout === undefined
-        ? remaining
-        : Math.min(stepTimeout, remaining);
 }
 function getTelegramInboundHandlerKind(handler) {
     if (Array.isArray(handler.template))
@@ -208,27 +176,30 @@ function formatTelegramInboundHandlerFailure(result) {
         parts.push(`stdout:\n${truncateTelegramInboundFailureStream(result.stdout)}`);
     return parts.join("\n\n");
 }
+function getTelegramInboundHandlerRetryOptions(handler, values, cwd, timeout, deps) {
+    if (typeof handler !== "object" || handler.retry === undefined)
+        return {};
+    const recover = createCommandTemplateRecovery(handler, values, {
+        cwd,
+        timeout,
+        execCommand: deps.execCommand,
+    });
+    return {
+        retry: resolveCommandTemplateNumericField(handler.retry, {}, "retry"),
+        ...(recover ? { recover } : {}),
+    };
+}
 async function executeTelegramInboundHandlerInvocation(handler, file, cwd, deps, appendFileIfMissing = true, timeout = getTelegramInboundHandlerTimeout(handler), stdin) {
     const invocation = buildTelegramInboundHandlerInvocation(handler, file, cwd, appendFileIfMissing);
     const result = await deps.execCommand(invocation.command, invocation.args, {
         cwd,
         timeout,
-        ...(typeof handler === "object" && handler.retry !== undefined
-            ? {
-                retry: resolveTelegramInboundNumericControlField(handler.retry, {}, "retry"),
-            }
-            : {}),
+        ...getTelegramInboundHandlerRetryOptions(handler, getTelegramInboundHandlerTemplateValues(file), cwd, timeout, deps),
         ...(stdin !== undefined ? { stdin } : {}),
     });
     if (result.code !== 0)
         throw new Error(formatTelegramInboundHandlerFailure(result));
     return truncateTelegramInboundOutput(result.stdout);
-}
-function getTelegramInboundHandlerCompositionSteps(handler) {
-    if (Array.isArray(handler.template)) {
-        return expandCommandTemplateConfigs(handler);
-    }
-    return [];
 }
 function getTelegramTextHandlerFile() {
     return {
@@ -264,28 +235,24 @@ async function executeTelegramTextHandlerInvocation(handler, text, cwd, deps, ti
         cwd,
         timeout,
         stdin: text,
-        ...(typeof handler === "object" && handler.retry !== undefined
-            ? {
-                retry: resolveTelegramInboundNumericControlField(handler.retry, {}, "retry"),
-            }
-            : {}),
+        ...getTelegramInboundHandlerRetryOptions(handler, getTelegramInboundHandlerTemplateValues(getTelegramTextHandlerFile(), text), cwd, timeout, deps),
     });
     if (result.code !== 0)
         throw new Error(formatTelegramInboundHandlerFailure(result));
     return truncateTelegramInboundOutput(result.stdout);
 }
 async function executeTelegramTextHandler(handler, text, cwd, deps) {
-    const steps = getTelegramInboundHandlerCompositionSteps(handler);
+    const steps = getCommandTemplateCompositionSteps(handler);
     if (steps.length === 0) {
         return (await executeTelegramTextHandlerInvocation(handler, text, cwd, deps)).trim();
     }
     const startedAt = Date.now();
     let output = text;
     for (const [index, step] of steps.entries()) {
+        if (!shouldRunCommandTemplateConfig(step, getTelegramInboundHandlerTemplateValues(getTelegramTextHandlerFile(), output)))
+            continue;
         try {
-            output = await executeTelegramTextHandlerInvocation(step, output, cwd, deps, index === 0
-                ? getTelegramInboundInitialCompositionStepTimeout(handler, step)
-                : getTelegramInboundCompositionStepTimeout(handler, step, startedAt));
+            output = await executeTelegramTextHandlerInvocation(step, output, cwd, deps, getCommandTemplateStepTimeout(getTelegramInboundHandlerTimeout(handler), step, index === 0 ? undefined : Date.now() - startedAt));
         }
         catch (error) {
             if (typeof step === "object" && step.failure === "root")
@@ -303,6 +270,9 @@ async function processTelegramTextHandlers(options) {
     let text = options.rawText;
     for (const handler of findTelegramTextHandlers(options.handlers)) {
         try {
+            // An unresolvable guard fails only this handler, like its command would.
+            if (!shouldRunCommandTemplateConfig(handler, getTelegramInboundHandlerTemplateValues(getTelegramTextHandlerFile(), text)))
+                continue;
             const output = await executeTelegramTextHandler(handler, text, options.cwd, options);
             if (output)
                 text = output;
@@ -384,18 +354,22 @@ async function readBuiltInTelegramTextAttachment(file) {
     return truncateTelegramInboundOutput(`[${name}]\n${normalized}`);
 }
 async function executeTelegramInboundHandler(handler, file, cwd, deps) {
-    const steps = getTelegramInboundHandlerCompositionSteps(handler);
+    const steps = getCommandTemplateCompositionSteps(handler);
     if (steps.length === 0) {
         const output = await executeTelegramInboundHandlerInvocation(handler, file, cwd, deps);
         return output.trim();
     }
     const startedAt = Date.now();
+    const values = getTelegramInboundHandlerTemplateValues(file);
     let output = "";
-    for (const [index, step] of steps.entries()) {
+    let started = false;
+    for (const step of steps) {
+        if (!shouldRunCommandTemplateConfig(step, values))
+            continue;
+        const first = !started;
+        started = true;
         try {
-            output = await executeTelegramInboundHandlerInvocation(step, file, cwd, deps, false, index === 0
-                ? getTelegramInboundInitialCompositionStepTimeout(handler, step)
-                : getTelegramInboundCompositionStepTimeout(handler, step, startedAt), index === 0 ? undefined : output);
+            output = await executeTelegramInboundHandlerInvocation(step, file, cwd, deps, false, getCommandTemplateStepTimeout(getTelegramInboundHandlerTimeout(handler), step, first ? undefined : Date.now() - startedAt), first ? undefined : output);
         }
         catch (error) {
             if (typeof step === "object" && step.failure === "root")
@@ -420,6 +394,8 @@ export async function processTelegramInboundHandlers(options) {
         const handlers = findTelegramInboundHandlers(options.handlers, file);
         for (const handler of handlers) {
             try {
+                if (!shouldRunCommandTemplateConfig(handler, getTelegramInboundHandlerTemplateValues(file)))
+                    continue;
                 const output = await executeTelegramInboundHandler(handler, file, options.cwd, options);
                 if (output) {
                     outputs.push({ file, output, handler });

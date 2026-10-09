@@ -5,6 +5,8 @@
  */
 import type { TelegramInlineKeyboardMarkup } from "./keyboard.ts";
 import { type MenuModel, type ScopedTelegramModel, type TelegramModelSwitchContinuationSource, type ThinkingLevel } from "./model.ts";
+import type { TelegramTarget } from "./target.ts";
+import { type TelegramApiCallOptions } from "./telegram-api.ts";
 export type TelegramModelScope = "all" | "scoped";
 export interface TelegramModelMenuState<TModel extends MenuModel = MenuModel> {
     chatId: number;
@@ -79,12 +81,20 @@ export type TelegramReplyMarkup = TelegramInlineKeyboardMarkup;
 export interface TelegramMenuMessageRuntimeDeps {
     editInteractiveMessage: (chatId: number, messageId: number, text: string, mode: "markdown" | "html" | "plain", replyMarkup: TelegramReplyMarkup) => Promise<void>;
     sendInteractiveMessage: (chatId: number, text: string, mode: "markdown" | "html" | "plain", replyMarkup: TelegramReplyMarkup, options?: {
-        target?: {
-            chatId: number;
-            threadId?: number;
-        };
-    }) => Promise<number | undefined>;
+        target?: TelegramTarget;
+    } & Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<number | undefined>;
 }
+/** Per-open delivery lifetime; never retain this guard in stored callback state. */
+export declare function createTelegramMenuDelivery<TModel extends MenuModel>(target: TelegramTarget, options: Pick<TelegramApiCallOptions, "assertAuthority"> | undefined, deps: Pick<TelegramMenuMessageRuntimeDeps, "sendInteractiveMessage"> & {
+    storeModelMenuState: (state: TelegramModelMenuState<TModel>) => void;
+}): {
+    assertCurrent: () => void;
+    assertAuthority: (() => void) | undefined;
+    sendInteractiveMessage: (chatId: number, text: string, mode: "html" | "markdown" | "plain", replyMarkup: TelegramInlineKeyboardMarkup, options?: ({
+        target?: TelegramTarget;
+    } & Pick<TelegramApiCallOptions, "assertAuthority">) | undefined) => Promise<number | undefined>;
+    storeModelMenuState: (state: TelegramModelMenuState<TModel>) => void;
+};
 export type TelegramModelMenuCallbackDeps<TModel extends MenuModel = MenuModel> = {
     answerCallbackQuery: (callbackQueryId: string, text?: string) => Promise<void>;
     updateModelMenuMessage: () => Promise<void>;
@@ -177,6 +187,10 @@ export interface TelegramModelMenuRuntime<TModel extends MenuModel = MenuModel> 
 export declare const TELEGRAM_MODEL_PAGE_SIZE = 6;
 export declare const MODEL_MENU_TITLE = "<b>\uD83E\uDD16 Choose a model:</b>";
 export declare const MODEL_PAGE_MENU_TITLE = "<b>Choose a page:</b>";
+/** Apply the payload mode to state, then edit the existing menu message in place. */
+export declare function editTelegramMenuMessage(state: TelegramModelMenuState, payload: TelegramMenuRenderPayload, deps: TelegramMenuMessageRuntimeDeps): Promise<void>;
+/** Apply the payload mode to state, then send a fresh menu message to its exact chat/Thread. */
+export declare function sendTelegramMenuMessage(state: TelegramModelMenuState, payload: TelegramMenuRenderPayload, deps: TelegramMenuMessageRuntimeDeps): Promise<number | undefined>;
 export declare function formatScopedModelButtonText<TModel extends MenuModel = MenuModel>(entry: ScopedTelegramModel<TModel>, currentModel: TModel | undefined): string;
 export declare function formatStatusButtonLabel(label: string, value: string): string;
 export declare function getModelMenuItems<TModel extends MenuModel = MenuModel>(state: TelegramModelMenuState<TModel>): ScopedTelegramModel<TModel>[];

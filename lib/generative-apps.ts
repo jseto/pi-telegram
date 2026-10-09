@@ -22,6 +22,8 @@ import { Worker } from "node:worker_threads";
 import { Type } from "@sinclair/typebox";
 
 import type { ExtensionAPI } from "./pi.ts";
+import { renameTelegramPathWithRetry } from "./locks.ts";
+import { isProcessAlive } from "./process-identity.ts";
 
 const GENERATIVE_APP_NAME = /^[a-z][a-z0-9-]{0,31}$/u;
 const GENERATIVE_APP_METHOD = /^[a-z][a-z0-9_]{0,31}$/u;
@@ -120,10 +122,10 @@ export interface GenerativeAppLiveSurfaceRuntimeDeps<THandle> {
     result: GenerativeAppInvocationResult,
     handle: THandle,
   ) => GenerativeAppLiveSurfaceFrame<THandle>;
-  edit: (
-    frame: GenerativeAppLiveSurfaceFrame<THandle>,
-  ) => Promise<THandle>;
-  classifyEditError?: (error: unknown) =>
+  edit: (frame: GenerativeAppLiveSurfaceFrame<THandle>) => Promise<THandle>;
+  classifyEditError?: (
+    error: unknown,
+  ) =>
     | { kind: "retry"; retryAfterMs?: number }
     | { kind: "terminal" | "unavailable" | "unknown" };
   recordRuntimeEvent?: (
@@ -131,7 +133,10 @@ export interface GenerativeAppLiveSurfaceRuntimeDeps<THandle> {
     error: unknown,
     details?: Record<string, unknown>,
   ) => void;
-  setTimer?: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
+  setTimer?: (
+    callback: () => void,
+    delayMs: number,
+  ) => ReturnType<typeof setTimeout>;
   clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
 }
 
@@ -159,7 +164,8 @@ export interface TelegramBindToolRegistrationDeps extends GenerativeAppRuntimeOp
   liveSurfaceSetTimer?: GenerativeAppLiveSurfaceRuntimeDeps<unknown>["setTimer"];
   liveSurfaceClearTimer?: GenerativeAppLiveSurfaceRuntimeDeps<unknown>["clearTimer"];
   setLiveSurfaceRuntime?: (
-    runtime: GenerativeAppLiveSurfaceRuntime<TelegramBindLiveHandle> | undefined,
+    runtime:
+      GenerativeAppLiveSurfaceRuntime<TelegramBindLiveHandle> | undefined,
   ) => void;
   isDeliveryHandleCurrent?: (handle: TelegramBindDeliveryHandle) => boolean;
   editView?: (
@@ -211,21 +217,9 @@ function wait(ms: number): Promise<void> {
   return new Promise((resolveWait) => setTimeout(resolveWait, ms));
 }
 
-function isProcessAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
 function assertAppName(app: string): void {
   if (!GENERATIVE_APP_NAME.test(app)) {
-    throw new Error(
-      "Generative App name must match /^[a-z][a-z0-9-]{0,31}$/.",
-    );
+    throw new Error("Generative App name must match /^[a-z][a-z0-9-]{0,31}$/.");
   }
 }
 
@@ -237,7 +231,10 @@ function assertMethod(method: string): void {
   }
 }
 
-function assertJsonValue(value: unknown, label: string): GenerativeAppJsonValue {
+function assertJsonValue(
+  value: unknown,
+  label: string,
+): GenerativeAppJsonValue {
   let encoded: string;
   try {
     encoded = JSON.stringify(value);
@@ -247,7 +244,9 @@ function assertJsonValue(value: unknown, label: string): GenerativeAppJsonValue 
   if (encoded === undefined) throw new Error(`${label} must be a JSON value.`);
   const parsed = JSON.parse(encoded) as GenerativeAppJsonValue;
   if (byteLength(encoded) > GENERATIVE_APP_MAX_STATE_BYTES) {
-    throw new Error(`${label} exceeds ${GENERATIVE_APP_MAX_STATE_BYTES} bytes.`);
+    throw new Error(
+      `${label} exceeds ${GENERATIVE_APP_MAX_STATE_BYTES} bytes.`,
+    );
   }
   return parsed;
 }
@@ -266,14 +265,19 @@ async function ensureManagedAppsRoot(
   try {
     const metadata = await lstat(appsRoot);
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-      throw new Error("Generative App root must be a managed non-symlink directory.");
+      throw new Error(
+        "Generative App root must be a managed non-symlink directory.",
+      );
     }
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !create) throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !create)
+      throw error;
     await mkdir(appsRoot, { mode: 0o700 });
     const metadata = await lstat(appsRoot);
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-      throw new Error("Generative App root must be a managed non-symlink directory.");
+      throw new Error(
+        "Generative App root must be a managed non-symlink directory.",
+      );
     }
   }
   return appsRoot;
@@ -295,7 +299,11 @@ async function writeFileAtomic(path: string, content: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(temporary, content, { encoding: "utf8", mode: 0o600 });
-  await rename(temporary, path);
+  // Windows may briefly deny replacing a file another reader or scanner holds; share the bounded retry.
+  if (!renameTelegramPathWithRetry(temporary, path))
+    throw new Error(
+      "Generative App staging file disappeared before publication.",
+    );
 }
 
 async function acquireGenerativeAppTransitionLock(
@@ -371,13 +379,15 @@ async function acquireGenerativeAppTransitionLock(
           } catch {
             // Re-check ownerless staleness below.
           }
-          const currentOwnerlessStale = currentOwnerPid === undefined
-            ? await stat(lockDir)
-                .then((metadata) => Date.now() - metadata.mtimeMs > 1_000)
-                .catch(() => false)
-            : false;
+          const currentOwnerlessStale =
+            currentOwnerPid === undefined
+              ? await stat(lockDir)
+                  .then((metadata) => Date.now() - metadata.mtimeMs > 1_000)
+                  .catch(() => false)
+              : false;
           if (
-            (currentOwnerPid !== undefined && !isProcessAlive(currentOwnerPid)) ||
+            (currentOwnerPid !== undefined &&
+              !isProcessAlive(currentOwnerPid)) ||
             currentOwnerlessStale
           ) {
             await rm(lockDir, { recursive: true, force: true });
@@ -388,7 +398,9 @@ async function acquireGenerativeAppTransitionLock(
         continue;
       }
       if (Date.now() >= deadline) {
-        throw new Error("Generative App transition is busy in another process.");
+        throw new Error(
+          "Generative App transition is busy in another process.",
+        );
       }
       await wait(25);
     }
@@ -398,23 +410,31 @@ async function acquireGenerativeAppTransitionLock(
 async function assertGenerativeAppModule(path: string): Promise<void> {
   const metadata = await lstat(path);
   if (!metadata.isFile() || metadata.isSymbolicLink()) {
-    throw new Error(`Generative App module is not a regular managed file: ${path}`);
+    throw new Error(
+      `Generative App module is not a regular managed file: ${path}`,
+    );
   }
   if (metadata.size > GENERATIVE_APP_MAX_MODULE_BYTES) {
-    throw new Error(`Generative App module exceeds ${GENERATIVE_APP_MAX_MODULE_BYTES} bytes.`);
+    throw new Error(
+      `Generative App module exceeds ${GENERATIVE_APP_MAX_MODULE_BYTES} bytes.`,
+    );
   }
 }
 
 async function assertManagedAppDir(appDir: string): Promise<void> {
   const metadata = await lstat(appDir);
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-    throw new Error("Generative App path must be a managed non-symlink directory.");
+    throw new Error(
+      "Generative App path must be a managed non-symlink directory.",
+    );
   }
 }
 
 async function readGenerativeAppGeneration(appDir: string): Promise<string> {
   await assertManagedAppDir(appDir);
-  const generation = (await readFile(join(appDir, "generation"), "utf8")).trim();
+  const generation = (
+    await readFile(join(appDir, "generation"), "utf8")
+  ).trim();
   if (!/^[0-9a-f]{8}-[0-9a-f-]{27}$/u.test(generation)) {
     throw new Error("Generative App installation generation is invalid.");
   }
@@ -430,7 +450,9 @@ function normalizeMethodResult(value: unknown): GenerativeAppMethodResult {
     throw new Error("Generative App method result.output must be a string.");
   }
   if (byteLength(result.output) > GENERATIVE_APP_MAX_OUTPUT_BYTES) {
-    throw new Error(`Generative App output exceeds ${GENERATIVE_APP_MAX_OUTPUT_BYTES} bytes.`);
+    throw new Error(
+      `Generative App output exceeds ${GENERATIVE_APP_MAX_OUTPUT_BYTES} bytes.`,
+    );
   }
   const viewMode = result.viewMode ?? "new";
   if (viewMode !== "new" && viewMode !== "edit") {
@@ -444,7 +466,9 @@ function normalizeMethodResult(value: unknown): GenerativeAppMethodResult {
       !Number.isInteger(result.refreshAfterMs) ||
       result.refreshAfterMs <= 0
     ) {
-      throw new Error("Generative App refreshAfterMs must be a finite positive integer.");
+      throw new Error(
+        "Generative App refreshAfterMs must be a finite positive integer.",
+      );
     }
     refreshAfterMs = Math.min(
       GENERATIVE_APP_MAX_REFRESH_AFTER_MS,
@@ -461,7 +485,9 @@ function normalizeMethodResult(value: unknown): GenerativeAppMethodResult {
   };
 }
 
-async function readStateTimeline(appDir: string): Promise<GenerativeAppStateEnvelope[]> {
+async function readStateTimeline(
+  appDir: string,
+): Promise<GenerativeAppStateEnvelope[]> {
   const path = join(appDir, "states.jsonl");
   let content: string;
   try {
@@ -483,11 +509,17 @@ async function readStateTimeline(appDir: string): Promise<GenerativeAppStateEnve
         parsed.revision !== envelopes.length ||
         typeof parsed.method !== "string" ||
         !Object.hasOwn(parsed, "state")
-      ) throw new Error("invalid envelope");
-      parsed.state = assertJsonValue(parsed.state, "Generative App journal state");
+      )
+        throw new Error("invalid envelope");
+      parsed.state = assertJsonValue(
+        parsed.state,
+        "Generative App journal state",
+      );
       envelopes.push(parsed);
     } catch {
-      const hasLaterContent = lines.slice(index + 1).some((entry) => entry.trim());
+      const hasLaterContent = lines
+        .slice(index + 1)
+        .some((entry) => entry.trim());
       if (!hasLaterContent) {
         await writeFileAtomic(
           path,
@@ -496,7 +528,9 @@ async function readStateTimeline(appDir: string): Promise<GenerativeAppStateEnve
         );
         break;
       }
-      throw new Error(`Generative App state journal is corrupt at line ${index + 1}.`);
+      throw new Error(
+        `Generative App state journal is corrupt at line ${index + 1}.`,
+      );
     }
   }
   return envelopes;
@@ -537,23 +571,26 @@ async function executeGenerativeAppWorker(options: {
   options.execution?.assertCurrent();
   await assertGenerativeAppModule(options.modulePath);
   return await new Promise((resolveResult, rejectResult) => {
-    const worker = new Worker(new URL("./generative-app-worker.mjs", import.meta.url), {
-      execArgv: [],
-      workerData: {
-        argument: options.argument,
-        argumentPresent: options.argument !== undefined,
-        method: options.method,
-        methodTimeoutMs: options.methodTimeoutMs,
-        modulePath: options.modulePath,
-        app: options.app,
-        revision: options.revision,
-        runMaxArgs: GENERATIVE_APP_RUN_MAX_ARGS,
-        runMaxStreamBytes: GENERATIVE_APP_RUN_MAX_STREAM_BYTES,
-        runMaxTimeoutMs: GENERATIVE_APP_RUN_MAX_TIMEOUT_MS,
-        state: options.state,
-        statePresent: options.state !== undefined,
+    const worker = new Worker(
+      new URL("./generative-app-worker.mjs", import.meta.url),
+      {
+        execArgv: [],
+        workerData: {
+          argument: options.argument,
+          argumentPresent: options.argument !== undefined,
+          method: options.method,
+          methodTimeoutMs: options.methodTimeoutMs,
+          modulePath: options.modulePath,
+          app: options.app,
+          revision: options.revision,
+          runMaxArgs: GENERATIVE_APP_RUN_MAX_ARGS,
+          runMaxStreamBytes: GENERATIVE_APP_RUN_MAX_STREAM_BYTES,
+          runMaxTimeoutMs: GENERATIVE_APP_RUN_MAX_TIMEOUT_MS,
+          state: options.state,
+          statePresent: options.state !== undefined,
+        },
       },
-    });
+    );
     let settled = false;
     let terminationError: Error | undefined;
     let terminationStarted = false;
@@ -594,22 +631,25 @@ async function executeGenerativeAppWorker(options: {
     }, options.methodTimeoutMs);
     timeout.unref?.();
     options.execution?.signal.addEventListener("abort", abort, { once: true });
-    worker.on("message", (message: {
-      error?: string;
-      ok?: boolean;
-      result?: unknown;
-      type?: string;
-    }) => {
-      if (terminationError) {
-        if (message?.type === "abort-ack") terminateAndFinish();
-      } else if (message?.ok === true) {
-        finish(undefined, message.result);
-        void worker.terminate();
-      } else {
-        finish(new Error(message?.error || "Generative App worker failed."));
-        void worker.terminate();
-      }
-    });
+    worker.on(
+      "message",
+      (message: {
+        error?: string;
+        ok?: boolean;
+        result?: unknown;
+        type?: string;
+      }) => {
+        if (terminationError) {
+          if (message?.type === "abort-ack") terminateAndFinish();
+        } else if (message?.ok === true) {
+          finish(undefined, message.result);
+          void worker.terminate();
+        } else {
+          finish(new Error(message?.error || "Generative App worker failed."));
+          void worker.terminate();
+        }
+      },
+    );
     worker.once("error", (error) => finish(terminationError ?? error));
     worker.once("exit", (code) => {
       if (terminationError) finish(terminationError);
@@ -622,7 +662,10 @@ async function executeGenerativeAppWorker(options: {
 
 const invocationQueues = new Map<string, Promise<unknown>>();
 
-function serializeInvocation<T>(key: string, operation: () => Promise<T>): Promise<T> {
+function serializeInvocation<T>(
+  key: string,
+  operation: () => Promise<T>,
+): Promise<T> {
   const previous = invocationQueues.get(key) ?? Promise.resolve();
   const current = previous.catch(() => undefined).then(operation);
   invocationQueues.set(key, current);
@@ -697,7 +740,10 @@ async function invokeMethod(options: {
     const encodedEnvelope = `${JSON.stringify(envelope)}\n`;
     const encodedState = `${JSON.stringify(result.state, null, 2)}\n`;
     if (options.method === "init") {
-      await writeFileAtomic(join(options.appDir, "states.jsonl"), encodedEnvelope);
+      await writeFileAtomic(
+        join(options.appDir, "states.jsonl"),
+        encodedEnvelope,
+      );
     } else {
       await appendFile(join(options.appDir, "states.jsonl"), encodedEnvelope, {
         encoding: "utf8",
@@ -721,21 +767,27 @@ async function invokeMethod(options: {
   };
 }
 
-export async function invokeGenerativeApp(options: GenerativeAppRuntimeOptions & {
-  argument?: unknown;
-  expectedGeneration?: string;
-  expectedRevision?: number;
-  method: string;
-  app: string;
-}): Promise<GenerativeAppInvocationResult> {
+export async function invokeGenerativeApp(
+  options: GenerativeAppRuntimeOptions & {
+    argument?: unknown;
+    expectedGeneration?: string;
+    expectedRevision?: number;
+    method: string;
+    app: string;
+  },
+): Promise<GenerativeAppInvocationResult> {
   assertAppName(options.app);
   assertMethod(options.method);
-  const argument = options.argument === undefined
-    ? undefined
-    : assertJsonValue(options.argument, "Generative App argument");
+  const argument =
+    options.argument === undefined
+      ? undefined
+      : assertJsonValue(options.argument, "Generative App argument");
   await ensureManagedAppsRoot(options.agentDir, false);
   const appDir = resolveGenerativeAppDir(options.agentDir, options.app);
-  const modulePath = resolveGenerativeAppModulePath(options.agentDir, options.app);
+  const modulePath = resolveGenerativeAppModulePath(
+    options.agentDir,
+    options.app,
+  );
   return await serializeInvocation(appDir, async () => {
     const releaseLock = await acquireGenerativeAppTransitionLock(appDir);
     try {
@@ -750,7 +802,8 @@ export async function invokeGenerativeApp(options: GenerativeAppRuntimeOptions &
           ? { expectedRevision: options.expectedRevision }
           : {}),
         method: options.method,
-        methodTimeoutMs: options.methodTimeoutMs ?? GENERATIVE_APP_METHOD_TIMEOUT_MS,
+        methodTimeoutMs:
+          options.methodTimeoutMs ?? GENERATIVE_APP_METHOD_TIMEOUT_MS,
         modulePath,
         app: options.app,
       });
@@ -760,12 +813,14 @@ export async function invokeGenerativeApp(options: GenerativeAppRuntimeOptions &
   });
 }
 
-export async function installGenerativeApp(options: GenerativeAppRuntimeOptions & {
-  argument?: unknown;
-  app: string;
-  replace?: boolean;
-  script: string;
-}): Promise<GenerativeAppInvocationResult> {
+export async function installGenerativeApp(
+  options: GenerativeAppRuntimeOptions & {
+    argument?: unknown;
+    app: string;
+    replace?: boolean;
+    script: string;
+  },
+): Promise<GenerativeAppInvocationResult> {
   assertAppName(options.app);
   const sourcePath = resolve(options.script);
   if (extname(sourcePath) !== ".mjs") {
@@ -776,10 +831,14 @@ export async function installGenerativeApp(options: GenerativeAppRuntimeOptions 
   }
   const sourceMetadata = await lstat(sourcePath);
   if (!sourceMetadata.isFile() || sourceMetadata.isSymbolicLink()) {
-    throw new Error("Generative App source must be a regular non-symlink file.");
+    throw new Error(
+      "Generative App source must be a regular non-symlink file.",
+    );
   }
   if (sourceMetadata.size > GENERATIVE_APP_MAX_MODULE_BYTES) {
-    throw new Error(`Generative App module exceeds ${GENERATIVE_APP_MAX_MODULE_BYTES} bytes.`);
+    throw new Error(
+      `Generative App module exceeds ${GENERATIVE_APP_MAX_MODULE_BYTES} bytes.`,
+    );
   }
   const appsRoot = await ensureManagedAppsRoot(options.agentDir, true);
   const appDir = resolveGenerativeAppDir(options.agentDir, options.app);
@@ -788,17 +847,23 @@ export async function installGenerativeApp(options: GenerativeAppRuntimeOptions 
     try {
       const metadata = await lstat(appDir);
       if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-        throw new Error(`Generative App ${options.app} path is not a managed directory.`);
+        throw new Error(
+          `Generative App ${options.app} path is not a managed directory.`,
+        );
       }
       installed = true;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
     if (installed && options.replace !== true) {
-      throw new Error(`Generative App ${options.app} is already installed; set replace to true.`);
+      throw new Error(
+        `Generative App ${options.app} is already installed; set replace to true.`,
+      );
     }
     if (!installed && options.replace === true) {
-      throw new Error(`Generative App ${options.app} is not installed and cannot be replaced.`);
+      throw new Error(
+        `Generative App ${options.app} is not installed and cannot be replaced.`,
+      );
     }
     const releaseLock = installed
       ? await acquireGenerativeAppTransitionLock(appDir)
@@ -815,15 +880,17 @@ export async function installGenerativeApp(options: GenerativeAppRuntimeOptions 
         encoding: "utf8",
         mode: 0o600,
       });
-      const argument = options.argument === undefined
-        ? undefined
-        : assertJsonValue(options.argument, "Generative App argument");
+      const argument =
+        options.argument === undefined
+          ? undefined
+          : assertJsonValue(options.argument, "Generative App argument");
       const result = await invokeMethod({
         appDir: stagingDir,
         ...(argument !== undefined ? { argument } : {}),
         ...(options.execution ? { execution: options.execution } : {}),
         method: "init",
-        methodTimeoutMs: options.methodTimeoutMs ?? GENERATIVE_APP_METHOD_TIMEOUT_MS,
+        methodTimeoutMs:
+          options.methodTimeoutMs ?? GENERATIVE_APP_METHOD_TIMEOUT_MS,
         modulePath: stagingModule,
         app: options.app,
       });
@@ -864,18 +931,22 @@ export function parseGenerativeAppBoundAction(
   prompt: string,
 ): GenerativeAppBoundAction | undefined {
   if (!prompt.includes("::")) return undefined;
-  const match = /^([a-z][a-z0-9-]{0,31})::([a-z][a-z0-9_]{0,31})(?:\(([\s\S]+)\))?$/u.exec(
-    prompt,
-  );
+  const match =
+    /^([a-z][a-z0-9-]{0,31})::([a-z][a-z0-9_]{0,31})(?:\(([\s\S]+)\))?$/u.exec(
+      prompt,
+    );
   if (!match) throw new Error("Malformed Generative App bound action.");
   const [, app, method, encodedArgument] = match;
-  if (!app || !method) throw new Error("Malformed Generative App bound action.");
+  if (!app || !method)
+    throw new Error("Malformed Generative App bound action.");
   if (encodedArgument === undefined) return { method, app };
   let argument: unknown;
   try {
     argument = JSON.parse(encodedArgument);
   } catch {
-    throw new Error("Generative App bound action argument must be strict JSON.");
+    throw new Error(
+      "Generative App bound action argument must be strict JSON.",
+    );
   }
   return {
     argument: assertJsonValue(argument, "Generative App bound action argument"),
@@ -884,37 +955,15 @@ export function parseGenerativeAppBoundAction(
   };
 }
 
-export async function invokeGenerativeAppBoundAction(
+export async function bindGenerativeApp(
   options: GenerativeAppRuntimeOptions & {
-    expectedGeneration?: string;
-    expectedRevision?: number;
-    prompt: string;
+    argument?: unknown;
+    method?: string;
+    app: string;
+    replace?: boolean;
+    script?: string;
   },
-): Promise<GenerativeAppInvocationResult | undefined> {
-  const action = parseGenerativeAppBoundAction(options.prompt);
-  if (!action) return undefined;
-  return await invokeGenerativeApp({
-    agentDir: options.agentDir,
-    ...(action.argument !== undefined ? { argument: action.argument } : {}),
-    ...(options.expectedGeneration !== undefined
-      ? { expectedGeneration: options.expectedGeneration }
-      : {}),
-    ...(options.expectedRevision !== undefined
-      ? { expectedRevision: options.expectedRevision }
-      : {}),
-    method: action.method,
-    methodTimeoutMs: options.methodTimeoutMs,
-    app: action.app,
-  });
-}
-
-export async function bindGenerativeApp(options: GenerativeAppRuntimeOptions & {
-  argument?: unknown;
-  method?: string;
-  app: string;
-  replace?: boolean;
-  script?: string;
-}): Promise<GenerativeAppInvocationResult> {
+): Promise<GenerativeAppInvocationResult> {
   const hasScript = typeof options.script === "string";
   const hasMethod = typeof options.method === "string";
   if (hasScript === hasMethod) {
@@ -926,7 +975,9 @@ export async function bindGenerativeApp(options: GenerativeAppRuntimeOptions & {
   return hasScript
     ? await installGenerativeApp({
         agentDir: options.agentDir,
-        ...(options.argument !== undefined ? { argument: options.argument } : {}),
+        ...(options.argument !== undefined
+          ? { argument: options.argument }
+          : {}),
         methodTimeoutMs: options.methodTimeoutMs,
         app: options.app,
         replace: options.replace,
@@ -934,7 +985,9 @@ export async function bindGenerativeApp(options: GenerativeAppRuntimeOptions & {
       })
     : await invokeGenerativeApp({
         agentDir: options.agentDir,
-        ...(options.argument !== undefined ? { argument: options.argument } : {}),
+        ...(options.argument !== undefined
+          ? { argument: options.argument }
+          : {}),
         method: options.method!,
         methodTimeoutMs: options.methodTimeoutMs,
         app: options.app,
@@ -956,10 +1009,12 @@ export function createGenerativeAppLiveSurfaceRuntime<THandle>(
     };
   }
   const records = new Map<string, Record>();
-  const setTimer: NonNullable<GenerativeAppLiveSurfaceRuntimeDeps<THandle>["setTimer"]> =
-    deps.setTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
-  const clearTimer: NonNullable<GenerativeAppLiveSurfaceRuntimeDeps<THandle>["clearTimer"]> =
-    deps.clearTimer ?? ((timer) => clearTimeout(timer));
+  const setTimer: NonNullable<
+    GenerativeAppLiveSurfaceRuntimeDeps<THandle>["setTimer"]
+  > = deps.setTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
+  const clearTimer: NonNullable<
+    GenerativeAppLiveSurfaceRuntimeDeps<THandle>["clearTimer"]
+  > = deps.clearTimer ?? ((timer) => clearTimeout(timer));
   let active = true;
 
   const clearRecordTimer = (record: Record): void => {
@@ -1029,7 +1084,9 @@ export function createGenerativeAppLiveSurfaceRuntime<THandle>(
       record.surface.refreshAfterMs = result.refreshAfterMs;
       schedule(record, result.refreshAfterMs);
     } catch (error) {
-      const classification = deps.classifyEditError?.(error) ?? { kind: "unknown" as const };
+      const classification = deps.classifyEditError?.(error) ?? {
+        kind: "unknown" as const,
+      };
       if (!ownsRecord(key, record)) return;
       deps.recordRuntimeEvent?.("generative-app", error, {
         phase: "live-surface-refresh",
@@ -1040,9 +1097,13 @@ export function createGenerativeAppLiveSurfaceRuntime<THandle>(
         cancel(key);
         return;
       }
-      const delay = classification.retryAfterMs === undefined
-        ? record.retryDelayMs
-        : Math.max(GENERATIVE_APP_MIN_REFRESH_AFTER_MS, classification.retryAfterMs);
+      const delay =
+        classification.retryAfterMs === undefined
+          ? record.retryDelayMs
+          : Math.max(
+              GENERATIVE_APP_MIN_REFRESH_AFTER_MS,
+              classification.retryAfterMs,
+            );
       record.retryDelayMs = Math.min(60_000, Math.max(4_000, delay * 2));
       schedule(record, delay);
     } finally {
@@ -1068,10 +1129,15 @@ export function createGenerativeAppLiveSurfaceRuntime<THandle>(
     async resume(surface, result) {
       if (!active || !deps.isCurrent(surface)) return;
       const frame = deps.plan(result, surface.handle);
-      const handle = frame.digest === surface.initialDigest
-        ? surface.handle
-        : await deps.edit(frame);
-      if (result.refreshAfterMs === undefined || !deps.isCurrent({ ...surface, handle })) return;
+      const handle =
+        frame.digest === surface.initialDigest
+          ? surface.handle
+          : await deps.edit(frame);
+      if (
+        result.refreshAfterMs === undefined ||
+        !deps.isCurrent({ ...surface, handle })
+      )
+        return;
       open({
         ...surface,
         appGeneration: result.generation,
@@ -1100,7 +1166,9 @@ export function formatDisplayedGenerativeAppToolOutput(): string {
 
 export function formatGenerativeAppToolError(error: unknown): Error {
   const message = error instanceof Error ? error.message : String(error);
-  return new Error(`\n${message.replace(/^\n+/u, "") || "Generative App operation failed."}`);
+  return new Error(
+    `\n${message.replace(/^\n+/u, "") || "Generative App operation failed."}`,
+  );
 }
 
 // Provider tool APIs reject recursive $ref schemas (OpenAI) and raw TypeBox
@@ -1139,53 +1207,73 @@ export function registerTelegramBindTool(
     const view = {
       text: planned.markdown,
       parseMode: "markdown" as const,
-      ...(planned.replyMarkup !== undefined ? { replyMarkup: planned.replyMarkup } : {}),
+      ...(planned.replyMarkup !== undefined
+        ? { replyMarkup: planned.replyMarkup }
+        : {}),
     };
     return {
       digest: createHash("sha256").update(JSON.stringify(view)).digest("hex"),
       handle: { delivery: handle.delivery, view },
     };
   };
-  const liveSurfaces = deps.planOutput && deps.editView && deps.isDeliveryHandleCurrent
-    ? createGenerativeAppLiveSurfaceRuntime<TelegramBindLiveHandle>({
-        agentDir: deps.agentDir,
-        isCurrent: (surface) => deps.isDeliveryHandleCurrent!(surface.handle.delivery),
-        plan: planFrame,
-        async edit(frame) {
-          const view = frame.handle.view;
-          if (!view) throw new Error("Generative App live frame is missing its planned view.");
-          const edited = await deps.editView!(frame.handle.delivery, view);
-          if (!edited.ok) throw Object.assign(new Error(edited.message), {
-            deliveryFailureReason: edited.reason,
-            ...(edited.retryAfterMs === undefined ? {} : { retryAfterMs: edited.retryAfterMs }),
-          });
-          return { delivery: edited.value, view };
-        },
-        classifyEditError(error) {
-          const failure = error as {
-            deliveryFailureReason?: string;
-            retryAfterMs?: number;
-          };
-          if (failure.deliveryFailureReason === "rate-limited") {
-            return { kind: "retry", retryAfterMs: failure.retryAfterMs };
-          }
-          if (failure.deliveryFailureReason === "transport-retryable") {
-            return { kind: "retry" };
-          }
-          if (failure.deliveryFailureReason === "message-unavailable") {
-            return { kind: "unavailable" };
-          }
-          return {
-            kind: failure.deliveryFailureReason === "commit-unknown" ? "unknown" : "terminal",
-          };
-        },
-        recordRuntimeEvent: deps.recordRuntimeEvent,
-        ...(deps.liveSurfaceSetTimer ? { setTimer: deps.liveSurfaceSetTimer } : {}),
-        ...(deps.liveSurfaceClearTimer ? { clearTimer: deps.liveSurfaceClearTimer } : {}),
-      })
-    : undefined;
+  const liveSurfaces =
+    deps.planOutput && deps.editView && deps.isDeliveryHandleCurrent
+      ? createGenerativeAppLiveSurfaceRuntime<TelegramBindLiveHandle>({
+          agentDir: deps.agentDir,
+          isCurrent: (surface) =>
+            deps.isDeliveryHandleCurrent!(surface.handle.delivery),
+          plan: planFrame,
+          async edit(frame) {
+            const view = frame.handle.view;
+            if (!view)
+              throw new Error(
+                "Generative App live frame is missing its planned view.",
+              );
+            const edited = await deps.editView!(frame.handle.delivery, view);
+            if (!edited.ok)
+              throw Object.assign(new Error(edited.message), {
+                deliveryFailureReason: edited.reason,
+                ...(edited.retryAfterMs === undefined
+                  ? {}
+                  : { retryAfterMs: edited.retryAfterMs }),
+              });
+            return { delivery: edited.value, view };
+          },
+          classifyEditError(error) {
+            const failure = error as {
+              deliveryFailureReason?: string;
+              retryAfterMs?: number;
+            };
+            if (failure.deliveryFailureReason === "rate-limited") {
+              return { kind: "retry", retryAfterMs: failure.retryAfterMs };
+            }
+            if (failure.deliveryFailureReason === "transport-retryable") {
+              return { kind: "retry" };
+            }
+            if (failure.deliveryFailureReason === "message-unavailable") {
+              return { kind: "unavailable" };
+            }
+            return {
+              kind:
+                failure.deliveryFailureReason === "commit-unknown"
+                  ? "unknown"
+                  : "terminal",
+            };
+          },
+          recordRuntimeEvent: deps.recordRuntimeEvent,
+          ...(deps.liveSurfaceSetTimer
+            ? { setTimer: deps.liveSurfaceSetTimer }
+            : {}),
+          ...(deps.liveSurfaceClearTimer
+            ? { clearTimer: deps.liveSurfaceClearTimer }
+            : {}),
+        })
+      : undefined;
   deps.setLiveSurfaceRuntime?.(liveSurfaces);
-  const surfaceKey = (app: string, handle: TelegramBindDeliveryHandle): string =>
+  const surfaceKey = (
+    app: string,
+    handle: TelegramBindDeliveryHandle,
+  ): string =>
     getTelegramBindLiveSurfaceKey(
       app,
       deps.getActiveProfileName?.() ?? "default",
@@ -1196,21 +1284,28 @@ export function registerTelegramBindTool(
     label: "Telegram Bind",
     description:
       "Install, explicitly replace, or invoke one named method on a managed Generative App; successful output displays directly in the active Telegram turn unless display is false.",
-    parameters: Type.Object({
-      app: Type.String(),
-      script: Type.Optional(Type.String()),
-      method: Type.Optional(Type.String()),
-      replace: Type.Optional(Type.Boolean()),
-      display: Type.Optional(Type.Boolean()),
-      argument: Type.Optional(
-        createTelegramBindJsonArgumentSchema(TELEGRAM_BIND_JSON_ARGUMENT_MAX_DEPTH),
-      ),
-    }, { additionalProperties: false }),
+    parameters: Type.Object(
+      {
+        app: Type.String(),
+        script: Type.Optional(Type.String()),
+        method: Type.Optional(Type.String()),
+        replace: Type.Optional(Type.Boolean()),
+        display: Type.Optional(Type.Boolean()),
+        argument: Type.Optional(
+          createTelegramBindJsonArgumentSchema(
+            TELEGRAM_BIND_JSON_ARGUMENT_MAX_DEPTH,
+          ),
+        ),
+      },
+      { additionalProperties: false },
+    ),
     async execute(_toolCallId, params) {
       try {
         const result = await bindGenerativeApp({
           agentDir: deps.agentDir,
-          ...(params.argument !== undefined ? { argument: params.argument } : {}),
+          ...(params.argument !== undefined
+            ? { argument: params.argument }
+            : {}),
           ...("method" in params && typeof params.method === "string"
             ? { method: params.method }
             : {}),
@@ -1223,10 +1318,13 @@ export function registerTelegramBindTool(
             : {}),
           methodTimeoutMs: deps.methodTimeoutMs,
         });
-        const activeTurn = params.display === false
-          ? undefined
-          : deps.getActiveTurn?.();
-        if (activeTurn && deps.planOutput && (deps.sendView || deps.sendMarkdownReply)) {
+        const activeTurn =
+          params.display === false ? undefined : deps.getActiveTurn?.();
+        if (
+          activeTurn &&
+          deps.planOutput &&
+          (deps.sendView || deps.sendMarkdownReply)
+        ) {
           try {
             const planned = deps.planOutput(result.output, {
               binding: {
@@ -1284,7 +1382,12 @@ export function registerTelegramBindTool(
               );
             }
             return {
-              content: [{ type: "text", text: formatDisplayedGenerativeAppToolOutput() }],
+              content: [
+                {
+                  type: "text",
+                  text: formatDisplayedGenerativeAppToolOutput(),
+                },
+              ],
               details: { ...result, displayed: true, messageId },
             };
           } catch (error) {
@@ -1294,13 +1397,23 @@ export function registerTelegramBindTool(
               method: result.method,
             });
             return {
-              content: [{ type: "text", text: formatGenerativeAppToolOutput(result.output) }],
+              content: [
+                {
+                  type: "text",
+                  text: formatGenerativeAppToolOutput(result.output),
+                },
+              ],
               details: { ...result, displayed: false, displayFailed: true },
             };
           }
         }
         return {
-          content: [{ type: "text", text: formatGenerativeAppToolOutput(result.output) }],
+          content: [
+            {
+              type: "text",
+              text: formatGenerativeAppToolOutput(result.output),
+            },
+          ],
           details: { ...result, displayed: false },
         };
       } catch (error) {

@@ -1,3 +1,8 @@
+/**
+ * Telegram bridge path resolution for Pi-compatible runtimes
+ * Zones: telemetry paths, filesystem, runtime identity
+ * Owns agent-dir detection and extension-local path derivation
+ */
 export declare const TELEGRAM_DEFAULT_PROFILE_NAME = "default";
 export interface TelegramAgentDirResolutionInput {
     env?: Partial<Pick<NodeJS.ProcessEnv, "PI_CODING_AGENT_DIR">>;

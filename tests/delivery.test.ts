@@ -14,7 +14,6 @@ import {
   createTelegramDeliveryTargetPolicyRuntime,
   createTelegramDeliveryRuntime as createConcreteDeliveryRuntime,
   deleteTelegramView,
-  editTelegramTargetView,
   editTelegramView,
   isTelegramDeliveryExplicitTargetAuthorized,
   resolveTelegramDeliveryAggregateTarget,
@@ -88,12 +87,11 @@ test("Delivery API delegates operations to the current runtime", async () => {
   );
   assert.equal(sent.ok, true);
   await editTelegramView(handle("one"), { text: "updated" });
-  await editTelegramTargetView(target, 11, { text: "result" });
   await deleteTelegramView(handle("one"));
   await sendTelegramChatAction("typing", {
     scope: { kind: "aggregate" },
   });
-  assert.deepEqual(calls, ["send", "edit", "edit", "delete", "action:typing"]);
+  assert.deepEqual(calls, ["send", "edit", "delete", "action:typing"]);
 });
 
 test("Delivery API rejects empty views before transport", async () => {
@@ -740,10 +738,12 @@ test("Concrete delivery runtime serializes operations per target", async () => {
       order.push("action");
     },
   });
+  assert.equal(runtime.hasPendingTarget?.(target), false);
   const sending = runtime.sendView(
     { text: "one" },
     { scope: { kind: "instance" } },
   );
+  assert.equal(runtime.hasPendingTarget?.(target), true, "Logical admission precedes transport entry");
   await new Promise((resolve) => setTimeout(resolve, 0));
   const action = runtime.sendChatAction("typing", { kind: "instance" });
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -751,4 +751,5 @@ test("Concrete delivery runtime serializes operations per target", async () => {
   releaseFirst?.();
   await Promise.all([sending, action]);
   assert.deepEqual(order, ["first-start", "first-end", "action"]);
+  assert.equal(runtime.hasPendingTarget?.(target), false);
 });

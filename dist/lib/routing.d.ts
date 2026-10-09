@@ -43,6 +43,71 @@ export declare function resolveTelegramGuestPromptPeer(input: {
 export declare function resolveTelegramGuestFileScope(input: Parameters<typeof resolveTelegramGuestPromptPeer>[0]): string;
 import * as Threads from "./threads.ts";
 import * as Updates from "./updates.ts";
+/** Prepare the selected leader's exact retained originals; no copy, adoption, acceptance proof or dispatch. */
+export declare function prepareTelegramLiveLeaderOriginal(input: {
+    request: Threads.TelegramWorkspaceRestoreRequest;
+    messages: readonly unknown[];
+    isCurrent(): boolean;
+}): Updates.TelegramLiveDeferredInputPreparation | undefined;
+export type TelegramLiveRebindCleanupIssue = {
+    status: "not-ready";
+} | {
+    status: "finished";
+    operationId: string;
+    cleanup: ThreadReconciler.TelegramLiveRebindCleanupOutcome;
+    recorded: boolean;
+};
+/** Default live-rebind cleanup pacing: quick early attempts, then minutely, within a 15-minute window. */
+export declare const TELEGRAM_LIVE_REBIND_CLEANUP_SCHEDULE: Readonly<{
+    delaysMs: readonly number[];
+    intervalMs: 60000;
+    windowMs: number;
+}>;
+/** Chooser-scoped saved command reference; it is never retained after the chooser record. */
+type TelegramLiveRebindSelectedCommandReference = {
+    operationId: string;
+    preparedSource: Bus.TelegramBusPreparedCommandSource;
+    selectedCommand: Bus.TelegramBusSelectedCommandInput;
+};
+/** One warm live attempt with exact post-release peer donor settlement; no startup recovery, Restore ACK or cleanup. */
+export declare function createTelegramLiveRebindCoordinator(input: {
+    request: Threads.TelegramWorkspaceRestoreRequest;
+    /** Captures caller source/reference, admission, profile, transport and Pi lifetime. */
+    authority: Threads.TelegramWorkspaceRestoreAuthority;
+    messages: readonly unknown[];
+    restoreStore: Threads.TelegramWorkspaceRestore;
+    threadStore: Pick<Threads.TelegramTopicTargetStore, "withWorkspaceRestoreSnapshot">;
+    getRecipient(): (Threads.TelegramWorkspaceRestoreRecipient & {
+        bindingKey: string;
+    }) | undefined;
+    leader?: {
+        apply(intent: Threads.TelegramWorkspaceLiveRebindIntent, mode: "apply" | "inspect", isCurrent: () => boolean): Promise<void>;
+        /** Synchronous local identity only; safe inside a Workspace publication fence. */
+        isApplied(intent: Threads.TelegramWorkspaceLiveRebindIntent): boolean;
+    } & ({
+        /** Confirm ordinary queue admission of these same bound messages, never handler replay. */
+        continue(messages: readonly unknown[], isCurrent: () => boolean): Promise<boolean>;
+        /** Observe only the same issued admission through its existing receipt owner; never re-enqueue. */
+        observeAdmission?(): boolean;
+        complete?: never;
+    } | {
+        /** Issue one semantic completion; the adapter owns detached delivery and errors, not a removal ACK. */
+        complete(messages: readonly unknown[], isCurrent: () => boolean): void;
+        continue?: never;
+    });
+    follower?: {
+        run: ReturnType<typeof Bus.createTelegramBusLiveRebindController>;
+        /** Explicit staged singleton command branch; absence preserves ordinary live input behavior. */
+        selectedCommand?: Bus.TelegramBusSelectedCommandInput;
+    };
+    recordRuntimeEvent?: (category: string, error: unknown, details: Record<string, unknown>) => void;
+}): {
+    /** Correlation only; a later cleanup attempt rereads and revalidates the canonical row itself. */
+    operationId: string;
+    /** Body-free copy of the authenticated saved command reference: correlation only, never authority, an ACK or a cleanup permit. */
+    selectedCommandReference(): TelegramLiveRebindSelectedCommandReference | undefined;
+    advance(): Promise<"protected" | "unknown" | "released">;
+};
 /** One admitted Restore attempt through recipient readiness, never source dispatch or cleanup. */
 export declare function advanceTelegramWorkspaceRestore(input: {
     request: Threads.TelegramWorkspaceRestoreRequest;
@@ -68,8 +133,8 @@ export declare function advanceTelegramWorkspaceRestore(input: {
     inspectOnly?: true;
 }): Promise<Threads.TelegramWorkspaceRestoreIntent | undefined>;
 export declare const TELEGRAM_ALL_TAB_COMMAND_MAX_AGE_MS: number;
-/** One user-facing answer for expired or previous-process routing controls. */
-export declare const TELEGRAM_ROUTING_CHOICE_EXPIRED = "\u231B Routing choice expired.";
+/** The toast for expired or previous-process routing controls; the chooser notice is written separately. */
+export declare const TELEGRAM_ROUTING_CHOICE_EXPIRED = "Routing choice expired";
 export declare function isTelegramAllTabCommandExpired(message: {
     date?: number;
     message_thread_id?: number;
@@ -132,17 +197,36 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
         journalBindingKey: string;
     }) => TelegramUpdateJournalQueuedReceiptEvidence | undefined;
     hasWorkspaceRestoreAuthority?: () => boolean;
+    /** Exact live root authority; capability advertisement alone cannot replace owned profile/session/recipient fences. */
+    hasWorkspaceLiveRebindAuthority?: () => boolean;
     /** Strict complete namespace plus exact current/historical references; only an empty result clears journal protection. */
-    inspectTemporaryThreadSources?: (target: Queue.TelegramQueueTarget, requiredJournalBindingKeys: readonly string[]) => readonly number[] | undefined;
+    inspectTemporaryThreadSources?: (target: Queue.TelegramQueueTarget, requiredJournalBindingKeys: readonly string[], ownInputs?: readonly Threads.TelegramTemporaryThreadInput[]) => readonly number[] | undefined;
     /** Quiet period after the last cancelled input before one cleanup attempt; defaults to 1000 ms. */
     temporaryThreadCleanupDelayMs?: number;
+    /** Live-rebind cleanup attempt pacing; the bounded window ends in `not-issued`, never a time-based deletion. */
+    liveRebindCleanupSchedule?: {
+        delaysMs: readonly number[];
+        intervalMs: number;
+        windowMs: number;
+    };
     getSessionGeneration?: () => number;
     workspaceRestoreRecipient?: {
         getSessionId: (ctx: TContext) => string | undefined;
         getCwd: (ctx: TContext) => string | undefined;
         getLeaderIdentity: Threads.TelegramLeaderThreadStateRuntime["getIdentity"];
+        /** Read-only current leader work; source/chooser lifetime is not recipient authority. */
+        observeLeaderWork?: (oldTarget: Queue.TelegramQueueTarget & {
+            threadId: number;
+        }, ctx: TContext) => Bus.TelegramBusLiveRebindWorkState;
         followerRegistry: Pick<Bus.TelegramBusFollowerRegistry, "get" | "register">;
         runFollower: ReturnType<typeof Bus.createTelegramBusWorkspaceRestoreController>;
+        liveFollower?: {
+            /** Pure trusted assembly availability (Commands/native/menu and local protocol), never future target activation. */
+            isSelectedCommandAvailable?(follower: Readonly<Bus.TelegramBusFollowerView>, name: string): boolean;
+            /** Exact session journal identity from the existing registration/journal owners, never the profile routing key. */
+            getJournalBindingKey(follower: Bus.TelegramBusFollowerView): string | undefined;
+            run: ReturnType<typeof Bus.createTelegramBusLiveRebindController>;
+        };
     };
     bridgeRuntime: TelegramBridgeRuntime;
     activeTurnRuntime: Queue.TelegramActiveTurnStore;
@@ -154,9 +238,11 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
     currentModelRuntime: Model.CurrentModelRuntime<TContext, TModel>;
     modelSwitchController: Model.TelegramModelSwitchController<TContext, Model.ScopedTelegramModel<TModel>>;
     menuActions: Menu.TelegramMenuActionRuntime<TContext, TModel>;
+    /** Thinking controls refuse while the active Telegram turn expects a voice reply. */
+    isVoiceReplyActive?: () => boolean;
     updateSettingsMenuMessage?: (state: Menu.TelegramModelMenuState<TModel>, ctx: TContext) => Promise<void>;
-    openQueueMenu: (chatId: number, replyToMessageId: number, ctx: TContext) => Promise<void>;
-    openSettingsMenu?: (chatId: number, replyToMessageId: number, ctx: TContext) => Promise<void>;
+    openQueueMenu: (chatId: number, replyToMessageId: number, ctx: TContext, threadId?: number, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<void>;
+    openSettingsMenu?: (chatId: number, replyToMessageId: number, ctx: TContext, threadId?: number, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<void>;
     settingsMenuCallbackHandler?: (query: TCallbackQuery, ctx: TContext) => Promise<boolean>;
     queueMenuCallbackHandler: (query: TCallbackQuery, ctx: TContext) => Promise<boolean>;
     buttonActionStore?: OutboundHandlers.TelegramButtonActionStore;
@@ -184,12 +270,16 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
         };
     }) => void;
     stopTypingLoop?: () => void;
-    answerCallbackQuery: (callbackQueryId: string, text?: string) => Promise<void>;
-    editInteractiveMessage?: (chatId: number, messageId: number, text: string, mode: "markdown" | "html" | "plain", replyMarkup: Menu.TelegramReplyMarkup) => Promise<void>;
+    answerCallbackQuery: (callbackQueryId: string, text?: string, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<void>;
+    editInteractiveMessage?: (chatId: number, messageId: number, text: string, mode: "markdown" | "html" | "plain", replyMarkup: Menu.TelegramReplyMarkup, options?: {
+        target?: Queue.TelegramQueueTarget;
+        assertAuthority?: TelegramApiCallOptions["assertAuthority"];
+    }) => Promise<void>;
     editMessageReplyMarkup?: (chatId: number, messageId: number, replyMarkup: OutboundHandlers.TelegramOutboundButtonMarkup) => Promise<void>;
     sendInteractiveMessage?: (chatId: number, text: string, mode: "markdown" | "html" | "plain", replyMarkup: Menu.TelegramReplyMarkup, options?: {
         target?: Queue.TelegramQueueTarget;
         replyToMessageId?: number;
+        assertAuthority?: TelegramApiCallOptions["assertAuthority"];
     }) => Promise<number | undefined>;
     deleteMessage?: (chatId: number, messageId: number) => Promise<void>;
     answerGuestQuery: (guestQueryId: string, text?: string) => Promise<void>;
@@ -202,8 +292,11 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
     sendTextReply: (chatId: number, replyToMessageId: number, text: string, options?: {
         parseMode?: "HTML";
         target?: Queue.TelegramQueueTarget;
+        assertAuthority?: TelegramApiCallOptions["assertAuthority"];
     }) => Promise<number | undefined>;
     setMyCommands: Commands.TelegramBotCommandRegistrationDeps["setMyCommands"];
+    /** Captures independent recipient authority, never the source execution or dialog handle. */
+    captureThreadNameRecipientAuthority?: (target: Queue.TelegramQueueTarget, ctx: TContext) => (() => void) | undefined;
     validateThreadName?: (threadName: string) => string | undefined;
     renameCurrentThread?: Commands.TelegramThreadDisplayNameRenamePort;
     resetCurrentThreadName?: Commands.TelegramThreadDisplayNameResetPort;
@@ -223,6 +316,7 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
         onError: (error: unknown) => void;
     }) => void;
     recordRuntimeEvent?: (category: string, error: unknown, details?: Record<string, unknown>) => void;
+    beginCommandEffectWork?: Commands.TelegramCommandRuntimeDeps<TMessage, TContext>["beginCommandEffectWork"];
     sectionRegistry?: TelegramSectionRegistry;
     sendSectionRichMessage?: (chatId: number, message: TelegramInputRichMessage, options?: {
         target?: {
@@ -249,6 +343,25 @@ export declare function createTelegramInboundRouteRuntime<TUpdate extends Update
     onUpdateCompleted: NonNullable<Updates.TelegramUpdateWorkerRuntimeDeps<TContext>["onUpdateCompleted"]>;
     onWorkspaceRestoreRecipientObserved(follower: Bus.TelegramBusFollowerView, isCurrent: () => boolean, ctx: TContext | undefined): Promise<void> | undefined;
     waitForRestoreSettlement(): Promise<void>;
+    /** Commands-owned registry port for dormant scoped recipient assembly, not ordinary update replay. */
+    prepareHeldCommand: ReturnType<typeof Commands.createTelegramCommandHandlerTargetRuntime<TMessage, TContext>>["prepareHeldCommand"];
+    canPrepareHeldCommand: ReturnType<typeof Commands.createTelegramCommandHandlerTargetRuntime<TMessage, TContext>>["canPrepareHeldCommand"];
+    /** Fresh body-free recipient observation only; never reconstructs an attempt or grants cleanup. */
+    observeLiveRebindLeaderWork(intent: Threads.TelegramWorkspaceLiveRebindIntent, ctx: TContext): Promise<Bus.TelegramBusLiveRebindWorkObservation | undefined>;
+    /** Fresh non-destructive candidate only; no retained idle, cleanup action or deletion grant. */
+    prepareLiveRebindLeaderCleanup(intent: Threads.TelegramWorkspaceLiveRebindIntent, ctx: TContext): Promise<ThreadReconciler.TelegramLiveRebindCleanupPreparation | undefined>;
+    /** Requires the authenticated peer's exact retained released carrier; never recreates save/apply/release. */
+    prepareLiveRebindFollowerCleanup(intent: Threads.TelegramWorkspaceLiveRebindIntent, ctx: TContext): Promise<ThreadReconciler.TelegramLiveRebindCleanupPreparation | undefined>;
+    /**
+     * One cleanup attempt under fresh admission: a fresh clear sample, then the durable issue marker, one unretried
+     * deletion and the terminal record. `not-ready` leaves the released row unissued; `undefined` is lost authority.
+     */
+    issueLiveRebindLeaderCleanup(intent: Threads.TelegramWorkspaceLiveRebindIntent, ctx: TContext): Promise<TelegramLiveRebindCleanupIssue | undefined>;
+    issueLiveRebindFollowerCleanup(intent: Threads.TelegramWorkspaceLiveRebindIntent, ctx: TContext): Promise<TelegramLiveRebindCleanupIssue | undefined>;
+    /** Coordinator-only prompt admission; caller retains Workspace/canonical and exact recipient authority. */
+    continueLiveRebindPrompt(messages: readonly TMessage[], ctx: TContext, target: Queue.TelegramQueueTarget & {
+        threadId: number;
+    }, isCurrent: () => boolean): Promise<boolean>;
 };
 export interface TelegramAssistantOutputAuthority<TTransportStamp> {
     transportStamp: TTransportStamp;

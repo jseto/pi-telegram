@@ -4,7 +4,10 @@
  * Owns model identity, thinking levels, scoped resolution, current-model state, and in-flight model switching
  */
 
-import type { PendingTelegramTurn } from "./queue.ts";
+import {
+  truncateTelegramQueueSummary,
+  type PendingTelegramTurn,
+} from "./queue.ts";
 import { TELEGRAM_PREFIX } from "./turns.ts";
 
 export interface MenuModel {
@@ -428,24 +431,6 @@ export function restartTelegramModelSwitchContinuation<
   return true;
 }
 
-function truncateTelegramModelSwitchStatusSummary(
-  text: string,
-  maxWords = 4,
-  maxLength = 32,
-): string {
-  const normalized = text.replace(/\s+/g, " ").trim();
-  if (!normalized) return "";
-  const words = normalized.split(" ");
-  let summary = words.slice(0, maxWords).join(" ");
-  if (summary.length === 0) summary = normalized;
-  if (summary.length > maxLength) {
-    summary = summary.slice(0, maxLength).trimEnd();
-  }
-  return summary.length < normalized.length || words.length > maxWords
-    ? `${summary}…`
-    : summary;
-}
-
 export function buildTelegramModelSwitchContinuationText<
   TModel extends MenuModel,
 >(
@@ -473,8 +458,10 @@ export function buildTelegramModelSwitchContinuationTurn<
   laneOrder: number;
 }): PendingTelegramTurn {
   const modelLabel = `${options.selection.model.provider}/${options.selection.model.id}`;
-  const statusLabel = truncateTelegramModelSwitchStatusSummary(
+  const statusLabel = truncateTelegramQueueSummary(
     `continue on ${options.selection.model.id}`,
+    4,
+    32,
   );
   return {
     kind: "prompt",
@@ -643,8 +630,7 @@ export function createTelegramModelSwitchController<TContext, TSelection>(
   deps: TelegramModelSwitchControllerDeps<TContext, TSelection>,
 ): TelegramModelSwitchController<TContext, TSelection> {
   let pendingContinuationTurn:
-    | TelegramModelSwitchContinuationSource
-    | undefined;
+    TelegramModelSwitchContinuationSource | undefined;
   const triggerPendingAbort = (ctx: TContext): boolean => {
     const turn = pendingContinuationTurn ?? deps.getActiveTurn();
     if (

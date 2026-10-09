@@ -225,42 +225,33 @@ export interface TelegramThreadAwarePollingPorts<TContext, TOwner> {
     restoreFollowerWithOwner: (ctx: TContext, owner: TOwner) => Promise<boolean | undefined>;
     stopFollowerRegistration: () => void;
 }
-export interface TelegramThreadAwarePollingDeps<TContext, TOwner> extends TelegramStartupThreadCapabilityProbeDeps {
-    lifecycle?: TelegramThreadCapabilityLifecycle;
+/** Classic/leader polling and follower registration controls that thread-aware polling switches between. */
+export interface TelegramThreadAwarePollingControls<TContext, TOwner> {
+    startClassicPolling: (ctx: TContext) => MaybePromise<void>;
+    stopClassicPolling: () => Promise<void>;
+    startBusLeaderPolling: (ctx: TContext) => Promise<void>;
+    stopBusLeaderPolling: () => Promise<void>;
+    startLeaderHealth: () => void;
+    stopLeaderHealth: () => void;
+    registerFollowerWithLeader: (ctx: TContext, owner: TOwner) => Promise<boolean | undefined>;
+    restoreFollowerWithLeader?: (ctx: TContext, owner: TOwner) => Promise<boolean | undefined>;
+    hasRememberedWorkspaceBinding?: (ctx: TContext) => boolean;
+    stopFollowerRegistration: () => void;
     isBusRuntimeEnabled: () => boolean;
     isTopicModeUnavailableError: (error: unknown) => boolean;
+}
+export interface TelegramThreadAwarePollingDeps<TContext, TOwner> extends TelegramStartupThreadCapabilityProbeDeps, TelegramThreadAwarePollingControls<TContext, TOwner> {
+    lifecycle?: TelegramThreadCapabilityLifecycle;
     getPollingStartedWithTelegramBus: () => boolean;
     setPollingStartedWithTelegramBus: (started: boolean) => void;
     setForceFreshLeaderThreadOnNextStart: (forceFresh: boolean) => void;
-    startClassicPolling: (ctx: TContext) => MaybePromise<void>;
-    stopClassicPolling: () => Promise<void>;
-    startBusLeaderPolling: (ctx: TContext) => Promise<void>;
-    stopBusLeaderPolling: () => Promise<void>;
-    startLeaderHealth: () => void;
-    stopLeaderHealth: () => void;
-    registerFollowerWithLeader: (ctx: TContext, owner: TOwner) => Promise<boolean | undefined>;
-    restoreFollowerWithLeader?: (ctx: TContext, owner: TOwner) => Promise<boolean | undefined>;
-    hasRememberedWorkspaceBinding?: (ctx: TContext) => boolean;
-    stopFollowerRegistration: () => void;
 }
-export interface TelegramThreadCapabilityOrchestrationDeps<TContext, TOwner> extends TelegramThreadCapabilityReaderDeps {
+export interface TelegramThreadCapabilityOrchestrationDeps<TContext, TOwner> extends TelegramThreadCapabilityReaderDeps, TelegramThreadAwarePollingControls<TContext, TOwner> {
     state: TelegramThreadCapabilityStateRuntime;
     topicTargetStore: TelegramThreadCapabilityStore;
-    isBusRuntimeEnabled: () => boolean;
     ownsLock: (ctx: TContext) => boolean;
     isFollowerRegistered?: () => boolean;
-    startClassicPolling: (ctx: TContext) => MaybePromise<void>;
-    stopClassicPolling: () => Promise<void>;
-    startBusLeaderPolling: (ctx: TContext) => Promise<void>;
-    stopBusLeaderPolling: () => Promise<void>;
-    startLeaderHealth: () => void;
-    stopLeaderHealth: () => void;
-    registerFollowerWithLeader: (ctx: TContext, owner: TOwner) => Promise<boolean | undefined>;
-    restoreFollowerWithLeader?: (ctx: TContext, owner: TOwner) => Promise<boolean | undefined>;
-    hasRememberedWorkspaceBinding?: (ctx: TContext) => boolean;
     suspendLiveThreadTarget?: () => void;
-    stopFollowerRegistration: () => void;
-    isTopicModeUnavailableError: (error: unknown) => boolean;
     updateStatus: (ctx: TContext) => void;
     recordEvent: (category: string, message: unknown, details?: Record<string, unknown>) => void;
 }
@@ -308,10 +299,8 @@ export interface TelegramPollingBatchAdmissionDeps<TUpdate extends TelegramUpdat
     onPhaseChange?: (phase: TelegramPollingWorkPhase, currentUpdateId?: number) => void;
 }
 export declare function admitTelegramPollingUpdateBatch<TUpdate extends TelegramUpdate>(deps: TelegramPollingBatchAdmissionDeps<TUpdate>): Promise<TelegramPollingBatchAdmissionResult>;
-export interface TelegramPollLoopDeps<TUpdate extends TelegramUpdate, TContext = unknown> extends TelegramRuntimeEventRecorderPort {
-    ctx: TContext;
-    signal: AbortSignal;
-    config: TelegramPollingConfig;
+/** Bot API, journal and progress ports shared by one poll loop and its restartable runner. */
+export interface TelegramPollLoopTransportPorts<TUpdate extends TelegramUpdate> extends TelegramRuntimeEventRecorderPort {
     deleteWebhook: (signal: AbortSignal) => Promise<unknown>;
     getUpdates: (body: Record<string, unknown>, signal: AbortSignal) => Promise<TUpdate[]>;
     getUpdatesRequestBudgetMs?: (body: Record<string, unknown>) => number;
@@ -320,26 +309,21 @@ export interface TelegramPollLoopDeps<TUpdate extends TelegramUpdate, TContext =
     getAcceptedThroughUpdateId?: () => number | undefined;
     getJournalEntryCount: () => number;
     signalUpdateWorker: () => void;
-    onErrorStatus: (message: string) => void;
-    onStatusReset: () => void;
-    sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
     onPhaseChange?: (phase: TelegramPollingWorkPhase, currentUpdateId?: number) => void;
     onSuccessfulResponse?: (updateCount: number) => void;
 }
-export interface TelegramPollLoopRunnerDeps<TUpdate extends TelegramUpdate, TContext = unknown> extends TelegramRuntimeEventRecorderPort {
+export interface TelegramPollLoopDeps<TUpdate extends TelegramUpdate, TContext = unknown> extends TelegramPollLoopTransportPorts<TUpdate> {
+    ctx: TContext;
+    signal: AbortSignal;
+    config: TelegramPollingConfig;
+    onErrorStatus: (message: string) => void;
+    onStatusReset: () => void;
+    sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
+}
+export interface TelegramPollLoopRunnerDeps<TUpdate extends TelegramUpdate, TContext = unknown> extends TelegramPollLoopTransportPorts<TUpdate> {
     getConfig: () => TelegramPollingConfig;
-    deleteWebhook: (signal: AbortSignal) => Promise<unknown>;
-    getUpdates: (body: Record<string, unknown>, signal: AbortSignal) => Promise<TUpdate[]>;
-    getUpdatesRequestBudgetMs?: (body: Record<string, unknown>) => number;
-    persistConfig: (config: TelegramPollingConfig) => Promise<void>;
-    appendUpdateBatch: (updates: readonly TUpdate[], acceptedThroughUpdateId?: number) => MaybePromise<unknown>;
-    getAcceptedThroughUpdateId?: () => number | undefined;
-    getJournalEntryCount: () => number;
-    signalUpdateWorker: () => void;
     updateStatus: (ctx: TContext, message?: string) => void;
     sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
-    onPhaseChange?: (phase: TelegramPollingWorkPhase, currentUpdateId?: number) => void;
-    onSuccessfulResponse?: (updateCount: number) => void;
 }
 export declare function sleepTelegramPollingRetry(ms: number, signal?: AbortSignal): Promise<void>;
 export declare function createTelegramPollLoopRunner<TUpdate extends TelegramUpdate, TContext = unknown>(deps: TelegramPollLoopRunnerDeps<TUpdate, TContext>): (ctx: TContext, signal: AbortSignal) => Promise<void>;

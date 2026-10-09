@@ -45,8 +45,7 @@ export function createTimeInjectionRuntime(deps) {
                 return line;
             const previous = lastInjectedAt.get(chatId);
             const nowMs = now.getTime();
-            if (previous !== undefined &&
-                nowMs - previous < config.interval) {
+            if (previous !== undefined && nowMs - previous < config.interval) {
                 return null;
             }
             lastInjectedAt.set(chatId, nowMs);

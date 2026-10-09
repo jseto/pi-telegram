@@ -5,9 +5,9 @@
  * cross-instance forwarding helpers, and the live follower registry model.
  */
 import { type TelegramBusEndpointLayout, type TelegramBusTransportEventRecorder, type TelegramBusTransportRetryPolicy } from "./bus-transport.ts";
-import { type TelegramQueueHandoffPayload } from "./queue.ts";
-import type { TelegramTarget } from "./target.ts";
 import type { TelegramThreadDisplayMode } from "./config.ts";
+import { type TelegramQueueHandoffPayload } from "./queue.ts";
+import { type TelegramTarget } from "./target.ts";
 import { type TelegramSessionReplacementIntent } from "./threads.ts";
 interface TelegramBusProcessRuntime {
     instanceId: string;
@@ -17,21 +17,6 @@ interface TelegramBusProcessRuntime {
     getLeaderSocketPath: () => string;
     getFollowerSocketPath: () => string;
 }
-interface TelegramProcessBirthIdentityOptions {
-    platform?: NodeJS.Platform;
-    readProcStat?: (pid: number) => string;
-    readDarwinProcessStart?: (pid: number) => string;
-}
-export type TelegramProcessLiveness = "alive" | "dead" | "unverifiable";
-interface TelegramProcessLivenessOptions extends TelegramProcessBirthIdentityOptions {
-    isProcessAlive?: (pid: number) => boolean;
-}
-export declare function getTelegramProcessBirthIdentity(pid: number, fallbackGeneration: number | string, options?: TelegramProcessBirthIdentityOptions): string;
-export declare function getTelegramProcessLiveness(owner: {
-    processId: number;
-    processBirthId: string;
-}, options?: TelegramProcessLivenessOptions): TelegramProcessLiveness;
-export declare function getTelegramProcessBirthIdentityLiveness(processBirthId: string, options?: TelegramProcessLivenessOptions): TelegramProcessLiveness;
 export declare function createCurrentTelegramBusProcessRuntime(input: {
     getActiveProfileName: () => string | undefined;
     endpointLayout?: TelegramBusEndpointLayout;
@@ -57,6 +42,122 @@ export declare const TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT: "director
 export declare const TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT: "workspace-follower-auto-connect-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT: "session-replacement-intent-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE: "workspace-restore-v1";
+export declare const TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SAVE: "live-thread-rebind-save-v1";
+export declare const TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY: "live-thread-rebind-apply-v1";
+export declare const TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SETTLE: "live-thread-rebind-settle-v1";
+/** Restricted recipient text/menu delivery; negotiated identity and captured effect authority remain required. */
+export declare const TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY: "selected-menu-delivery-v1";
+/** Versioned held-command set; syntax is shared, while the captured recipient Commands registry owns supported plans. */
+export declare const TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_COMMAND_SET: "live-thread-rebind-command-set-v1";
+/** Every live rebinding needs the save/apply/settle trio; held command selections additionally need these two. */
+export declare const TELEGRAM_BUS_LIVE_REBIND_CAPABILITIES: readonly ["live-thread-rebind-save-v1", "live-thread-rebind-apply-v1", "live-thread-rebind-settle-v1"];
+export declare const TELEGRAM_BUS_HELD_COMMAND_CAPABILITIES: readonly ["live-thread-rebind-command-set-v1", "selected-menu-delivery-v1"];
+export interface TelegramBusSelectedCommandInput {
+    name: string;
+    target: TelegramTarget & {
+        threadId: number;
+    };
+}
+export type TelegramBusSelectedMenuTextEffect = {
+    text: string;
+    parseMode?: "HTML";
+    replyMarkup?: {
+        inline_keyboard: {
+            text: string;
+            callback_data: string;
+        }[][];
+    };
+} & ({
+    kind: "send-text";
+    replyToMessageId?: number;
+} | {
+    kind: "edit-text";
+    messageId: number;
+});
+/** Serializable identity/effect description, never a process-local callback or standalone delivery grant. */
+export interface TelegramBusSelectedMenuDelivery {
+    kind: "follower.deliverSelectedMenu";
+    requestId: string;
+    instanceId: string;
+    registrationGeneration: string;
+    operationId: string;
+    recipient: {
+        sessionId: string;
+        sessionGeneration: number;
+        processId: number;
+        processBirthId: string;
+        profileKey: string;
+        journalBindingKey: string;
+        target: TelegramTarget & {
+            threadId: number;
+        };
+    };
+    executor: {
+        instanceId: string;
+        leaderEpoch: string;
+    };
+    operatorUserId: number;
+    effect: TelegramBusSelectedMenuTextEffect;
+    sentAtMs: number;
+}
+export interface TelegramBusSelectedMenuDeliveryObservation {
+    operationId: string;
+    recipient: TelegramBusSelectedMenuDelivery["recipient"];
+    registrationGeneration: string;
+    effect: TelegramBusSelectedMenuTextEffect["kind"];
+    messageId: number;
+}
+/** Closed wire projection of prepared recipient source; independent of journal implementation and never a removal grant. */
+export interface TelegramBusPreparedCommandSource {
+    journalBindingKey: string;
+    updateId: number;
+    sourceSha256: string;
+}
+export interface TelegramBusLiveRebindSaveObservation {
+    operationId: string;
+    recipient: {
+        instanceId: string;
+        sessionId: string;
+        generation: string;
+        bindingKey: string;
+    };
+    sourceUpdateIds: number[];
+    selectedCommand?: TelegramBusSelectedCommandInput;
+    preparedSource?: TelegramBusPreparedCommandSource;
+    status: "saved";
+}
+/** Read-only warm observation; semantic completion and exact source ACK are distinct from detached delivery. */
+export interface TelegramBusLiveRebindCommandObservation extends Omit<TelegramBusLiveRebindSaveObservation, "status" | "preparedSource" | "selectedCommand"> {
+    status: "command-observed";
+    selectedCommand: TelegramBusSelectedCommandInput;
+    preparedSource: TelegramBusPreparedCommandSource;
+    command: "completed" | "unknown" | "not-issued";
+    sourceAck?: TelegramBusPreparedCommandSource;
+}
+export interface TelegramBusLiveRebindWorkState {
+    sessionBusy: boolean;
+    targetWork: boolean;
+    deliveryPending: boolean;
+    unknown: boolean;
+}
+export interface TelegramBusLiveRebindWorkObservation extends Omit<TelegramBusLiveRebindSaveObservation, "status"> {
+    status: "observed";
+    oldTarget: TelegramTarget & {
+        threadId: number;
+    };
+    work: TelegramBusLiveRebindWorkState;
+}
+export interface TelegramBusLiveRebindSettlementObservation extends Omit<TelegramBusLiveRebindSaveObservation, "status"> {
+    action: "release" | "discard";
+    status: "released" | "discarded" | "protected" | "unknown";
+}
+export interface TelegramBusLiveRebindApplyObservation extends Omit<TelegramBusLiveRebindSaveObservation, "status"> {
+    status: "saved" | "applied";
+    target: TelegramTarget & {
+        threadId: number;
+    };
+    slot: string;
+}
 export interface TelegramBusWorkspaceRestoreObservation {
     operationId: string;
     recipient: {
@@ -88,6 +189,8 @@ export declare function createTelegramBusProtocolIdentity(input: {
 export declare function createTelegramCurrentBusProtocolIdentity(capabilities?: readonly string[]): TelegramBusProtocolIdentity;
 export declare function hasTelegramBusCapability(identity: TelegramBusProtocolIdentity | undefined, capability: string): boolean;
 export declare function getTelegramInputCustodyPeerReadiness(followers: readonly Pick<TelegramBusFollowerView, "registrationGeneration" | "protocol">[]): ("ready" | "legacy" | "unknown")[];
+/** Both peers advertise every required capability over a compatible protocol; reads only the two identities. */
+export declare function hasTelegramBusSharedCapabilities(local: TelegramBusProtocolIdentity, remote: TelegramBusProtocolIdentity | undefined, required: readonly string[]): boolean;
 export declare function getTelegramBusProtocolCompatibility(input: {
     local: TelegramBusProtocolIdentity;
     remote?: TelegramBusProtocolIdentity;
@@ -114,6 +217,8 @@ export interface TelegramBusInstanceRegistration {
 export interface TelegramBusFollowerView extends TelegramBusInstanceRegistration {
     lastHeartbeatMs: number;
 }
+/** Whether a live follower is still exactly the captured registration: identity, process, session, endpoint and negotiated protocol. */
+export declare function isSameTelegramBusFollowerRegistration(live: TelegramBusInstanceRegistration, captured: TelegramBusInstanceRegistration): boolean;
 export declare function getTelegramFollowerTargetOwnership(input: {
     target: TelegramTarget;
     followers: readonly TelegramBusFollowerView[];
@@ -320,6 +425,48 @@ export type TelegramBusEnvelope = ({
     delivery: TelegramBusFollowerDeliveryIdentity;
     sentAtMs: number;
 } | {
+    kind: "leader.prepareLiveRebind";
+    requestId: string;
+    recipientInstanceId: string;
+    recipientRegistrationGeneration: string;
+    recipientSessionId: string;
+    recipientBindingKey: string;
+    operationId: string;
+    updates: ({
+        update_id: number;
+    } & Record<string, unknown>)[];
+    selectedCommand?: TelegramBusSelectedCommandInput;
+    sentAtMs: number;
+} | {
+    kind: "leader.applyLiveRebind";
+    requestId: string;
+    recipientInstanceId: string;
+    recipientRegistrationGeneration: string;
+    recipientSessionId: string;
+    recipientBindingKey: string;
+    operationId: string;
+    sourceUpdateIds: number[];
+    mode: "apply" | "inspect";
+    preparedSource?: TelegramBusPreparedCommandSource;
+    selectedCommand?: TelegramBusSelectedCommandInput;
+    sentAtMs: number;
+} | {
+    kind: "leader.settleLiveRebind";
+    requestId: string;
+    recipientInstanceId: string;
+    recipientRegistrationGeneration: string;
+    recipientSessionId: string;
+    recipientBindingKey: string;
+    operationId: string;
+    sourceUpdateIds: number[];
+    mode: "release" | "discard" | "observe" | "observe-command";
+    oldTarget?: TelegramTarget & {
+        threadId: number;
+    };
+    preparedSource?: TelegramBusPreparedCommandSource;
+    selectedCommand?: TelegramBusSelectedCommandInput;
+    sentAtMs: number;
+} | {
     kind: "leader.workspaceRestore";
     requestId: string;
     recipientInstanceId: string;
@@ -370,7 +517,7 @@ export type TelegramBusEnvelope = ({
     registrationGeneration?: string;
     message: TelegramBusAgentMessage;
     sentAtMs: number;
-} | {
+} | TelegramBusSelectedMenuDelivery | {
     kind: "follower.callApi";
     requestId: string;
     instanceId: string;
@@ -394,6 +541,14 @@ export type TelegramBusEnvelope = ({
 }) & {
     auth?: string;
 };
+/** Follower-staged queue handoff offer before the follower adds its own request and registration framing. */
+export type TelegramBusFollowerQueueHandoffOffer = Omit<Extract<TelegramBusEnvelope, {
+    kind: "follower.offerQueueHandoff";
+}>, "kind" | "requestId" | "instanceId" | "registrationGeneration" | "sentAtMs" | "auth">;
+/** Leader-routed queue handoff offer as donors and leaders exchange it before envelope framing. */
+export type TelegramBusLeaderQueueHandoffOffer = Omit<Extract<TelegramBusEnvelope, {
+    kind: "leader.offerQueueHandoff";
+}>, "kind">;
 type TelegramBusEnvelopeTrafficClass = "bootstrap" | "generation-fenced" | "response";
 export declare function getTelegramBusEnvelopeTrafficClass(envelope: TelegramBusEnvelope): TelegramBusEnvelopeTrafficClass;
 export declare function createTelegramBusRequestId(input: {
@@ -419,7 +574,13 @@ interface TelegramBusLocalServerDeps {
     requestLedgerMaxEntries?: number;
     shouldDropResponse?: (request: TelegramBusEnvelope, response: TelegramBusEnvelope) => boolean;
 }
+/** Local IPC issuance proof only: this callback/error never enters the envelope or certifies a remote API effect. */
+export declare class TelegramBusLocalAuthorityError extends Error {
+    readonly requestIssued: boolean;
+    constructor(requestIssued: boolean, reason?: string);
+}
 interface TelegramBusLocalClientOptions {
+    assertAuthority?: () => void;
     socketPath: string;
     envelope: TelegramBusEnvelope;
     timeoutMs?: number;
@@ -504,7 +665,41 @@ export declare function createTelegramBusWorkspaceRestoreController(deps: {
     mode: "apply" | "inspect";
     isCurrent: () => boolean;
 }) => Promise<TelegramBusWorkspaceRestoreObservation | undefined>;
+/** Each capability has its own effect boundary; transport retries never replay save/dispatch/disposal. */
+export declare function createTelegramBusLiveRebindController(deps: {
+    getFollower(instanceId: string): TelegramBusFollowerView | undefined;
+    localProtocolIdentity: TelegramBusProtocolIdentity;
+    createRequestId(): string;
+    getAuthSecret(): string | undefined;
+    timeoutMs?: number;
+}): (input: {
+    operationId: string;
+    instanceId: string;
+    sessionId: string;
+    recipientBindingKey: string;
+    isCurrent(): boolean;
+    selectedCommand?: TelegramBusSelectedCommandInput;
+    preparedSource?: TelegramBusPreparedCommandSource;
+} & ({
+    updates: ({
+        update_id: number;
+    } & Record<string, unknown>)[];
+} | {
+    mode: "apply" | "inspect" | "release" | "discard" | "observe" | "observe-command";
+    sourceUpdateIds: number[];
+    slot: string;
+    target: TelegramTarget & {
+        threadId: number;
+    };
+    oldTarget: TelegramTarget & {
+        threadId: number;
+    };
+})) => Promise<TelegramBusLiveRebindSaveObservation | TelegramBusLiveRebindApplyObservation | TelegramBusLiveRebindSettlementObservation | TelegramBusLiveRebindWorkObservation | TelegramBusLiveRebindCommandObservation | undefined>;
 export declare function isTelegramBusEnvelopeAuthorized(envelope: TelegramBusEnvelope, secret: string | undefined): boolean;
+/** Negative acknowledgement carrying only a diagnostic message. */
+export declare function rejectTelegramBusRequest(requestId: string, message: string): Extract<TelegramBusEnvelope, {
+    kind: "bus.ack";
+}>;
 export declare function createUnauthorizedBusAck(requestId: string): TelegramBusEnvelope;
 export declare function createTelegramBusLocalServer(deps: TelegramBusLocalServerDeps): TelegramBusLocalServer;
 export declare function sendTelegramBusLocalEnvelope(options: TelegramBusLocalClientOptions): Promise<TelegramBusEnvelope | undefined>;
@@ -524,4 +719,6 @@ export interface TelegramBusFollowerRegistry {
 }
 export declare function createTelegramBusForwardOwnershipValidator(registry: Pick<TelegramBusFollowerRegistry, "get">): (ownership: TelegramBusForwardOwnership) => boolean;
 export declare function createTelegramBusFollowerRegistry(): TelegramBusFollowerRegistry;
+/** Shared closed text-effect codec; parsing alone supplies no recipient or issuance authority. */
+export declare function parseTelegramBusSelectedMenuTextEffect(effect: unknown): TelegramBusSelectedMenuTextEffect | undefined;
 export {};

@@ -13,6 +13,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -31,7 +32,6 @@ import {
   createTelegramLockedPollingRuntime,
   createTelegramLockKeyResolver,
   createTelegramLockRuntime,
-  isProcessAlive,
   readLocks,
   readTelegramRuntimeState,
   resetDamagedTelegramRuntimeState,
@@ -43,6 +43,9 @@ import {
   TELEGRAM_OWNERSHIP_CHECK_MS,
   TELEGRAM_OWNERSHIP_REFRESH_MS,
   withTelegramFileTransaction,
+  publishTelegramPrivateFile,
+  readTelegramPrivateFile,
+  TelegramPrivateFileError,
   writeLocks,
   type TelegramLockEntry,
   createTelegramLeaderJournalPathResolver,
@@ -77,17 +80,6 @@ for (const change of ["replace-session", "same-context-restart", "clear", "relea
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 }
-
-test("Process absence requires ESRCH rather than an unknown liveness error", (t) => {
-  let code: string | undefined;
-  t.mock.method(process, "kill", () => {
-    if (code) throw Object.assign(new Error("liveness unavailable"), { code });
-    return true;
-  });
-  for (code of [undefined, "ESRCH", "EPERM", "EACCES", "EINVAL", "unknown"]) {
-    assert.equal(isProcessAlive(42), code !== "ESRCH", String(code));
-  }
-});
 
 function createTempLockPath(): { dir: string; path: string } {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-owners-"));
@@ -143,6 +135,39 @@ for (const boundary of ["before-mutation", "after-mutation", "before-write", "af
       if (boundary === "after-rename") assert.deepEqual(readTelegramRuntimeState(path).profiles.default?.workspace, { binding: 66, forwardIssued: true });
       else assert.equal(readFileSync(path, "utf8"), before);
       assert.deepEqual(readdirSync(join(temp.dir, "runtime")), [], "Fault cleanup never leaves an authoritative guard or temporary snapshot");
+    } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+  });
+}
+
+for (const code of ["EPERM", "EACCES", "EBUSY"] as const) for (const revoked of [false, true]) {
+  test(`Runtime publication sharing retry respects its grant (${code}, revoked=${revoked})`, () => {
+    const temp = createTempLockPath(), path = join(temp.dir, "state.json");
+    try {
+      mutateTelegramRuntimeStateSection(path, "default", "workspace", () => ({ value: { binding: 55 }, result: true }), { isCurrent: () => true });
+      const before = readFileSync(path, "utf8");
+      let current = true, attempts = 0, stagedPath: unknown;
+      const publish = () => mutateTelegramRuntimeStateSection(path, "default", "workspace", () => ({ value: { binding: 66 }, result: true }), {
+        isCurrent: () => current,
+        publishRename(from, to) {
+          attempts++;
+          if (attempts === 1) {
+            stagedPath = from;
+            current = !revoked;
+            throw Object.assign(new Error("Temporary publication sharing conflict"), { code });
+          }
+          assert.equal(from, stagedPath, "A sharing retry reuses the same complete candidate");
+          renameSync(from, to);
+        },
+      });
+      if (revoked) {
+        assert.throws(publish, /outcome is unknown|authority changed/);
+        assert.equal(readFileSync(path, "utf8"), before, "Revoked publication cannot overwrite retained state");
+      } else {
+        assert.equal(publish(), true);
+        assert.deepEqual(readTelegramRuntimeState(path).profiles.default?.workspace, { binding: 66 });
+      }
+      assert.equal(attempts, revoked ? 1 : 2, "A sharing retry must revalidate authority before another rename");
+      assert.deepEqual(readdirSync(join(temp.dir, "runtime")), [], "The guard and staged candidate are released");
     } finally { rmSync(temp.dir, { recursive: true, force: true }); }
   });
 }
@@ -3390,4 +3415,23 @@ test("Locked polling runtime does not claim stale ownership from another cwd dur
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
   }
+});
+
+test("Private file helpers publish owner-only contents and refuse unsafe or oversized reads", { skip: process.platform === "win32" }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "pt-private-file-")), path = join(dir, "nested", "store.json");
+  try {
+    assert.equal(readTelegramPrivateFile(path, 64), undefined, "Absence is not a failure");
+    const boundaries: string[] = [];
+    publishTelegramPrivateFile(path, join(dir, "staging", "store.json"), "{\"ok\":true}\n", "Fixture", value => boundaries.push(value));
+    assert.deepEqual(boundaries, ["after-write-before-rename", "after-rename"]);
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+    assert.deepEqual(readdirSync(join(dir, "staging")), [], "Rename consumes the staging file");
+    assert.equal(readTelegramPrivateFile(path, 64), "{\"ok\":true}\n");
+    const failure = (fn: () => unknown, expected: string) => assert.throws(fn, error => error instanceof TelegramPrivateFileError && error.failure === expected);
+    failure(() => readTelegramPrivateFile(path, 4), "capacity");
+    rmSync(path); writeFileSync(path, "{}", { mode: 0o644 });
+    failure(() => readTelegramPrivateFile(path, 64), "unsafe");
+    rmSync(path); symlinkSync(join(dir, "elsewhere"), path);
+    failure(() => readTelegramPrivateFile(path, 64), "unsafe");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

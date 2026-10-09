@@ -9,10 +9,12 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readdir,
   readFile,
+  rename,
   rm,
   stat,
   utimes,
@@ -46,9 +48,6 @@ import {
   readTelegramConfig,
   resolveTelegramThreadDisplayMode,
   setTelegramThreadDisplayMode,
-  setGlobalTelegramConfigRuntime,
-  updateTelegramVoiceConfig,
-  writeTelegramConfig,
 } from "../lib/config.ts";
 import { createTelegramSettingsMenuRuntime } from "../lib/menu-settings.ts";
 import { createTelegramLockRuntime } from "../lib/locks.ts";
@@ -57,6 +56,23 @@ const execFileAsync = promisify(execFile);
 
 function legacyConfig(value: Record<string, unknown>): TelegramConfig {
   return value as TelegramConfig;
+}
+
+/** Seed a config file the way an operator-edited, atomically replaced file appears on disk. */
+async function writeTelegramConfig(
+  agentDir: string,
+  configPath: string,
+  config: TelegramConfig,
+): Promise<void> {
+  await mkdir(agentDir, { recursive: true });
+  const tempConfigPath = `${configPath}.tmp-${process.pid}-${Date.now()}`;
+  await writeFile(tempConfigPath, JSON.stringify(config, null, "\t") + "\n", {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  await chmod(tempConfigPath, 0o600);
+  await rename(tempConfigPath, configPath);
+  await chmod(configPath, 0o600);
 }
 import {
   createTelegramSetupPromptRuntime,
@@ -968,22 +984,6 @@ test("Telegram time injection mode setter persists telegram.json", async () => {
     assistant: { timeInjection: "hidden" },
     time: { interval: 5000, injectionMode: "always" },
   });
-});
-
-test("Telegram config runtime lets extensions update live voice config", async () => {
-  let voice: TelegramConfig["voice"] | undefined;
-  setGlobalTelegramConfigRuntime({
-    updateVoiceConfig: (nextVoice) => {
-      voice = nextVoice;
-    },
-  });
-  try {
-    assert.equal(updateTelegramVoiceConfig({ replyMode: "mirror" }), true);
-    assert.deepEqual(voice, { replyMode: "mirror" });
-  } finally {
-    setGlobalTelegramConfigRuntime(undefined);
-  }
-  assert.equal(updateTelegramVoiceConfig({ replyMode: "always" }), false);
 });
 
 test("Telegram config store owns load, mutation, and persistence", async () => {

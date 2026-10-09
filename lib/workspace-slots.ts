@@ -40,8 +40,13 @@ function isValidSnapshot(
   const slots = new Set<string>();
   const keys = new Set<string>();
   for (const binding of bindings) {
-    if (!isSlot(binding.slot) || !binding.bindingKey ||
-        slots.has(binding.slot) || keys.has(binding.bindingKey)) return false;
+    if (
+      !isSlot(binding.slot) ||
+      !binding.bindingKey ||
+      slots.has(binding.slot) ||
+      keys.has(binding.bindingKey)
+    )
+      return false;
     slots.add(binding.slot);
     keys.add(binding.bindingKey);
   }
@@ -54,17 +59,21 @@ function eligibleByInactivity(
   nowMs: number,
 ): TelegramWorkspaceSlotOccupancy[] {
   const reserved = new Set(reservedSlots);
-  return bindings.filter((binding) =>
-    binding.protection === "eligible" &&
-    !reserved.has(binding.slot) &&
-    typeof binding.inactiveSinceMs === "number" &&
-    Number.isFinite(binding.inactiveSinceMs) &&
-    binding.inactiveSinceMs >= 0 &&
-    binding.inactiveSinceMs <= nowMs,
-  ).sort((left, right) =>
-    left.inactiveSinceMs! - right.inactiveSinceMs! ||
-    left.slot.charCodeAt(0) - right.slot.charCodeAt(0),
-  );
+  return bindings
+    .filter(
+      (binding) =>
+        binding.protection === "eligible" &&
+        !reserved.has(binding.slot) &&
+        typeof binding.inactiveSinceMs === "number" &&
+        Number.isFinite(binding.inactiveSinceMs) &&
+        binding.inactiveSinceMs >= 0 &&
+        binding.inactiveSinceMs <= nowMs,
+    )
+    .sort(
+      (left, right) =>
+        left.inactiveSinceMs! - right.inactiveSinceMs! ||
+        left.slot.charCodeAt(0) - right.slot.charCodeAt(0),
+    );
 }
 
 /** Caller must recheck exact ownership and protected work before retirement. */

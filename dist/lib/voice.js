@@ -1,21 +1,10 @@
 /**
- * Voice Domain
- * Zones: telegram, voice
- *
- * This module is the single owner of all Voice-specific coordination logic:
- * - Voice reply policy (mirror / voice / manual) via getTelegramVoiceReplyMode()
- * - Voice turn tagging (voiceReplyPreferred / voiceReplyRequired)
- * - Voice-specific prompt contributions for the LLM
- * - Voice synthesis provider registry (registration + policy/prompt hooks)
- * - Voice markup parsing (planTelegramVoiceReply + helpers)
- * - Voice suppression helpers (isVoiceTurn, shouldSuppressPreviewForVoice)
- *
- * Separation of concerns:
- * - All decision logic and domain rules live here.
- * - Actual delivery (sending the audio via Telegram) stays in outbound.ts.
- *
- * Keeps voice policy, turn tagging, prompt contributions, and markup helpers
- * out of the queue, preview, turn-building, and delivery domains.
+ * Telegram voice reply policy and provider registries
+ * Zones: telegram, voice, pi agent prompts
+ * Owns: voice reply modes (manual / mirror / always), voice turn flags and preview suppression,
+ * voice prompt contributions, and the process-global synthesis/transcription provider registries.
+ * Excludes: voice markup parsing (outbound-markup), audio generation and Telegram delivery
+ * (outbound, outbound-voice), queue, preview lifecycle and turn building.
  */
 const VOICE_SYNTHESIS_PROVIDER_REGISTRY_KEY = "__piTelegramVoiceSynthesisProviders__";
 const VOICE_TRANSCRIPTION_PROVIDER_REGISTRY_KEY = "__piTelegramVoiceTranscriptionProviders__";
@@ -167,8 +156,4 @@ export function computeVoicePromptContribution(voiceReplyMode, files, rawText) {
  * Returns true if the current turn should not show a text preview
  * (e.g. because it's a voice reply).
  */
-export function shouldSuppressPreviewForVoice(turn) {
-    return !!(turn?.voiceReplyPreferred || turn?.voiceReplyRequired);
-}
-// --- Outbound Markup Re-Exports ---
-export { normalizeMarkdownAfterVoiceExtraction, planTelegramVoiceReply, stripTelegramCommentMarkupForDelivery, stripTelegramCommentMarkupForPreview, stripTelegramVoiceMarkupForPreview, } from "./outbound-markup.js";
+export const shouldSuppressPreviewForVoice = isVoiceTurn;

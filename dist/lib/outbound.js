@@ -6,15 +6,15 @@
 import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { resolveTelegramAttachmentsDir } from "./paths.js";
-import * as Replies from "./replies.js";
-import { isTelegramApiCommitUnknownError } from "./telegram-api.js";
 import { planTelegramButtonReply, } from "./outbound-buttons.js";
 import { planTelegramVoiceReply, stripTelegramCommentMarkupForDelivery, } from "./outbound-markup.js";
 import { createTelegramVoiceReplySender as createTelegramVoiceReplySenderWithPorts } from "./outbound-voice.js";
+import { resolveTelegramAttachmentsDir } from "./paths.js";
+import * as Replies from "./replies.js";
+import { assertTelegramApiCallAuthority, isTelegramApiCommitUnknownError, } from "./telegram-api.js";
 const OUTBOUND_HANDLER_REGISTRY_KEY = "__piTelegramOutboundHandlers__";
 const VOICE_EVENT_RECORDER_KEY = "__piTelegramVoiceEventRecorder__";
-import { buildCommandTemplateInvocation, expandCommandTemplateConfigs, substituteCommandTemplateToken, } from "./command-templates.js";
+import { buildCommandTemplateInvocation, createCommandTemplateRecovery, getCommandTemplateCompositionSteps, shouldRunCommandTemplateConfig, getCommandTemplateConfiguredTimeout, getCommandTemplateStepTimeout, resolveCommandTemplateNumericField, } from "./command-templates.js";
 const DEFAULT_VOICE_TIMEOUT_MS = 120_000;
 export function bindTelegramRuntimeEventRecorder(recorder) {
     globalThis[VOICE_EVENT_RECORDER_KEY] = recorder;
@@ -25,7 +25,6 @@ export function recordTelegramRuntimeEvent(category, error, details) {
         recorder(category, error, details);
     }
 }
-export { normalizeMarkdownAfterVoiceExtraction, planTelegramVoiceReply, stripTelegramCommentMarkupForDelivery, stripTelegramCommentMarkupForPreview, stripTelegramVoiceMarkupForPreview, } from "./outbound-markup.js";
 // --- Programmatic Outbound Handler Registry Runtime ---
 function getOrCreateOutboundHandlerRegistry() {
     const existing = globalThis[OUTBOUND_HANDLER_REGISTRY_KEY];
@@ -62,35 +61,8 @@ function getTelegramOutboundProgrammaticHandlers(kind) {
     return [...(registry.handlers.get(kind) ?? [])];
 }
 // --- Voice Reply Timeout Helpers ---
-function resolveOutboundNumericControlField(value, values, label) {
-    if (value === undefined)
-        return undefined;
-    const resolved = typeof value === "string"
-        ? substituteCommandTemplateToken(value, values, label)
-        : value;
-    if (resolved === "")
-        return undefined;
-    const numeric = Number(resolved);
-    if (!Number.isFinite(numeric) || numeric < 0)
-        throw new Error(`Command template ${label} must be a non-negative number.`);
-    return numeric;
-}
-function getVoiceReplyConfiguredTimeout(config) {
-    const timeout = typeof config === "string" ? undefined : config?.timeout;
-    return resolveOutboundNumericControlField(timeout, {}, "timeout");
-}
 function getVoiceReplyTimeout(config) {
-    return getVoiceReplyConfiguredTimeout(config) ?? DEFAULT_VOICE_TIMEOUT_MS;
-}
-function getRemainingVoiceReplyTimeout(timeout, startedAt) {
-    return Math.max(1, timeout - (Date.now() - startedAt));
-}
-function getVoiceReplyCompositionStepTimeout(handlerTimeout, step, startedAt) {
-    const remaining = getRemainingVoiceReplyTimeout(handlerTimeout, startedAt);
-    const stepTimeout = getVoiceReplyConfiguredTimeout(step);
-    return stepTimeout === undefined
-        ? remaining
-        : Math.min(stepTimeout, remaining);
+    return (getCommandTemplateConfiguredTimeout(config) ?? DEFAULT_VOICE_TIMEOUT_MS);
 }
 function formatVoiceReplyExecutionFailure(label, result) {
     const parts = [
@@ -101,6 +73,9 @@ function formatVoiceReplyExecutionFailure(label, result) {
     if (result.stdout.trim())
         parts.push(`stdout:\n${result.stdout.trimEnd()}`);
     return parts.join("\n\n");
+}
+function withCommandTemplateRecovery(recover) {
+    return recover ? { recover } : {};
 }
 async function runVoiceReplyCommand(label, config, values, options) {
     if (!options.execCommand) {
@@ -115,7 +90,12 @@ async function runVoiceReplyCommand(label, config, values, options) {
         timeout: options.timeout,
         ...(typeof config === "object" && config.retry !== undefined
             ? {
-                retry: resolveOutboundNumericControlField(config.retry, {}, "retry"),
+                retry: resolveCommandTemplateNumericField(config.retry, {}, "retry"),
+                ...withCommandTemplateRecovery(createCommandTemplateRecovery(config, values, {
+                    cwd: options.cwd,
+                    timeout: options.timeout,
+                    execCommand: options.execCommand,
+                })),
             }
             : {}),
         ...(options.stdin !== undefined ? { stdin: options.stdin } : {}),
@@ -149,12 +129,6 @@ export function findTelegramOutboundHandlers(handlers, type) {
     return handlers.filter((handler) => !!handler &&
         typeof handler === "object" &&
         outboundHandlerMatchesType(handler, type));
-}
-function getTelegramVoiceHandlerCompositionSteps(handler) {
-    if (Array.isArray(handler.template)) {
-        return expandCommandTemplateConfigs(handler);
-    }
-    return [];
 }
 function extractVoiceReplyPath(stdout) {
     const path = stdout.trim().split(/\r?\n/).filter(Boolean).at(-1);
@@ -194,15 +168,19 @@ async function generateTelegramVoiceReplyFileWithHandler(text, options) {
         mp3Path: join(options.tempDir, `${artifactId}-voice.mp3`),
         oggPath: join(options.tempDir, `${artifactId}-voice.ogg`),
     });
-    const steps = getTelegramVoiceHandlerCompositionSteps(options.handler);
+    if (!shouldRunCommandTemplateConfig(options.handler, values))
+        return undefined;
+    const steps = getCommandTemplateCompositionSteps(options.handler);
     if (steps.length > 0) {
         const startedAt = Date.now();
         let stdout = text;
         for (const [index, step] of steps.entries()) {
+            if (!shouldRunCommandTemplateConfig(step, values))
+                continue;
             try {
                 const result = await runVoiceReplyCommand(`Outbound voice template step ${index + 1}`, step, values, {
                     cwd: options.cwd,
-                    timeout: getVoiceReplyCompositionStepTimeout(options.timeout, step, startedAt),
+                    timeout: getCommandTemplateStepTimeout(options.timeout, step, Date.now() - startedAt),
                     execCommand: options.execCommand,
                     stdin: stdout,
                 });
@@ -243,15 +221,19 @@ function getOutboundTextTemplateValues(text) {
 }
 async function transformTelegramOutboundTextWithHandler(text, options) {
     const values = getOutboundTextTemplateValues(text);
-    const steps = getTelegramVoiceHandlerCompositionSteps(options.handler);
+    if (!shouldRunCommandTemplateConfig(options.handler, values))
+        return text;
+    const steps = getCommandTemplateCompositionSteps(options.handler);
     if (steps.length > 0) {
         const startedAt = Date.now();
         let stdout = text;
         for (const [index, step] of steps.entries()) {
+            if (!shouldRunCommandTemplateConfig(step, values))
+                continue;
             try {
                 const result = await runVoiceReplyCommand(`Outbound text template step ${index + 1}`, step, values, {
                     cwd: options.cwd,
-                    timeout: getVoiceReplyCompositionStepTimeout(getVoiceReplyTimeout(options.handler), step, startedAt),
+                    timeout: getCommandTemplateStepTimeout(getVoiceReplyTimeout(options.handler), step, Date.now() - startedAt),
                     execCommand: options.execCommand,
                     stdin: stdout,
                 });
@@ -328,17 +310,33 @@ async function transformTelegramOutboundTextReply(text, options) {
     return { text: transformedText, ...(replyMarkup ? { replyMarkup } : {}) };
 }
 export function createTelegramOutboundTextReplyRuntime(deps) {
+    const sendTextReply = deps.sendTextReply, sendMarkdownReply = deps.sendMarkdownReply;
     return {
         sendTextReply: async (chatId, replyToMessageId, text, options) => {
+            const capturedOptions = options && {
+                ...options,
+                ...(options.target ? { target: { ...options.target } } : {}),
+            };
+            const assertAuthority = capturedOptions?.assertAuthority;
+            assertTelegramApiCallAuthority(assertAuthority, false);
             const transformed = await transformTelegramOutboundText(text, {
                 handlers: deps.getHandlers?.(),
                 cwd: deps.cwd,
                 execCommand: deps.execCommand,
                 recordRuntimeEvent: deps.recordRuntimeEvent,
             });
-            return deps.sendTextReply(chatId, replyToMessageId, transformed, options);
+            assertTelegramApiCallAuthority(assertAuthority, false);
+            const messageId = await sendTextReply(chatId, replyToMessageId, transformed, capturedOptions);
+            assertTelegramApiCallAuthority(assertAuthority, true);
+            return messageId;
         },
         sendMarkdownReply: async (chatId, replyToMessageId, markdown, options) => {
+            const capturedOptions = options && {
+                ...options,
+                ...(options.target ? { target: { ...options.target } } : {}),
+            };
+            const assertAuthority = capturedOptions?.assertAuthority;
+            assertTelegramApiCallAuthority(assertAuthority, false);
             const deliveryMarkdown = stripTelegramCommentMarkupForDelivery(markdown);
             if (!deliveryMarkdown)
                 return undefined;
@@ -347,14 +345,17 @@ export function createTelegramOutboundTextReplyRuntime(deps) {
                 cwd: deps.cwd,
                 execCommand: deps.execCommand,
                 recordRuntimeEvent: deps.recordRuntimeEvent,
-                replyMarkup: options?.replyMarkup,
+                replyMarkup: capturedOptions?.replyMarkup,
             });
-            return deps.sendMarkdownReply(chatId, replyToMessageId, transformed.text, {
-                ...options,
+            assertTelegramApiCallAuthority(assertAuthority, false);
+            const messageId = await sendMarkdownReply(chatId, replyToMessageId, transformed.text, {
+                ...capturedOptions,
                 ...(transformed.replyMarkup
                     ? { replyMarkup: transformed.replyMarkup }
                     : {}),
             });
+            assertTelegramApiCallAuthority(assertAuthority, true);
+            return messageId;
         },
     };
 }
@@ -378,7 +379,12 @@ export function createTelegramOutboundTextPreviewRuntime(deps) {
         finalizeMarkdownPreview: wrap(deps.finalizeMarkdownPreview),
         preparePreviewDelivery(isDeliveryActive) {
             const prepared = deps.preparePreviewDelivery?.(isDeliveryActive);
-            return prepared ? { ...prepared, finalizeMarkdownPreview: wrap(prepared.finalizeMarkdownPreview) } : undefined;
+            return prepared
+                ? {
+                    ...prepared,
+                    finalizeMarkdownPreview: wrap(prepared.finalizeMarkdownPreview),
+                }
+                : undefined;
         },
     };
 }
@@ -431,8 +437,12 @@ export function createTelegramOutboundReplyPlanner(store, getRenderingMode = () 
 // --- Outbound Reply Artifacts ---
 export function createTelegramOutboundReplyArtifactSender(deps) {
     return async (turn, plan, options) => {
-        const isDeliveryActive = () => deps.isDeliveryActive?.() !== false && options?.isDeliveryActive?.() !== false;
-        const sendVoiceReply = createTelegramVoiceReplySender({ ...deps, isDeliveryActive });
+        const isDeliveryActive = () => deps.isDeliveryActive?.() !== false &&
+            options?.isDeliveryActive?.() !== false;
+        const sendVoiceReply = createTelegramVoiceReplySender({
+            ...deps,
+            isDeliveryActive,
+        });
         // Normalize voice replies: either use explicit voiceReplies array or fall back to voiceText
         const voiceReplies = plan.voiceReplies?.length
             ? plan.voiceReplies

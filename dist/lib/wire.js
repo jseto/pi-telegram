@@ -11,7 +11,7 @@ export function isWireRecord(value) {
 /** Checks only own enumerable string keys, not required, inherited or symbol fields. */
 export function hasOnlyWireKeys(value, allowedKeys) {
     const allowed = new Set(allowedKeys);
-    return Object.keys(value).every(key => allowed.has(key));
+    return Object.keys(value).every((key) => allowed.has(key));
 }
 export function isNonEmptyWireString(value) {
     return typeof value === "string" && value.length > 0;

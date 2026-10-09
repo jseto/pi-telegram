@@ -5,9 +5,7 @@
  */
 
 export type TelegramInlineKeyboardButtonStyle =
-  | "danger"
-  | "success"
-  | "primary";
+  "danger" | "success" | "primary";
 
 export type TelegramInlineKeyboardButton = {
   text: string;

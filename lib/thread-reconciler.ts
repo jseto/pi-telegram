@@ -133,14 +133,6 @@ export type ThreadReconciliationAction =
       leaderEpoch?: number | string;
     }
   | {
-      kind: "close-delete-disconnected-instance-topic";
-      target: TelegramTarget & { threadId: number };
-      reason: "manual-disconnect";
-      instanceId?: string;
-      messageId?: number;
-      leaderEpoch?: number | string;
-    }
-  | {
       kind: "close-delete-graceful-shutdown-topic";
       target: TelegramTarget & { threadId: number };
       reason: "graceful-shutdown";
@@ -204,7 +196,10 @@ export interface ThreadReconciliationApplyResult {
 export interface ThreadReconciliationApplyPorts {
   /** Private-chat temporary tabs support deletion, not forum closing. */
   skipCloseBeforeDelete?: boolean;
-  isCleanupTargetProtected?: (target: ThreadTarget, action: ThreadReconciliationAction) => boolean;
+  isCleanupTargetProtected?: (
+    target: ThreadTarget,
+    action: ThreadReconciliationAction,
+  ) => boolean;
   callApi?: <TResponse>(
     method: string,
     body: Record<string, unknown>,
@@ -249,7 +244,10 @@ function targetKey(target: ThreadTarget): string {
   return `${target.chatId}:${target.threadId}`;
 }
 
-function isCurrentRecord(record: ThreadReconciliationRecord): boolean {
+/** A Thread record still claims its slot/target while active, starting or pending. */
+export function isCurrentThreadRecord(record: {
+  readonly status: string;
+}): boolean {
   return (
     record.status === "active" ||
     record.status === "starting" ||
@@ -323,7 +321,6 @@ function isCleanupAction(action: ThreadReconciliationAction): boolean {
     action.kind === "close-stale-replaced-topic" ||
     action.kind === "close-delete-replaced-follower-topic" ||
     action.kind === "close-delete-previous-leader-topic" ||
-    action.kind === "close-delete-disconnected-instance-topic" ||
     action.kind === "close-delete-graceful-shutdown-topic" ||
     action.kind === "cancel-superseded-graceful-shutdown-cleanup" ||
     action.kind === "close-delete-expired-pending-provision-topic"
@@ -331,7 +328,9 @@ function isCleanupAction(action: ThreadReconciliationAction): boolean {
 }
 
 function isSyncAction(action: ThreadReconciliationAction): boolean {
-  return action.kind === "mark-topic-active" || action.kind === "mark-topic-stale";
+  return (
+    action.kind === "mark-topic-active" || action.kind === "mark-topic-stale"
+  );
 }
 
 function createThreadReconciliationMachineState(
@@ -392,27 +391,40 @@ function getActionLeaderEpoch(
   return "leaderEpoch" in action ? action.leaderEpoch : undefined;
 }
 
+/** Pure Bot API vocabulary for a deleted/missing Thread; callers own their HTTP-status policy. */
+export function isTelegramTopicDeletedErrorMessage(message: string): boolean {
+  const text = message.toLowerCase();
+  return [
+    "topic_id_invalid",
+    "message thread not found",
+    "thread not found",
+    "topic not found",
+    "topic deleted",
+  ].some((fragment) => text.includes(fragment));
+}
+
+/** Pure Bot API vocabulary for a closed Thread; closure is not deletion evidence. */
+export function isTelegramTopicClosedErrorMessage(message: string): boolean {
+  const text = message.toLowerCase();
+  return [
+    "topic closed",
+    "thread closed",
+    "forum topic closed",
+    "message thread closed",
+  ].some((fragment) => text.includes(fragment));
+}
+
 function isTelegramTopicTargetDeletedOrMissingError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  const message = error.message.toLowerCase();
   return (
-    message.includes("topic_id_invalid") ||
-    message.includes("message thread not found") ||
-    message.includes("thread not found") ||
-    message.includes("topic not found") ||
-    message.includes("topic deleted")
+    error instanceof Error && isTelegramTopicDeletedErrorMessage(error.message)
   );
 }
 
 function isTelegramTopicTargetGoneError(error: unknown): boolean {
-  if (isTelegramTopicTargetDeletedOrMissingError(error)) return true;
-  if (!(error instanceof Error)) return false;
-  const message = error.message.toLowerCase();
   return (
-    message.includes("topic closed") ||
-    message.includes("thread closed") ||
-    message.includes("forum topic closed") ||
-    message.includes("message thread closed")
+    error instanceof Error &&
+    (isTelegramTopicDeletedErrorMessage(error.message) ||
+      isTelegramTopicClosedErrorMessage(error.message))
   );
 }
 
@@ -501,24 +513,94 @@ export function createThreadReconciliationRuntime(deps: {
   };
 }
 
-export function planDisconnectedInstanceThreadCleanup(input: {
-  target: TelegramTarget & { threadId: number };
-  instanceId?: string;
-  leaderEpoch?: number | string;
-}): ThreadReconciliationPlan {
+/** Momentary preparation evidence only: not an action, lease, issued effect or reusable deletion grant. */
+export interface TelegramLiveRebindCleanupPreparation {
+  status: "prepared";
+  operationId: string;
+  target: ThreadTarget;
+  recipientTarget: ThreadTarget;
+  leaderEpoch: string;
+}
+
+export function prepareLiveRebindThreadCleanup(input: {
+  operationId: string;
+  oldTarget: ThreadTarget;
+  recipientTarget: ThreadTarget;
+  leaderEpoch: string;
+  targetProtected: boolean;
+  /** Narrow body-free current-work projection; no cached idle or historical disposition proof. */
+  work:
+    | Readonly<{
+        sessionBusy: boolean;
+        targetWork: boolean;
+        deliveryPending: boolean;
+        unknown: boolean;
+      }>
+    | undefined;
+}): TelegramLiveRebindCleanupPreparation | undefined {
+  const { operationId, oldTarget, recipientTarget, leaderEpoch, work } = input;
+  const validTarget = (target: ThreadTarget) =>
+    Number.isSafeInteger(target?.chatId) &&
+    target.chatId !== 0 &&
+    Number.isSafeInteger(target.threadId) &&
+    target.threadId > 0;
+  if (
+    !operationId?.trim() ||
+    !leaderEpoch?.trim() ||
+    !validTarget(oldTarget) ||
+    !validTarget(recipientTarget) ||
+    oldTarget.chatId !== recipientTarget.chatId ||
+    oldTarget.threadId === recipientTarget.threadId ||
+    input.targetProtected !== false ||
+    work?.sessionBusy !== false ||
+    work.targetWork !== false ||
+    work.deliveryPending !== false ||
+    work.unknown !== false
+  )
+    return undefined;
   return {
-    actions: [
-      {
-        kind: "close-delete-disconnected-instance-topic",
-        target: input.target,
-        reason: "manual-disconnect",
-        instanceId: input.instanceId,
-        ...(input.leaderEpoch !== undefined
-          ? { leaderEpoch: input.leaderEpoch }
-          : {}),
-      },
-    ],
+    status: "prepared",
+    operationId,
+    target: { ...oldTarget },
+    recipientTarget: { ...recipientTarget },
+    leaderEpoch,
   };
+}
+
+export type TelegramLiveRebindCleanupOutcome =
+  "confirmed" | "failed" | "unknown";
+
+/**
+ * One unretried deletion for an already issued live-rebind cleanup grant. Success or confirmed absence is `confirmed`;
+ * protection or authority loss before the request and a definite request rejection are `failed`; every other outcome is
+ * `unknown`. The caller owns the durable issue marker and terminal record; this never repeats or rolls back.
+ */
+export async function issueLiveRebindThreadCleanup(
+  prepared: TelegramLiveRebindCleanupPreparation,
+  ports: {
+    /** Throws when the issuer's current recipient/work/ownership authority no longer holds. */
+    assertCurrent(): void;
+    deleteTopic(target: ThreadTarget): Promise<unknown>;
+    classifyFailure(error: unknown): "absent" | "rejected" | "unknown";
+  },
+): Promise<TelegramLiveRebindCleanupOutcome> {
+  const target = { ...prepared.target };
+  try {
+    ports.assertCurrent();
+  } catch {
+    return "failed";
+  }
+  try {
+    await ports.deleteTopic(target);
+  } catch (error) {
+    const failure = ports.classifyFailure(error);
+    return failure === "absent"
+      ? "confirmed"
+      : failure === "rejected"
+        ? "failed"
+        : "unknown";
+  }
+  return "confirmed";
 }
 
 export async function applyThreadReconciliationPlan(
@@ -614,7 +696,6 @@ export async function applyThreadReconciliationPlan(
       action.kind === "close-delete-reserved-topic" ||
       action.kind === "close-delete-replaced-follower-topic" ||
       action.kind === "close-delete-previous-leader-topic" ||
-      action.kind === "close-delete-disconnected-instance-topic" ||
       action.kind === "close-delete-graceful-shutdown-topic" ||
       action.kind === "close-delete-expired-pending-provision-topic"
     ) {
@@ -638,7 +719,9 @@ export async function applyThreadReconciliationPlan(
       }
       let deleteConfirmed = false;
       let superseded = false;
-      for (const method of ports.skipCloseBeforeDelete ? ["deleteForumTopic"] : ["closeForumTopic", "deleteForumTopic"]) {
+      for (const method of ports.skipCloseBeforeDelete
+        ? ["deleteForumTopic"]
+        : ["closeForumTopic", "deleteForumTopic"]) {
         if (ports.isCleanupTargetProtected?.(action.target, action)) {
           superseded = true;
           break;
@@ -670,13 +753,20 @@ export async function applyThreadReconciliationPlan(
         incompleteActions.push(action);
         continue;
       }
-      if (superseded || ports.isCleanupTargetProtected?.(action.target, action)) {
-        ports.recordRuntimeEvent?.("telegram", "Cancelled cleanup of a protected Telegram target", {
-          phase: "thread-reconciler-cleanup-target-reused",
-          action: action.kind,
-          chatId: action.target.chatId,
-          threadId: action.target.threadId,
-        });
+      if (
+        superseded ||
+        ports.isCleanupTargetProtected?.(action.target, action)
+      ) {
+        ports.recordRuntimeEvent?.(
+          "telegram",
+          "Cancelled cleanup of a protected Telegram target",
+          {
+            phase: "thread-reconciler-cleanup-target-reused",
+            action: action.kind,
+            chatId: action.target.chatId,
+            threadId: action.target.threadId,
+          },
+        );
         continue;
       }
       if (!deleteConfirmed) {
@@ -699,7 +789,6 @@ export async function applyThreadReconciliationPlan(
       if (
         action.kind !== "close-delete-previous-leader-topic" &&
         action.kind !== "close-delete-replaced-follower-topic" &&
-        action.kind !== "close-delete-disconnected-instance-topic" &&
         action.kind !== "close-delete-expired-pending-provision-topic"
       ) {
         const changed =
@@ -714,14 +803,12 @@ export async function applyThreadReconciliationPlan(
           : action.kind === "close-delete-reserved-topic"
             ? "Reserved Telegram topic deleted"
             : action.kind === "close-delete-replaced-follower-topic"
-                ? "Replaced follower Telegram topic deleted"
-                : action.kind === "close-delete-previous-leader-topic"
-                  ? "Previous leader Telegram topic deleted"
-                  : action.kind === "close-delete-disconnected-instance-topic"
-                    ? "Disconnected instance Telegram topic deleted"
-                    : action.kind === "close-delete-graceful-shutdown-topic"
-                      ? "Graceful shutdown Telegram topic deleted"
-                      : "Expired pending provision Telegram topic deleted",
+              ? "Replaced follower Telegram topic deleted"
+              : action.kind === "close-delete-previous-leader-topic"
+                ? "Previous leader Telegram topic deleted"
+                : action.kind === "close-delete-graceful-shutdown-topic"
+                  ? "Graceful shutdown Telegram topic deleted"
+                  : "Expired pending provision Telegram topic deleted",
         {
           phase:
             action.kind === "close-delete-unbound-topic"
@@ -729,16 +816,12 @@ export async function applyThreadReconciliationPlan(
               : action.kind === "close-delete-reserved-topic"
                 ? "thread-reconciler-reserved-topic-delete"
                 : action.kind === "close-delete-replaced-follower-topic"
-                    ? "thread-reconciler-replaced-follower-topic-delete"
-                    : action.kind === "close-delete-previous-leader-topic"
-                      ? "thread-reconciler-previous-leader-topic-delete"
-                      : action.kind ===
-                          "close-delete-disconnected-instance-topic"
-                        ? "thread-reconciler-disconnected-instance-topic-delete"
-                        : action.kind ===
-                            "close-delete-graceful-shutdown-topic"
-                          ? "thread-reconciler-graceful-shutdown-topic-delete"
-                          : "thread-reconciler-expired-pending-provision-topic-delete",
+                  ? "thread-reconciler-replaced-follower-topic-delete"
+                  : action.kind === "close-delete-previous-leader-topic"
+                    ? "thread-reconciler-previous-leader-topic-delete"
+                    : action.kind === "close-delete-graceful-shutdown-topic"
+                      ? "thread-reconciler-graceful-shutdown-topic-delete"
+                      : "thread-reconciler-expired-pending-provision-topic-delete",
           chatId: action.target.chatId,
           threadId: action.target.threadId,
           ...("messageId" in action ? { messageId: action.messageId } : {}),
@@ -793,7 +876,7 @@ export function planThreadReconciliation(
   );
   const currentTargets = new Set(
     input.records
-      .filter(isCurrentRecord)
+      .filter(isCurrentThreadRecord)
       .map((record) => targetKey(record.target)),
   );
   const reservedTargets = new Set(
@@ -826,7 +909,7 @@ export function planThreadReconciliation(
   for (const cleanup of input.pendingCleanups ?? []) {
     const superseded = input.records.some(
       (record) =>
-        isCurrentRecord(record) &&
+        isCurrentThreadRecord(record) &&
         targetKey(record.target) === targetKey(cleanup.target) &&
         record.instanceId !== cleanup.instanceId,
     );

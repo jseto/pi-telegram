@@ -3,7 +3,7 @@
  * Zones: pi agent model control, telegram controls, queue continuation
  * Owns model identity, thinking levels, scoped resolution, current-model state, and in-flight model switching
  */
-import type { PendingTelegramTurn } from "./queue.ts";
+import { type PendingTelegramTurn } from "./queue.ts";
 export interface MenuModel {
     provider: string;
     id: string;

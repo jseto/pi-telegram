@@ -4,7 +4,7 @@
  * Owns name/title value policy and one expiring exact-target dialog per session scope.
  * Excludes occupancy/slot allocation, display-mode projection, transport and API/store effects.
  */
-import { areTelegramTargetsEqual as sameTarget } from "./target.js";
+import { areTelegramTargetsEqual as sameTarget, } from "./target.js";
 export const TELEGRAM_THREAD_NAME_DIALOG_TTL_MS = 5 * 60_000;
 function targetKey(target) {
     return `${target.chatId}:${target.threadId ?? "chat"}`;
@@ -16,98 +16,207 @@ export function createTelegramThreadNameDialogRuntime(options) {
     const ttlMs = options?.ttlMs ?? TELEGRAM_THREAD_NAME_DIALOG_TTL_MS;
     const nowMs = options?.nowMs ?? Date.now;
     const candidates = new Map();
-    const current = (scope, target) => {
-        const key = targetKey(target);
-        const candidate = candidates.get(key);
-        if (!candidate || candidate.scope !== scope ||
-            !sameTarget(candidate.target, target))
-            return undefined;
-        if (candidate.expiresAtMs <= nowMs()) {
-            candidates.delete(key);
-            return undefined;
+    const recipientCurrent = (entry) => {
+        try {
+            return entry.isCurrent ? entry.isCurrent() === true : true;
         }
-        return candidate;
+        catch {
+            return false;
+        }
+    };
+    const view = (entry) => cloneCandidate({
+        scope: entry.scope,
+        target: entry.target,
+        dialogMessageId: entry.dialogMessageId,
+        phase: "input",
+        expiresAtMs: entry.expiresAtMs,
+    });
+    const createLifetime = (entry) => {
+        const key = targetKey(entry.target);
+        const claim = {};
+        let ended = false;
+        const finish = () => {
+            ended = true;
+            if (candidates.get(key) === entry &&
+                (!entry.consumedBy || entry.consumedBy === claim))
+                candidates.delete(key);
+        };
+        const isCurrent = () => {
+            if (ended ||
+                candidates.get(key) !== entry ||
+                (entry.consumedBy && entry.consumedBy !== claim)) {
+                ended = true;
+                return false;
+            }
+            const current = entry.expiresAtMs > nowMs() && recipientCurrent(entry);
+            // Supplied authority/clock observations may synchronously replace this dialog.
+            if (!current ||
+                entry.expiresAtMs <= nowMs() ||
+                candidates.get(key) !== entry ||
+                (entry.consumedBy && entry.consumedBy !== claim)) {
+                finish();
+                return false;
+            }
+            return true;
+        };
+        return {
+            assertAuthority: entry.assertAuthority,
+            isCurrent,
+            publish(dialogMessageId, assertPublicationCurrent) {
+                if (!isCurrent() || entry.phase !== "delivery")
+                    return undefined;
+                // Source authority is needed for this publication only, never retained by future input/effects.
+                if (assertPublicationCurrent) {
+                    assertPublicationCurrent();
+                    if (entry.expiresAtMs <= nowMs())
+                        return undefined;
+                    assertPublicationCurrent();
+                    if (ended ||
+                        candidates.get(key) !== entry ||
+                        entry.phase !== "delivery")
+                        return undefined;
+                }
+                if (!Number.isSafeInteger(dialogMessageId) || dialogMessageId <= 0) {
+                    finish();
+                    return undefined;
+                }
+                entry.dialogMessageId = dialogMessageId;
+                entry.phase = "input";
+                return view(entry);
+            },
+            select(action) {
+                if (!isCurrent() || entry.phase !== "input")
+                    return { kind: "expired" };
+                if (action === "cancel")
+                    finish();
+                else {
+                    entry.phase = "consumed";
+                    entry.consumedBy = claim;
+                }
+                return { kind: action };
+            },
+            consumeName(text) {
+                if (!isCurrent() || entry.phase !== "input")
+                    return { kind: "none" };
+                const name = text.trim();
+                if (!name)
+                    return { kind: "empty" };
+                entry.phase = "consumed";
+                entry.consumedBy = claim;
+                return { kind: "name", name };
+            },
+            reopen() {
+                if (!isCurrent() ||
+                    entry.phase !== "consumed" ||
+                    entry.consumedBy !== claim) {
+                    return undefined;
+                }
+                // A failed effect may restore input, never renew its deadline or issued handle.
+                const replacement = {
+                    ...entry,
+                    phase: "input",
+                    consumedBy: undefined,
+                };
+                candidates.set(key, replacement);
+                ended = true;
+                return view(replacement);
+            },
+            finish,
+        };
+    };
+    const current = (scope, target) => {
+        const entry = candidates.get(targetKey(target));
+        if (!entry ||
+            entry.scope !== scope ||
+            entry.phase !== "input" ||
+            !sameTarget(entry.target, target) ||
+            !createLifetime(entry).isCurrent())
+            return undefined;
+        return entry;
+    };
+    const capture = (input) => {
+        const { scope, dialogMessageId } = input;
+        const target = { ...input.target };
+        const entry = current(scope, target);
+        if (!entry || entry.dialogMessageId !== dialogMessageId)
+            return undefined;
+        return createLifetime(entry);
     };
     return {
+        prepare(input) {
+            const scope = input.scope;
+            const target = { ...input.target };
+            const isCurrent = input.isCurrent, assertAuthority = input.assertAuthority;
+            const key = targetKey(target);
+            const previous = candidates.get(key);
+            const entry = {
+                scope,
+                target,
+                phase: "delivery",
+                expiresAtMs: nowMs() + ttlMs,
+                isCurrent,
+                assertAuthority,
+            };
+            if (!recipientCurrent(entry) ||
+                entry.expiresAtMs <= nowMs() ||
+                candidates.get(key) !== previous)
+                return undefined;
+            candidates.set(key, entry);
+            return createLifetime(entry);
+        },
+        capture,
         open(input) {
-            const candidate = {
+            const entry = {
                 scope: input.scope,
                 target: { ...input.target },
-                dialogMessageId: input.dialogMessageId,
                 phase: "input",
+                dialogMessageId: input.dialogMessageId,
                 expiresAtMs: nowMs() + ttlMs,
             };
-            candidates.set(targetKey(input.target), candidate);
-            return cloneCandidate(candidate);
+            candidates.set(targetKey(entry.target), entry);
+            return view(entry);
         },
         select(input) {
-            const candidate = current(input.scope, input.target);
-            if (!candidate || candidate.dialogMessageId !== input.dialogMessageId) {
+            const action = input.action;
+            const lifetime = capture(input);
+            if (!lifetime)
                 return { kind: "expired" };
-            }
-            candidates.delete(targetKey(input.target));
-            return { kind: input.action };
+            const result = lifetime.select(action);
+            lifetime.finish();
+            return result;
         },
         consumeName(input) {
-            const candidate = current(input.scope, input.target);
-            if (!candidate || candidate.phase !== "input")
+            const text = input.text;
+            const entry = current(input.scope, input.target);
+            if (!entry)
                 return { kind: "none" };
-            const name = input.text.trim();
-            if (!name)
-                return { kind: "empty" };
-            candidates.delete(targetKey(input.target));
-            return { kind: "name", name };
+            const lifetime = createLifetime(entry);
+            const result = lifetime.consumeName(text);
+            if (result.kind === "name")
+                lifetime.finish();
+            return result;
         },
         clearScope(scope) {
-            for (const [key, candidate] of candidates) {
-                if (candidate.scope === scope)
+            for (const [key, entry] of candidates) {
+                if (entry.scope === scope)
                     candidates.delete(key);
             }
         },
         inspect(target) {
-            const candidate = candidates.get(targetKey(target));
-            if (!candidate || candidate.expiresAtMs <= nowMs()) {
-                candidates.delete(targetKey(target));
+            const key = targetKey(target);
+            const entry = candidates.get(key);
+            if (!entry)
+                return undefined;
+            if (entry.expiresAtMs <= nowMs()) {
+                if (candidates.get(key) === entry)
+                    candidates.delete(key);
                 return undefined;
             }
-            return cloneCandidate(candidate);
+            if (entry.phase !== "input" || !createLifetime(entry).isCurrent())
+                return undefined;
+            return view(entry);
         },
     };
-}
-function hashString(value) {
-    let hash = 2166136261;
-    for (let index = 0; index < value.length; index += 1) {
-        hash ^= value.charCodeAt(index);
-        hash = Math.imul(hash, 16777619);
-    }
-    return hash >>> 0;
-}
-function getWorkspaceHint(cwd) {
-    if (!cwd)
-        return undefined;
-    const parts = cwd.split("/").filter(Boolean);
-    const last = parts.at(-1)?.trim();
-    if (!last)
-        return undefined;
-    return (last
-        .replace(/[^\p{L}\p{N}._-]+/gu, " ")
-        .trim()
-        .slice(0, 32) || undefined);
-}
-export function createTelegramThreadName(input) {
-    const workspace = getWorkspaceHint(input.cwd);
-    const roleMark = input.role === "leader"
-        ? "Leader"
-        : input.role === "follower"
-            ? "Follower"
-            : undefined;
-    const slot = input.slot ? `Thread ${input.slot}` : undefined;
-    const peerSalt = input.peers?.slice().sort().join("|") ?? "";
-    const fallback = `Instance ${hashString(`${input.seed}|${input.cwd ?? ""}|${input.role ?? ""}|${peerSalt}|${input.slot ?? ""}`)
-        .toString(36)
-        .slice(0, 4)}`;
-    return ([slot, workspace, roleMark].filter(Boolean).join(" ").slice(0, 96) ||
-        fallback);
 }
 export function normalizeTelegramTopicTargetThreadName(threadName) {
     return threadName.replace(/\s+/g, " ").trim().slice(0, 96);

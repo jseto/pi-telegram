@@ -39,8 +39,12 @@ export function createTelegramAgentMessageRuntime<TContext, TUpdate>(
     const leaderTarget = deps.getLeaderTarget();
     if (leaderTarget?.threadId) {
       targets.push({
-        target: { chatId: leaderTarget.chatId, threadId: leaderTarget.threadId },
-        threadName: deps.getDisplayTitle?.(leaderTarget) ?? deps.getLeaderThreadName(),
+        target: {
+          chatId: leaderTarget.chatId,
+          threadId: leaderTarget.threadId,
+        },
+        threadName:
+          deps.getDisplayTitle?.(leaderTarget) ?? deps.getLeaderThreadName(),
       });
     }
     for (const follower of deps.followerRegistry.list()) {
@@ -50,7 +54,8 @@ export function createTelegramAgentMessageRuntime<TContext, TUpdate>(
           chatId: follower.target.chatId,
           threadId: follower.target.threadId,
         },
-        threadName: deps.getDisplayTitle?.(follower.target) ?? follower.threadName,
+        threadName:
+          deps.getDisplayTitle?.(follower.target) ?? follower.threadName,
       });
     }
     return targets;
@@ -99,8 +104,10 @@ export function createTelegramAgentMessageRuntime<TContext, TUpdate>(
       if (allowedChatId === undefined || !ctx) {
         throw new Error("Telegram agent turn routing is unavailable.");
       }
-      const sourceTitle = (input.sourceTarget ? deps.getDisplayTitle?.(input.sourceTarget) : undefined)
-        ?? input.sourceThreadName;
+      const sourceTitle =
+        (input.sourceTarget
+          ? deps.getDisplayTitle?.(input.sourceTarget)
+          : undefined) ?? input.sourceThreadName;
       const sourceLabel =
         sourceTitle
           ?.replace(/[\r\n\[\]]+/g, " ")

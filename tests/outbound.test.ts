@@ -9,7 +9,7 @@ import { basename, dirname, join } from "node:path";
 import test from "node:test";
 
 import { resetTransportReplyDedup } from "../lib/replies.ts";
-import { TelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
+import { TelegramApiAuthorityError, TelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
 import { createTelegramVoiceReplySender as createVoiceSenderWithPorts } from "../lib/outbound-voice.ts";
 
 test.beforeEach(() => {
@@ -27,14 +27,15 @@ import {
   createTelegramVoiceReplySender,
   handleTelegramButtonCallbackQuery,
   planTelegramButtonReply,
-  planTelegramVoiceReply,
   registerTelegramVoiceSynthesisProvider,
   getTelegramVoiceSynthesisProviders,
   hasTelegramVoiceSynthesisProvider,
   clearTelegramVoiceSynthesisProviders,
-  stripTelegramCommentMarkupForPreview,
-  stripTelegramVoiceMarkupForPreview,
 } from "../lib/outbound.ts";
+import {
+  planTelegramVoiceReply,
+  stripTelegramCommentMarkupForPreview,
+} from "../lib/outbound-markup.ts";
 
 const testReplyMarkup = {
   inline_keyboard: [[{ text: "Continue", callback_data: "btn:1" }]],
@@ -96,6 +97,42 @@ test("Outbound text handler transforms text and markdown replies", async () => {
     },
   ]);
 });
+
+for (const surface of ["text", "markdown"] as const) {
+  for (const loss of ["current", "before", "transform", "response"] as const) {
+    test(`Outbound recipient fence ${surface} preserves captured authority across ${loss}`, async () => {
+      let current = loss !== "before", handlers = 0, sends = 0;
+      const assertAuthority = () => { if (!current) throw new Error("Private recipient details"); };
+      const options = { target: { chatId: 7, threadId: 41 }, assertAuthority, replyMarkup: testReplyMarkup };
+      const send = async (chatId: number, replyToMessageId: number | undefined, _text: string, supplied?: {
+        target?: { chatId: number; threadId?: number }; assertAuthority?: () => void;
+      }) => {
+        sends++;
+        assert.deepEqual([chatId, replyToMessageId, supplied?.target], [7, 11, { chatId: 7, threadId: 41 }]);
+        assert.equal(supplied?.assertAuthority, assertAuthority);
+        if (loss === "response") { current = false; if (supplied) supplied.assertAuthority = () => {}; }
+        return 9;
+      };
+      const runtime = createTelegramOutboundTextReplyRuntime({
+        getHandlers: () => [{ type: "text", template: "/fixture/transform" }],
+        execCommand: async () => {
+          handlers++;
+          await Promise.resolve();
+          options.target.chatId = 99; options.target.threadId = 99; options.assertAuthority = () => {};
+          if (loss === "transform") current = false;
+          return { stdout: "transformed", stderr: "", code: 0, killed: false };
+        },
+        sendTextReply: send, sendMarkdownReply: send,
+      });
+      const result = surface === "text" ? runtime.sendTextReply(7, 11, "body", options) : runtime.sendMarkdownReply(7, 11, "body", options);
+      if (loss === "current") assert.equal(await result, 9);
+      else await assert.rejects(result, error => error instanceof TelegramApiAuthorityError &&
+        error.requestIssued === (loss === "response") && error.message === "Telegram API call authority is unavailable.");
+      assert.equal(sends, loss === "current" || loss === "response" ? 1 : 0);
+      assert.equal(handlers, loss === "before" ? 0 : surface === "markdown" ? 2 : 1);
+    });
+  }
+}
 
 test("Outbound text runtime skips comment-only planned replies", async () => {
   const sent: string[] = [];
@@ -411,34 +448,6 @@ test("Voice reply planner strips non-voice comments from delivered markdown", ()
   assert.deepEqual(plan, {
     markdown: "Visible text.\n\nVisible tail.",
   });
-});
-
-test("Voice preview stripping hides closed and currently open telegram_voice blocks", () => {
-  assert.equal(
-    stripTelegramVoiceMarkupForPreview(
-      [
-        "Visible text.",
-        "",
-        "<!-- telegram_voice lang=ru rate=+30%",
-        "Hidden voice text streaming now",
-      ].join("\n"),
-    ),
-    "Visible text.",
-  );
-  assert.equal(
-    stripTelegramVoiceMarkupForPreview(
-      [
-        "Visible text.",
-        "",
-        "<!-- telegram_voice",
-        "Hidden voice text.",
-        "-->",
-        "",
-        "Visible tail.",
-      ].join("\n"),
-    ),
-    "Visible text.\n\nVisible tail.",
-  );
 });
 
 test("Comment preview stripping hides generic and partial comments", () => {
@@ -798,7 +807,7 @@ test("Button callback handler enqueues prompt actions", async () => {
       action: { text: "Continue", prompt: "Continue now" },
       ctx: { id: "ctx" },
     },
-    { answer: "callback-1", text: "Queued." },
+    { answer: "callback-1", text: "Queued" },
   ]);
 });
 
@@ -821,7 +830,7 @@ test("Button callback handler consumes expired button callbacks", async () => {
     true,
   );
   assert.deepEqual(events, [
-    { id: "callback-1", text: "Button action expired." },
+    { id: "callback-1", text: "Button action expired" },
   ]);
 });
 
@@ -1530,4 +1539,24 @@ test("Voice reply sender accepts provider returning an audio path", async () => 
   assert.equal(fileEvent.filePath, "/tmp/response.ogg");
   assert.equal(fileEvent.fileName, "response.ogg");
   dispose();
+});
+
+test("Outbound text handlers honour when guards on handlers and composition steps", async () => {
+  const calls: string[] = [];
+  const sent: string[] = [];
+  const runtime = createTelegramOutboundTextReplyRuntime({
+    getHandlers: () => [
+      { type: "text", when: false, template: "/tools/off" },
+      { type: "text", template: [{ when: "!text", template: "/tools/skip" }, "/tools/upper"] },
+    ],
+    execCommand: async (command, _args, options) => {
+      calls.push(command);
+      return { stdout: `${command}:${options?.stdin ?? ""}`, stderr: "", code: 0, killed: false };
+    },
+    sendTextReply: async (_chatId, _replyTo, text) => { sent.push(text); return 1; },
+    sendMarkdownReply: async () => 2,
+  });
+  await runtime.sendTextReply(1, 2, "hello");
+  assert.deepEqual(calls, ["/tools/upper"]);
+  assert.deepEqual(sent, ["/tools/upper:hello"]);
 });

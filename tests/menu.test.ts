@@ -16,6 +16,7 @@ import {
   createTelegramConfigStore,
 } from "../lib/config.ts";
 import { createTelegramQueueMenuRuntime } from "../lib/menu-queue.ts";
+import { createTelegramMenuDelivery } from "../lib/menu-model.ts";
 import {
   buildTelegramSettingsMenuReplyMarkup,
   buildTimeInjectionModeSettingsReplyMarkup,
@@ -40,7 +41,6 @@ import {
   buildThinkingMenuReplyMarkup,
   buildThinkingMenuText,
   createTelegramMenuActionRuntime,
-  createTelegramMenuActionRuntimeWithStateBuilder,
   createTelegramMenuCallbackHandler,
   createTelegramMenuCallbackHandlerForContext,
   createTelegramModelMenuRuntime,
@@ -60,7 +60,6 @@ import {
   MODEL_PAGE_MENU_TITLE,
   openTelegramModelMenu,
   openTelegramStatusMenu,
-  parseTelegramMenuCallbackAction,
   resolveCachedTelegramModelMenuInputs,
   sendTelegramModelMenuMessage,
   sendTelegramStatusMessage,
@@ -72,6 +71,39 @@ import {
   updateTelegramThinkingMenuMessage,
 } from "../lib/menu.ts";
 import type { MenuModel, ThinkingLevel } from "../lib/model.ts";
+
+for (const revoke of [false, true]) {
+  test(`Menu delivery fence retains captured adapters and ${revoke ? "refuses" : "accepts"} replaced options`, async () => {
+    let current = true, sends = 0, stored = 0;
+    const assertAuthority = () => { if (!current) throw new Error("Private recipient"); };
+    const options = { assertAuthority }, target = { chatId: 7, threadId: 41 };
+    const deps = {
+      async sendInteractiveMessage(chatId: number, _text: string, _mode: string, _markup: unknown, supplied?: {
+        target?: { chatId: number; threadId?: number }; assertAuthority?: () => void;
+      }) {
+        sends++;
+        assert.equal(chatId, 7);
+        assert.deepEqual(supplied?.target, { chatId: 7, threadId: 41 });
+        assert.equal(supplied?.assertAuthority, assertAuthority);
+        return 99;
+      },
+      storeModelMenuState(state: TelegramModelMenuState) { stored++; assert.equal(state.threadId, 41); },
+    };
+    const delivery = createTelegramMenuDelivery(target, options, deps);
+    target.chatId = 99; target.threadId = 99; options.assertAuthority = () => {};
+    deps.sendInteractiveMessage = async () => assert.fail("Captured adapter cannot be replaced");
+    deps.storeModelMenuState = () => assert.fail("Captured state publisher cannot be replaced");
+    current = !revoke;
+    const send = delivery.sendInteractiveMessage(99, "menu", "html", { inline_keyboard: [] });
+    if (revoke) await assert.rejects(send, { name: "TelegramApiAuthorityError", requestIssued: false });
+    else {
+      assert.equal(await send, 99);
+      delivery.storeModelMenuState({ chatId: 7, threadId: 41, messageId: 99, mode: "status", page: 0,
+        scope: "all", scopedModels: [], allModels: [] });
+    }
+    assert.deepEqual([sends, stored], revoke ? [0, 0] : [1, 1]);
+  });
+}
 import type { TelegramQueueItem } from "../lib/queue.ts";
 import { createTelegramExtensionSectionRegistry } from "../lib/sections.ts";
 
@@ -364,7 +396,7 @@ test("Menu helpers expose UI constants", () => {
   assert.equal(TELEGRAM_MODEL_PAGE_SIZE, 6);
 });
 
-test("Menu helpers build model menu state and parse callback actions", () => {
+test("Menu helpers build model menu state", () => {
   const modelA = createMenuModel("openai", "gpt-5", true);
   const modelB = createMenuModel("anthropic", "claude-3", false);
   const state = buildTelegramModelMenuState({
@@ -377,39 +409,6 @@ test("Menu helpers build model menu state and parse callback actions", () => {
   assert.equal(state.chatId, 1);
   assert.equal(state.scope, "all");
   assert.match(state.note ?? "", /No CLI scoped models matched/);
-  assert.deepEqual(parseTelegramMenuCallbackAction("menu:model"), {
-    kind: "status",
-    action: "model",
-  });
-  assert.deepEqual(parseTelegramMenuCallbackAction("status:model"), {
-    kind: "status",
-    action: "model",
-  });
-  assert.deepEqual(parseTelegramMenuCallbackAction("menu:queue"), {
-    kind: "status",
-    action: "queue",
-  });
-  assert.deepEqual(parseTelegramMenuCallbackAction("status:queue"), {
-    kind: "status",
-    action: "queue",
-  });
-  assert.deepEqual(parseTelegramMenuCallbackAction("thinking:set:high"), {
-    kind: "thinking:set",
-    level: "high",
-  });
-  assert.deepEqual(parseTelegramMenuCallbackAction("model:pick:2"), {
-    kind: "model",
-    action: "pick",
-    value: "2",
-  });
-  assert.deepEqual(parseTelegramMenuCallbackAction("model:pages"), {
-    kind: "model",
-    action: "pages",
-    value: undefined,
-  });
-  assert.deepEqual(parseTelegramMenuCallbackAction("unknown"), {
-    kind: "ignore",
-  });
 });
 
 test("Menu helpers apply menu mutations and resolve model selections", () => {
@@ -626,7 +625,7 @@ test("Menu helpers build model callback plans for paging, page menu, selection, 
       canRestartBusyRun: false,
       hasActiveToolExecutions: false,
     }),
-    { kind: "answer", text: "Pi is busy. Send /abort, /next, or /stop." },
+    { kind: "answer", text: "Pi is busy. Send /abort, /next, or /stop" },
   );
 });
 
@@ -957,7 +956,7 @@ test("Menu helpers route callback entry states before action handlers", async ()
   );
   assert.deepEqual(events, [
     "answer:",
-    "answer:Interactive message expired.",
+    "answer:Interactive message expired",
     "status",
   ]);
 });
@@ -1008,7 +1007,7 @@ test("Menu helpers route stored callback queries through matching action handler
     "get:2",
     "status:2",
     "get:none",
-    "answer:Interactive message expired.",
+    "answer:Interactive message expired",
   ]);
 });
 
@@ -1548,7 +1547,7 @@ test("Menu helpers handle status and thinking callback actions", async () => {
   assert.equal(events[2], "set:high");
   assert.equal(events[3], "thinking:update");
   assert.equal(events[4], "answer:Thinking: high");
-  assert.equal(events[5], "answer:This model has no reasoning controls.");
+  assert.equal(events[5], "answer:This model has no reasoning controls");
 });
 
 test("Menu helpers build pure render payloads before transport", () => {
@@ -1640,7 +1639,7 @@ test("Menu action runtime opens and updates interactive menu messages", async ()
   );
 });
 
-test("Menu action runtime with state builder opens menus from settings runtime", async () => {
+test("Menu action runtime opens menus from a settings-backed state builder", async () => {
   const events: string[] = [];
   const statusMarkups: unknown[] = [];
   let pendingCancellations = 1;
@@ -1649,16 +1648,14 @@ test("Menu action runtime with state builder opens menus from settings runtime",
     scope: "all",
     allModels: [{ model: modelA }],
   });
-  const runtime = createTelegramMenuActionRuntimeWithStateBuilder<
-    typeof modelA,
-    {
-      cwd: string;
-      modelRegistry: {
-        refresh: () => void;
-        getAvailable: () => [typeof modelA];
-      };
-    }
-  >({
+  type Ctx = {
+    cwd: string;
+    modelRegistry: {
+      refresh: () => void;
+      getAvailable: () => [typeof modelA];
+    };
+  };
+  const getModelMenuState = createTelegramModelMenuStateBuilder<typeof modelA, Ctx>({
     runtime: {
       storeState: () => {},
       getState: () => undefined,
@@ -1678,6 +1675,10 @@ test("Menu action runtime with state builder opens menus from settings runtime",
       },
       getEnabledModels: () => ["openai/*"],
     }),
+    getActiveModel: () => modelA,
+  });
+  const runtime = createTelegramMenuActionRuntime<Ctx, typeof modelA>({
+    getModelMenuState,
     getActiveModel: () => modelA,
     getThinkingLevel: () => "medium",
     getPendingCancellationCount: () => pendingCancellations,
@@ -2117,7 +2118,7 @@ test("Queue item Keep and Skip selectors share deferred-removal state", async ()
     { text: "🟢 Keep", callback_data: "queue:skip-set:1:10:keep" },
     { text: "⚫️ Skip", callback_data: "queue:skip-set:1:10:skip" },
   ]);
-  assert.deepEqual(notices, [undefined, "Prioritized.", undefined]);
+  assert.deepEqual(notices, [undefined, "Prioritized", undefined]);
 
   assert.equal(await runtime.handleCallbackQuery(
     {
@@ -2250,7 +2251,7 @@ test("Queue menu discards the selected guest prompt by queue order and dismisses
   assert.deepEqual(discardedOrders, [22]);
   assert.deepEqual(dismissed, ["inline-2"]);
   assert.deepEqual(queuedItems.map((item) => item.queueOrder), [21]);
-  assert.equal(notices.at(-1), "Guest prompt skipped.");
+  assert.equal(notices.at(-1), "Guest prompt skipped");
 });
 
 test("Queue refresh rotates empty queue title", async () => {

@@ -13,7 +13,6 @@ import {
   createTelegramMediaGroupDispatchRuntime,
   downloadTelegramMessageFiles,
   extractFirstTelegramMessageText,
-  extractTelegramMessagePromptText,
   extractTelegramMessagesPromptText,
   extractTelegramMessagesText,
   formatTelegramHistoryText,
@@ -217,7 +216,7 @@ test("Media helpers keep raw text command-safe and add reply context only for pr
   assert.equal(extractFirstTelegramMessageText([repliedCommand]), "/status");
   assert.equal(extractTelegramMessagesText([repliedCommand]), "/status");
   assert.equal(
-    extractTelegramMessagePromptText(repliedCommand),
+    extractTelegramMessagesPromptText([repliedCommand]),
     "/status\n\n[reply] quoted context",
   );
   assert.equal(
@@ -253,7 +252,7 @@ test("Media helpers prefer rich-message text for reply context", () => {
     },
   };
   assert.equal(
-    extractTelegramMessagePromptText(message),
+    extractTelegramMessagesPromptText([message]),
     "current\n\n[reply] Rendered heading\n\nPlain reply text\n\n1. First item",
   );
 });

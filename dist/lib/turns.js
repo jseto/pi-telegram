@@ -5,7 +5,7 @@
  */
 import { readFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { buildTelegramReplyContextBlock, collectTelegramFileInfos, collectTelegramMessageIds, downloadTelegramMessageFiles, extractTelegramForwardContextText, extractTelegramMessagesPromptText, extractTelegramMessagesText, extractTelegramMessageText, formatTelegramHistoryText, guessMediaType, } from "./media.js";
+import { appendTelegramAttachmentSection, appendTelegramListSection, buildTelegramReplyContextBlock, collectTelegramFileInfos, collectTelegramMessageIds, downloadTelegramMessageFiles, extractTelegramForwardContextText, extractTelegramMessagesPromptText, extractTelegramMessagesText, extractTelegramMessageText, formatTelegramHistoryText, guessMediaType, } from "./media.js";
 import { createTelegramQueueAdmissionReceipt, truncateTelegramQueueSummary, } from "./queue.js";
 import { computeVoicePromptContribution, computeVoiceTurnFlags, getTelegramVoiceReplyMode, } from "./voice.js";
 export const TELEGRAM_PREFIX = "[telegram]";
@@ -48,24 +48,6 @@ export function formatTelegramTurnStatusSummary(rawText, files, handlerOutputs =
     if (files.length > 1)
         return `📎 ${files.length} attachments`;
     return "(empty message)";
-}
-function appendTelegramListSection(text, title, items) {
-    if (items.length === 0)
-        return text;
-    const prefix = text.length > 0 ? `${text}\n\n` : "";
-    return `${prefix}[${title}]\n${items.map((item) => `- ${item}`).join("\n")}`;
-}
-function appendTelegramAttachmentSection(text, files) {
-    if (files.length === 0)
-        return text;
-    const dirs = [...new Set(files.map((file) => dirname(file.path)))];
-    const sameDir = dirs.length === 1;
-    const header = sameDir ? `[attachments] ${dirs[0]}` : "[attachments]";
-    const items = sameDir
-        ? files.map((file) => `/${basename(file.path)}`)
-        : files.map((file) => file.path);
-    const prefix = text.length > 0 ? `${text}\n\n` : "";
-    return `${prefix}${header}\n${items.map((item) => `- ${item}`).join("\n")}`;
 }
 function appendTelegramSourceContext(text, sourceContext) {
     if (!sourceContext)

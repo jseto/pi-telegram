@@ -164,5 +164,10 @@ export declare function registerTelegramChannelPostMutationTool(pi: ExtensionAPI
 export declare function registerTelegramChannelPostListTool(pi: ExtensionAPI, deps: {
     list: TelegramChannelPostJournalStore["list"];
 }): void;
+/** The profile's channel-post journal in the shared runtime directory, bound to the active bot token. */
+export declare function openTelegramChannelPostJournalStore(input: {
+    profileName: string;
+    botToken: string;
+}): TelegramChannelPostJournalStore;
 export declare function createTelegramChannelPostJournalStore(options: TelegramChannelPostJournalStoreOptions): TelegramChannelPostJournalStore;
 export {};

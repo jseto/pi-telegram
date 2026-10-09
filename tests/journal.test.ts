@@ -5,7 +5,7 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { constants, existsSync, readSync, writeFileSync } from "node:fs";
+import { existsSync, readSync, writeFileSync } from "node:fs";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import {
@@ -21,16 +21,17 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
-import test, { type TestContext } from "node:test";
+import test from "node:test";
 
 import { createTelegramBusFollowerDeliveryIdentity, createTelegramBusFollowerRegistry,
   createTelegramBusForeignOwnedUpdateForwarder, createTelegramBusProtocolIdentity,
-  getTelegramInputCustodyPeerReadiness, getTelegramProcessBirthIdentity,
+  getTelegramInputCustodyPeerReadiness,
   sendTelegramBusLocalEnvelope, TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
   TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE } from "../lib/bus.ts";
+import { getTelegramProcessBirthIdentity } from "../lib/process-identity.ts";
 import { createTelegramBusFollowerSourceReferenceAdmissionRuntime,
   createTelegramBusForwardedUpdateReceiverRuntime } from "../lib/bus-follower.ts";
 import { createTelegramConfigStore } from "../lib/config.ts";
@@ -132,8 +133,8 @@ test("Legacy custody disposition authority binds immutable quarantined failure e
     inputClaim: { phase: "running" } } as never), undefined);
 });
 
-test("V3 legacy custody disposition atomically requeues or discards with audit", async context => {
-  await withInputCustodyFixture(context, async ({ path, options, setHook }) => {
+test("V3 legacy custody disposition atomically requeues or discards with audit", async () => {
+  await withInputCustodyFixture(async ({ path, options, setHook }) => {
     const retryEntry = { updateId: 7, update: { update_id: 7 }, admittedAtMs: 100,
       preApprovalExcluded: false, state: "retry-wait" as const,
       failure: { attemptCount: 2, failedAtMs: 200, failureClass: "transport",
@@ -223,19 +224,7 @@ test("Follower journal discovery is profile-exact, segment-aware, and fail-close
   }
 });
 
-function assertUnsupportedStrictInspection(
-  input: Parameters<typeof inspectTelegramUpdateJournalFamily>[0],
-  context: TestContext,
-  inspect: () => unknown = () => inspectTelegramUpdateJournalFamily(input),
-): boolean {
-  if (fs.constants.O_NOFOLLOW && fs.constants.O_NONBLOCK) return false;
-  assert.throws(inspect, (error) =>
-    isJournalError(error, "invalid") && /platform lacks no-follow nonblocking open evidence/.test((error as Error).message));
-  context.diagnostic("Open flags unavailable: fail-closed refusal verified; successful decoding not exercised.");
-  return true;
-}
-
-async function withInputCustodyFixture(context: TestContext,
+async function withInputCustodyFixture(
   run: (fixture: {
     path: string; dir: string; options: TelegramInputJournalStoreOptions;
     setOwner: (owner: TelegramUpdateJournalQueueOwnerIdentity | undefined) => void;
@@ -284,8 +273,6 @@ async function withInputCustodyFixture(context: TestContext,
         hook?.(boundary, target);
       },
     };
-    if (assertUnsupportedStrictInspection({ ...options.sourceAccess, path, profile: "work", botIdentity }, context,
-      () => createTelegramInputJournalStore(options).read())) return;
     await run({ path, dir, options, ledger, setOwner: value => { owner = value; },
       setBinding: value => { recipientBindingKey = value; }, setHook: value => { hook = value; } });
     assert.deepEqual(ledger.read().leases, []);
@@ -301,8 +288,8 @@ function inputSource(receipt: {
     tokenSha256: receipt.tokenSha256, updateId: receipt.updateId };
 }
 
-test("Input custody acquires once, fences start and settlement, and preserves exact old receipts", async context => {
-  await withInputCustodyFixture(context, async ({ options, setOwner, setBinding, ledger }) => {
+test("Input custody acquires once, fences start and settlement, and preserves exact old receipts", async () => {
+  await withInputCustodyFixture(async ({ options, setOwner, setBinding, ledger }) => {
     const store = createTelegramInputJournalStore(options);
     assert.equal("removeCompleted" in store, false);
     assert.equal("removeCompletedExact" in store, false);
@@ -382,8 +369,8 @@ test("V3 activation readiness fails closed on mixed startup evidence", () => {
     evaluateTelegramInputCustodyActivationReadiness(input), { enabled: false, blocker });
 });
 
-test("Legacy journal mutations honor the optional outer writer admission fence", async context => {
-  await withInputCustodyFixture(context, async ({ options, path }) => {
+test("Legacy journal mutations honor the optional outer writer admission fence", async () => {
+  await withInputCustodyFixture(async ({ options, path }) => {
     const { onPublicationBoundary: _boundary, ...base } = options;
     let allowed = false;
     let admissions = 0;
@@ -426,8 +413,8 @@ test("Legacy journal mutations honor the optional outer writer admission fence",
   });
 });
 
-test("V3 source readiness adapter observes absent then strict v3 family", async context => {
-  await withInputCustodyFixture(context, async ({ options, path }) => {
+test("V3 source readiness adapter observes absent then strict v3 family", async () => {
+  await withInputCustodyFixture(async ({ options, path }) => {
     const inspection = { ...options.sourceAccess, path,
       profile: options.profileName!, botIdentity: options.botIdentity };
     const registry = createTelegramBusFollowerRegistry();
@@ -878,8 +865,8 @@ test("Legacy custody operator runtime resolves exact live binding without cachin
     "enter:journal:g2", "apply:journal:g2:legacy:7", "exit:journal:g2"]);
 });
 
-test("V3 worker journal port exposes custody but cannot complete non-excluded input without receipts", async context => {
-  await withInputCustodyFixture(context, async ({ options, path }) => {
+test("V3 worker journal port exposes custody but cannot complete non-excluded input without receipts", async () => {
+  await withInputCustodyFixture(async ({ options, path }) => {
     const store = createTelegramInputJournalStore(options);
     store.appendBatch([{ update_id: 1 }], 1);
     const port = createTelegramInputCustodyWorkerJournalPort(store);
@@ -938,8 +925,8 @@ test("V3 worker journal port exposes custody but cannot complete non-excluded in
   });
 });
 
-test("Custodied execution adapter starts once and settles complete or single-input queue outcomes", async context => {
-  await withInputCustodyFixture(context, async ({ options }) => {
+test("Custodied execution adapter starts once and settles complete or single-input queue outcomes", async () => {
+  await withInputCustodyFixture(async ({ options }) => {
     const store = createTelegramInputJournalStore(options);
     store.appendBatch([{ update_id: 1 }, { update_id: 2 }, { update_id: 3 }], 3);
     assert.deepEqual(await executeTelegramCustodiedInput({ journal: store,
@@ -965,8 +952,8 @@ test("Custodied execution adapter starts once and settles complete or single-inp
   });
 });
 
-test("Custodied execution session groups deferred and current receipts atomically", async context => {
-  await withInputCustodyFixture(context, async ({ options }) => {
+test("Custodied execution session groups deferred and current receipts atomically", async () => {
+  await withInputCustodyFixture(async ({ options }) => {
     const store = createTelegramInputJournalStore(options);
     store.appendBatch([{ update_id: 10 }, { update_id: 11 }, { update_id: 12 },
       { update_id: 13 }], 13);
@@ -1007,8 +994,8 @@ test("Custodied execution session groups deferred and current receipts atomicall
   });
 });
 
-test("Custodied admission handle settles a late report through its retained receipt", async context => {
-  await withInputCustodyFixture(context, async ({ options }) => {
+test("Custodied admission handle settles a late report through its retained receipt", async () => {
+  await withInputCustodyFixture(async ({ options }) => {
     const store = createTelegramInputJournalStore(options);
     store.appendBatch([{ update_id: 20, message: { chat: { type: "private" } } }], 20);
     let deferredMessage: { chat: { type: string } } | undefined;
@@ -1035,8 +1022,8 @@ test("Custodied admission handle settles a late report through its retained rece
   });
 });
 
-test("Assembled custodied worker publishes one late grouped queue receipt", async context => {
-  await withInputCustodyFixture(context, async ({ options }) => {
+test("Assembled custodied worker publishes one late grouped queue receipt", async () => {
+  await withInputCustodyFixture(async ({ options }) => {
     const store = createTelegramInputJournalStore(options);
     store.appendBatch([{ update_id: 30, message: { chat: { type: "private" } } },
       { update_id: 31, message: { chat: { type: "private" } } }], 31);
@@ -1074,8 +1061,8 @@ test("Assembled custodied worker publishes one late grouped queue receipt", asyn
   });
 });
 
-for (const mode of ["leader-restart", "follower-mutable-active"] as const) test(`V3 lifecycle refreshes expired source dependencies behind unchanged binding keys (${mode})`, async context => {
-  await withInputCustodyFixture(context, async ({ options, setOwner }) => {
+for (const mode of ["leader-restart", "follower-mutable-active"] as const) test(`V3 lifecycle refreshes expired source dependencies behind unchanged binding keys (${mode})`, async () => {
+  await withInputCustodyFixture(async ({ options, setOwner }) => {
     const follower = mode === "follower-mutable-active";
     let lifetime = 1;
     const createSource = () => {
@@ -1137,8 +1124,8 @@ for (const mode of ["leader-restart", "follower-mutable-active"] as const) test(
   });
 });
 
-test("V3 source refresh cannot replay an unsettled handler while independent input progresses", async context => {
-  await withInputCustodyFixture(context, async ({ options, setOwner }) => {
+test("V3 source refresh cannot replay an unsettled handler while independent input progresses", async () => {
+  await withInputCustodyFixture(async ({ options, setOwner }) => {
     let lifetime = 1;
     const createSource = () => {
       const capturedLifetime = lifetime;
@@ -1206,8 +1193,8 @@ test("V3 source refresh cannot replay an unsettled handler while independent inp
   });
 });
 
-test("V3 lifecycle replacement never replays retained running input", async context => {
-  await withInputCustodyFixture(context, async ({ options, setBinding }) => {
+test("V3 lifecycle replacement never replays retained running input", async () => {
+  await withInputCustodyFixture(async ({ options, setBinding }) => {
     const store = createTelegramInputJournalStore(options);
     store.appendBatch([{ update_id: 40 }], 40);
     const acquired = store.acquireInput({ updateId: 40,
@@ -1247,8 +1234,8 @@ test("V3 lifecycle replacement never replays retained running input", async cont
   });
 });
 
-test("Leader-follower custody assembly never replays running input across generation and role", async context => {
-  await withInputCustodyFixture(context, async ({ options }) => {
+test("Leader-follower custody assembly never replays running input across generation and role", async () => {
+  await withInputCustodyFixture(async ({ options }) => {
     const store = createTelegramInputJournalStore(options);
     store.appendBatch([{ update_id: 50 }], 50);
     const acquired = store.acquireInput({ updateId: 50,
@@ -1294,8 +1281,8 @@ test("Leader-follower custody assembly never replays running input across genera
   });
 });
 
-test("V3 worker drains independent tail behind retained running input", async context => {
-  await withInputCustodyFixture(context, async ({ options }) => {
+test("V3 worker drains independent tail behind retained running input", async () => {
+  await withInputCustodyFixture(async ({ options }) => {
     const store = createTelegramInputJournalStore(options);
     store.appendBatch([{ update_id: 60 }, { update_id: 61 }, { update_id: 62 },
       { update_id: 63 }, { update_id: 64 }, { update_id: 65 }], 65);
@@ -1330,8 +1317,8 @@ test("V3 worker drains independent tail behind retained running input", async co
   });
 });
 
-test("V3 worker drains tail behind frozen ready handoff custody", async context => {
-  await withInputCustodyFixture(context, async ({ options }) => {
+test("V3 worker drains tail behind frozen ready handoff custody", async () => {
+  await withInputCustodyFixture(async ({ options }) => {
     const store = createTelegramInputJournalStore(options);
     store.appendBatch([{ update_id: 70 }, { update_id: 71 }], 71);
     const ready = store.acquireInput({ updateId: 70, recipientBindingKey: "workspace:owner" });
@@ -1368,8 +1355,8 @@ test("V3 worker drains tail behind frozen ready handoff custody", async context 
   });
 });
 
-test("V3 worker drains tail behind foreign ready custody", async context => {
-  await withInputCustodyFixture(context, async ({ options }) => {
+test("V3 worker drains tail behind foreign ready custody", async () => {
+  await withInputCustodyFixture(async ({ options }) => {
     const donor = createTelegramInputJournalStore(options);
     donor.appendBatch([{ update_id: 80 }, { update_id: 81 }], 81);
     donor.acquireInput({ updateId: 80, recipientBindingKey: "workspace:owner" });
@@ -1399,8 +1386,8 @@ test("V3 worker drains tail behind foreign ready custody", async context => {
   });
 });
 
-test("V3 blocked diagnostics prioritize running outcome unknown over foreign ready", async context => {
-  await withInputCustodyFixture(context, async ({ options }) => {
+test("V3 blocked diagnostics prioritize running outcome unknown over foreign ready", async () => {
+  await withInputCustodyFixture(async ({ options }) => {
     const donor = createTelegramInputJournalStore(options);
     donor.appendBatch([{ update_id: 90 }, { update_id: 91 }], 91);
     donor.acquireInput({ updateId: 90, recipientBindingKey: "workspace:owner" });
@@ -1429,8 +1416,8 @@ test("V3 blocked diagnostics prioritize running outcome unknown over foreign rea
   });
 });
 
-test("V3 worker quarantines legacy retry state while draining pending tail", async context => {
-  await withInputCustodyFixture(context, async ({ options }) => {
+test("V3 worker quarantines legacy retry state while draining pending tail", async () => {
+  await withInputCustodyFixture(async ({ options }) => {
     const store = createTelegramInputJournalStore(options);
     store.appendBatch([{ update_id: 100 }, { update_id: 101 }], 101);
     const strict = createTelegramInputCustodyWorkerJournalPort(store);
@@ -1458,8 +1445,8 @@ test("V3 worker quarantines legacy retry state while draining pending tail", asy
   });
 });
 
-test("V3 source-reference wake requires one exact accepted ready handoff", async context => {
-  await withInputCustodyFixture(context, async ({ options, dir }) => {
+test("V3 source-reference wake requires one exact accepted ready handoff", async () => {
+  await withInputCustodyFixture(async ({ options, dir }) => {
     const donor = createTelegramInputJournalStore(options);
     donor.appendBatch([{ update_id: 109 }], 109);
     const claimed = donor.acquireInput({ updateId: 109, recipientBindingKey: "workspace:owner" });
@@ -1664,8 +1651,8 @@ test("V3 source-reference wake requires one exact accepted ready handoff", async
   });
 });
 
-test("V3 lifecycle lookup accepts one exact queued handoff for recipient owner", async context => {
-  await withInputCustodyFixture(context, async ({ options }) => {
+test("V3 lifecycle lookup accepts one exact queued handoff for recipient owner", async () => {
+  await withInputCustodyFixture(async ({ options }) => {
     const donor = createTelegramInputJournalStore(options);
     donor.appendBatch([{ update_id: 110 }], 110);
     const raw = donor.acquireInput({ updateId: 110, recipientBindingKey: "workspace:owner" });
@@ -1736,8 +1723,8 @@ test("V3 lifecycle lookup accepts one exact queued handoff for recipient owner",
   });
 });
 
-test("Input custody refuses vetoes and revoked publication without losing a retryable acquisition", async context => {
-  await withInputCustodyFixture(context, async ({ options, path, setOwner, setBinding, setHook }) => {
+test("Input custody refuses vetoes and revoked publication without losing a retryable acquisition", async () => {
+  await withInputCustodyFixture(async ({ options, path, setOwner, setBinding, setHook }) => {
     const excluded = createTelegramInputJournalStore({ ...options,
       withPairingAdmission: publish => options.withSourceSerialization(() => publish(true)) });
     excluded.appendBatch([{ update_id: 1 }], 1);
@@ -1768,8 +1755,8 @@ test("Input custody refuses vetoes and revoked publication without losing a retr
   });
 });
 
-test("Input custody never regrants a start whose compaction failed after durable publication", async context => {
-  await withInputCustodyFixture(context, async ({ options, path, setHook }) => {
+test("Input custody never regrants a start whose compaction failed after durable publication", async () => {
+  await withInputCustodyFixture(async ({ options, path, setHook }) => {
     const store = createTelegramInputJournalStore(options);
     store.appendBatch([{ update_id: 1 }], 1);
     const { receipt } = store.acquireInput({ updateId: 1, recipientBindingKey: "workspace:owner" });
@@ -1785,8 +1772,8 @@ test("Input custody never regrants a start whose compaction failed after durable
   });
 });
 
-test("Input custody serializes competing process acquisitions without dead-owner takeover", async context => {
-  await withInputCustodyFixture(context, async ({ options, path }) => {
+test("Input custody serializes competing process acquisitions without dead-owner takeover", async () => {
+  await withInputCustodyFixture(async ({ options, path }) => {
     const store = createTelegramInputJournalStore(options);
     store.appendBatch([{ update_id: 42 }], 42);
     await Promise.all([runJournalWorker(path, 1, 42, "input-custody"), runJournalWorker(path, 2, 42, "input-custody")]);
@@ -1803,8 +1790,8 @@ test("Input custody serializes competing process acquisitions without dead-owner
   });
 });
 
-test("Input custody captures configuration, refuses capacity, and retains stored receipt scope", async context => {
-  await withInputCustodyFixture(context, async ({ options, path }) => {
+test("Input custody captures configuration, refuses capacity, and retains stored receipt scope", async () => {
+  await withInputCustodyFixture(async ({ options, path }) => {
     for (const field of ["sourceAccess", "queueRuntimeIdentity", "withSourceSerialization", "withPairingAdmission", "getInputContext"]) {
       assert.throws(() => createTelegramInputJournalStore({ ...options, [field]: undefined } as unknown as TelegramInputJournalStoreOptions),
         /requires strict serialized polling admission/);
@@ -1837,8 +1824,8 @@ test("Input custody captures configuration, refuses capacity, and retains stored
   });
 });
 
-test("Input custody removes only immutable exclusions atomically and preserves the replay barrier", async context => {
-  await withInputCustodyFixture(context, async ({ options, path, dir, setOwner, ledger }) => {
+test("Input custody removes only immutable exclusions atomically and preserves the replay barrier", async () => {
+  await withInputCustodyFixture(async ({ options, path, dir, setOwner, ledger }) => {
     const store = createTelegramInputJournalStore(options);
     assert.throws(() => store.removeExcluded([1]), (error) => isJournalError(error, "conflict"));
     assert.equal(existsSync(path), false);
@@ -1880,8 +1867,8 @@ test("Input custody removes only immutable exclusions atomically and preserves t
   });
 });
 
-test("Input custody exclusion removal preserves failure diagnostics outside the veto and retries publication safely", async context => {
-  await withInputCustodyFixture(context, async ({ options, path, dir, setHook, setOwner }) => {
+test("Input custody exclusion removal preserves failure diagnostics outside the veto and retries publication safely", async () => {
+  await withInputCustodyFixture(async ({ options, path, dir, setHook, setOwner }) => {
     const failure = { attemptCount: 1, failedAtMs: 101, failureClass: "fixture", summary: "fixture failure" };
     const entries = [true, false].flatMap((preApprovalExcluded, group) =>
       (["pending", "retry-wait", "failed"] as const).map((state, index) => {
@@ -1933,8 +1920,8 @@ test("Input custody exclusion removal preserves failure diagnostics outside the 
   });
 });
 
-test("Input custody reserves one ready release and complete transition chain before durable admission", async context => {
-  await withInputCustodyFixture(context, async ({ options, dir, ledger }) => {
+test("Input custody reserves one ready release and complete transition chain before durable admission", async () => {
+  await withInputCustodyFixture(async ({ options, dir, ledger }) => {
     const calibrationPath = join(dir, "calibration.json");
     const calibration = createTelegramInputJournalStore({ ...options, path: calibrationPath });
     const rawBytes = calibration.appendBatch([{ update_id: 1 }], 1).serializedBytes;
@@ -1961,7 +1948,7 @@ test("Input custody reserves one ready release and complete transition chain bef
     store.appendBatch([{ update_id: 2 }], 2);
     const originalUnlink = fs.unlinkSync;
     fs.unlinkSync = ((target: fs.PathLike) => {
-      if (String(target).startsWith(`${path}.segments/`)) throw new Error("synthetic retained segment");
+      if (String(target).startsWith(`${path}.segments${sep}`)) throw new Error("synthetic retained segment");
       return originalUnlink(target);
     }) as typeof fs.unlinkSync;
     syncBuiltinESMExports();
@@ -1978,8 +1965,8 @@ test("Input custody reserves one ready release and complete transition chain bef
   });
 });
 
-test("Input custody reserves progress when append snapshot publication is commit-unknown", async context => {
-  await withInputCustodyFixture(context, async ({ options, dir, setHook }) => {
+test("Input custody reserves progress when append snapshot publication is commit-unknown", async () => {
+  await withInputCustodyFixture(async ({ options, dir, setHook }) => {
     const path = join(dir, "commit-unknown-append.json");
     const store = createTelegramInputJournalStore({ ...options, path,
       sourceAccess: { ...options.sourceAccess, limits: { ...options.sourceAccess.limits, maxFiles: 7 } } });
@@ -2010,8 +1997,8 @@ test("Input custody reserves progress when append snapshot publication is commit
   });
 });
 
-test("Input custody bounds execution projection growth inside its admission reserve", async context => {
-  await withInputCustodyFixture(context, async ({ options }) => {
+test("Input custody bounds execution projection growth inside its admission reserve", async () => {
+  await withInputCustodyFixture(async ({ options }) => {
     const store = createTelegramInputJournalStore(options);
     store.appendBatch([{ update_id: 1, message: { text: "original" } }], 1);
     const before = store.read();
@@ -2038,8 +2025,8 @@ test("Input custody bounds execution projection growth inside its admission rese
   });
 });
 
-test("Input custody releases only an exact ready claim and retries commit-unknown publication", async context => {
-  await withInputCustodyFixture(context, async ({ options, path, setOwner, setHook }) => {
+test("Input custody releases only an exact ready claim and retries commit-unknown publication", async () => {
+  await withInputCustodyFixture(async ({ options, path, setOwner, setHook }) => {
     const identity = { ...options.queueRuntimeIdentity, sessionGeneration: 1 };
     const store = createTelegramInputJournalStore(options);
     store.appendBatch([{ update_id: 1, message: { text: "retained" } }], 1);
@@ -2085,8 +2072,8 @@ test("Input custody releases only an exact ready claim and retries commit-unknow
   });
 });
 
-test("Input custody recovers ready ownership only after exact process-death proof", async context => {
-  await withInputCustodyFixture(context, async ({ options, path, ledger }) => {
+test("Input custody recovers ready ownership only after exact process-death proof", async () => {
+  await withInputCustodyFixture(async ({ options, path, ledger }) => {
     const ownerStore = createTelegramInputJournalStore(options);
     ownerStore.appendBatch([{ update_id: 1 }], 1);
     const first = ownerStore.acquireInput({ updateId: 1, recipientBindingKey: "workspace:owner" });
@@ -2137,8 +2124,8 @@ test("Input custody recovers ready ownership only after exact process-death proo
   });
 });
 
-test("Input custody offer freezes the donor and acceptance transfers one exact acquisition", async context => {
-  await withInputCustodyFixture(context, async ({ options, ledger }) => {
+test("Input custody offer freezes the donor and acceptance transfers one exact acquisition", async () => {
+  await withInputCustodyFixture(async ({ options, ledger }) => {
     const donor = createTelegramInputJournalStore(options);
     donor.appendBatch([{ update_id: 1, message: { text: "original" } }], 1);
     const donorClaim = donor.acquireInput({ updateId: 1, recipientBindingKey: "workspace:owner",
@@ -2217,8 +2204,8 @@ test("Input custody offer freezes the donor and acceptance transfers one exact a
   });
 });
 
-test("Input custody handoff cancellation, recovery, and commit-unknown acceptance never restore donor authority", async context => {
-  await withInputCustodyFixture(context, async ({ options, path, setHook, ledger }) => {
+test("Input custody handoff cancellation, recovery, and commit-unknown acceptance never restore donor authority", async () => {
+  await withInputCustodyFixture(async ({ options, path, setHook, ledger }) => {
     const donor = createTelegramInputJournalStore(options);
     donor.appendBatch([{ update_id: 1 }, { update_id: 2 }, { update_id: 3 }], 3);
     const recipientRuntime = { instanceId: "recipient", processId: process.pid + 3000,
@@ -2303,8 +2290,8 @@ test("Input custody handoff cancellation, recovery, and commit-unknown acceptanc
   });
 });
 
-test("Input custody serializes duplicate accept and accept/dead-recovery across processes", async context => {
-  await withInputCustodyFixture(context, async ({ options, dir, path, ledger }) => {
+test("Input custody serializes duplicate accept and accept/dead-recovery across processes", async () => {
+  await withInputCustodyFixture(async ({ options, dir, path, ledger }) => {
     const donor = createTelegramInputJournalStore(options);
     donor.appendBatch([{ update_id: 1 }, { update_id: 2 }], 2);
     const recipientRuntime = { instanceId: "recipient-race", processId: process.pid + 5000,
@@ -2366,8 +2353,8 @@ test("Input custody serializes duplicate accept and accept/dead-recovery across 
   });
 });
 
-test("Input custody offer reserves dead-donor recovery through complete cleanup refusal", async context => {
-  await withInputCustodyFixture(context, async ({ options, dir, ledger }) => {
+test("Input custody offer reserves dead-donor recovery through complete cleanup refusal", async () => {
+  await withInputCustodyFixture(async ({ options, dir, ledger }) => {
     const path = join(dir, "handoff-headroom.json");
     const initial = createTelegramInputJournalStore({ ...options, path });
     initial.appendBatch([{ update_id: 1 }], 1);
@@ -2391,7 +2378,7 @@ test("Input custody offer reserves dead-donor recovery through complete cleanup 
       getQueueProcessLiveness: () => "dead" });
     const originalUnlink = fs.unlinkSync;
     fs.unlinkSync = ((target: fs.PathLike) => {
-      if (String(target).startsWith(`${path}.segments/`)) throw new Error("synthetic retained handoff segment");
+      if (String(target).startsWith(`${path}.segments${sep}`)) throw new Error("synthetic retained handoff segment");
       return originalUnlink(target);
     }) as typeof fs.unlinkSync;
     syncBuiltinESMExports();
@@ -2409,8 +2396,8 @@ test("Input custody offer reserves dead-donor recovery through complete cleanup 
   });
 });
 
-test("Input custody atomically replaces exact running claims with one grouped Pi queue receipt", async context => {
-  await withInputCustodyFixture(context, async ({ options, setOwner, ledger }) => {
+test("Input custody atomically replaces exact running claims with one grouped Pi queue receipt", async () => {
+  await withInputCustodyFixture(async ({ options, setOwner, ledger }) => {
     const store = createTelegramInputJournalStore(options);
     store.appendBatch([{ update_id: 1, message: { text: "one" } },
       { update_id: 2, message: { text: "two" } }], 2);
@@ -2462,8 +2449,8 @@ test("Input custody atomically replaces exact running claims with one grouped Pi
   });
 });
 
-test("Input custody grouped queue transition reserves commit-unknown completion with cleanup residue", async context => {
-  await withInputCustodyFixture(context, async ({ options, dir, setHook, ledger }) => {
+test("Input custody grouped queue transition reserves commit-unknown completion with cleanup residue", async () => {
+  await withInputCustodyFixture(async ({ options, dir, setHook, ledger }) => {
     const path = join(dir, "queue-headroom.json");
     const initial = createTelegramInputJournalStore({ ...options, path });
     initial.appendBatch([{ update_id: 1 }, { update_id: 2 }], 2);
@@ -2492,7 +2479,7 @@ test("Input custody grouped queue transition reserves commit-unknown completion 
     assert.equal(duplicate.queued, false);
     const originalUnlink = fs.unlinkSync;
     fs.unlinkSync = ((target: fs.PathLike) => {
-      if (String(target).startsWith(`${path}.segments/`)) throw new Error("synthetic retained queue segment");
+      if (String(target).startsWith(`${path}.segments${sep}`)) throw new Error("synthetic retained queue segment");
       return originalUnlink(target);
     }) as typeof fs.unlinkSync;
     syncBuiltinESMExports();
@@ -2505,7 +2492,7 @@ test("Input custody grouped queue transition reserves commit-unknown completion 
   });
 });
 
-test("Custody v3 decodes input claims without granting legacy consumers access", async (context) => {
+test("Custody v3 decodes input claims without granting legacy consumers access", async () => {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-custody-codec-")));
   const path = join(dir, "inbox.work.json");
   const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "synthetic-custody-codec" });
@@ -2522,7 +2509,6 @@ test("Custody v3 decodes input claims without granting legacy consumers access",
     recipientOwner: { instanceId: "recipient", processId: 43, processBirthId: "birth-43", sessionGeneration: 2 } };
   try {
     await writeFile(path, JSON.stringify(file));
-    if (assertUnsupportedStrictInspection(input, context, () => readTelegramUpdateJournalSource(input))) return;
     for (const phase of ["ready", "running"] as const) {
       file.entries[0]!.inputClaim.phase = phase;
       await writeFile(path, JSON.stringify(file));
@@ -2645,7 +2631,7 @@ test("Custody v3 decodes input claims without granting legacy consumers access",
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test("Custody v3 retained segments validate claims and preserve exclusion/cursor replay barriers", async (context) => {
+test("Custody v3 retained segments validate claims and preserve exclusion/cursor replay barriers", async () => {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-custody-segments-")));
   const path = join(dir, "inbox.work.json");
   const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "synthetic-custody-segments" });
@@ -2659,7 +2645,6 @@ test("Custody v3 retained segments validate claims and preserve exclusion/cursor
   const segment = { ...base, revision: 1, previousRevision: 0, upsertedEntries: [entry], removedUpdateIds: [] };
   try {
     await writeFile(path, JSON.stringify({ ...base, entries: [entry] }));
-    if (assertUnsupportedStrictInspection(input, context)) return;
     await mkdir(`${path}.segments`);
     const segmentPath = join(`${path}.segments`, "0000000000000001.json");
     await writeFile(segmentPath, JSON.stringify(segment));
@@ -2691,7 +2676,7 @@ test("Custody v3 retained segments validate claims and preserve exclusion/cursor
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test("Strict family inspection preserves evidence and rejects uncertain families without writes", async (context) => {
+test("Strict family inspection preserves evidence and rejects uncertain families without writes", async () => {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-strict-journal-")));
   const path = join(dir, "journal.json");
   const segmentDir = `${path}.segments`;
@@ -2717,10 +2702,6 @@ test("Strict family inspection preserves evidence and rejects uncertain families
     assert.deepEqual(await tree(), before);
   };
   try {
-    if (assertUnsupportedStrictInspection(input, context)) {
-      assert.deepEqual(await tree(), []);
-      return;
-    }
     assert.deepEqual(inspectTelegramUpdateJournalFamily(input), { kind: "absent" });
     await writeFile(path, JSON.stringify(snapshot));
     await mkdir(segmentDir);
@@ -2800,31 +2781,48 @@ test("Strict family inspection preserves evidence and rejects uncertain families
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test("Live source reader refuses unavailable open capabilities (synthetic, not native Windows evidence)", () => {
-  const syntheticDirectory = resolve(tmpdir(), "pi-telegram-synthetic-journal");
-  const syntheticPath = join(syntheticDirectory, "journal.json");
-  for (const flag of ["O_NOFOLLOW", "O_NONBLOCK"]) {
-    const result = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", `
-      import { registerHooks } from 'node:module';
-      import assert from 'node:assert/strict';
-      registerHooks({ load(url, context, next) {
-        const loaded = next(url, context);
-        if (url === ${JSON.stringify(new URL("../lib/journal.ts", import.meta.url).href)}) {
-          return { ...loaded, source: String(loaded.source).replace('  constants,', '  constants as nativeConstants,') +
-            '\\nconst constants = { ...nativeConstants, ${flag}: 0 };\\n' };
-        }
-        return loaded;
-      } });
-      const { readTelegramUpdateJournalSource } = await import(${JSON.stringify(new URL("../lib/journal.ts", import.meta.url).href)});
-      assert.throws(() => readTelegramUpdateJournalSource({ directory: ${JSON.stringify(syntheticDirectory)}, path: ${JSON.stringify(syntheticPath)},
-        profile: 'default', botIdentity: { tokenSha256: 'a'.repeat(64) }, version: 1,
-        limits: { maxFiles: 1, maxBytes: 1, maxEntries: 1, maxWork: 1 } }), /platform lacks no-follow nonblocking open evidence/);
-    `], { encoding: "utf8", timeout: 10_000 });
-    assert.equal(result.status, 0, result.stderr);
-  }
+test("Strict readers work without no-follow, non-blocking or POSIX-uid support, as on Windows", () => {
+  // Emulates Windows in a child: the shared read flags lose both bits and process.getuid disappears. Identity binding
+  // must then carry the guarantee: a valid journal reads, and a link standing in for it is still refused.
+  const locks = new URL("../lib/locks.ts", import.meta.url).href;
+  const result = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", `
+    import { registerHooks } from 'node:module';
+    import assert from 'node:assert/strict';
+    import { constants, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+    import { tmpdir } from 'node:os';
+    import { join } from 'node:path';
+    registerHooks({ load(url, context, next) {
+      const loaded = next(url, context);
+      if (url !== ${JSON.stringify(locks)}) return loaded;
+      return { ...loaded, source: String(loaded.source).replace(/constants\\.O_(?:NOFOLLOW|NONBLOCK) \\?\\? 0/g, '0') };
+    } });
+    process.getuid = undefined;
+    const { TELEGRAM_STRICT_READ_FLAGS, readTelegramPrivateFile } = await import(${JSON.stringify(locks)});
+    assert.equal(TELEGRAM_STRICT_READ_FLAGS, constants.O_RDONLY, 'the emulation removed both open flags');
+    const { createTelegramUpdateJournalBotIdentity, readTelegramUpdateJournalSource } =
+      await import(${JSON.stringify(new URL("../lib/journal.ts", import.meta.url).href)});
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'pi-telegram-windows-emulation-')));
+    try {
+      const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: 'synthetic-windows' });
+      const path = join(dir, 'journal.json'), other = join(dir, 'other.json');
+      const raw = JSON.stringify({ version: 1, profile: 'default', botIdentity, acceptedThroughUpdateId: 1,
+        entries: [{ updateId: 1, update: { update_id: 1 }, admittedAtMs: 1, state: 'pending' }] });
+      writeFileSync(path, raw, { mode: 0o644 });
+      const input = { directory: dir, path, profile: 'default', botIdentity, version: 1,
+        limits: { maxFiles: 10, maxBytes: 100000, maxEntries: 10, maxWork: 100 } };
+      assert.equal(readTelegramUpdateJournalSource(input).kind, 'present');
+      assert.equal(readTelegramPrivateFile(path, 100000), raw, 'without a uid, mode bits do not decide privacy');
+      writeFileSync(other, raw);
+      rmSync(path);
+      symlinkSync(other, path);
+      assert.throws(() => readTelegramUpdateJournalSource(input), /linked or unexpected file type/);
+      assert.throws(() => readTelegramPrivateFile(path, 100000), { name: 'TelegramPrivateFileError' });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  `], { encoding: "utf8", timeout: 20_000 });
+  assert.equal(result.status, 0, result.stderr);
 });
 
-test("Live source reader preserves selected schema, exact identity, scope and rejection bytes", async (context) => {
+test("Live source reader preserves selected schema, exact identity, scope and rejection bytes", async () => {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-live-source-")));
   const path = join(dir, "journal.json");
   const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "synthetic-live" });
@@ -2837,7 +2835,6 @@ test("Live source reader preserves selected schema, exact identity, scope and re
     assert.deepEqual(fs.readFileSync(path), before);
   };
   try {
-    if (assertUnsupportedStrictInspection(input, context, inspect)) return;
     assert.deepEqual(inspect(), { kind: "absent" });
     for (const version of [1, 2] as const) {
       input.version = version;
@@ -2871,7 +2868,7 @@ test("Live source reader preserves selected schema, exact identity, scope and re
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test("Live ancestor endpoints tolerate sibling churn while full inspection and source mutations refuse", async (context) => {
+test("Live ancestor endpoints tolerate sibling churn while full inspection and source mutations refuse", async () => {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-live-endpoints-")));
   const root = join(dir, "root");
   const parent = join(root, "nested");
@@ -2909,7 +2906,6 @@ test("Live ancestor endpoints tolerate sibling churn while full inspection and s
   };
   try {
     await mkdir(parent, { recursive: true });
-    if (assertUnsupportedStrictInspection(input, context, () => readTelegramUpdateJournalSource(input))) return;
     const reset = () => {
       fs.rmSync(root, { recursive: true, force: true });
       fs.mkdirSync(parent, { recursive: true });
@@ -2960,7 +2956,7 @@ test("Live ancestor endpoints tolerate sibling churn while full inspection and s
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test("Strict inspection bounds raw, reconstructed and repeated work and preserves v1/v2 codecs", async (context) => {
+test("Strict inspection bounds raw, reconstructed and repeated work and preserves v1/v2 codecs", async () => {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-strict-budget-")));
   const path = join(dir, "journal.json");
   const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "synthetic-budget" });
@@ -2968,10 +2964,6 @@ test("Strict inspection bounds raw, reconstructed and repeated work and preserve
   const input = { directory: dir, path, profile: "default", botIdentity, limits };
   const entry = { updateId: 1, update: { update_id: 1 }, admittedAtMs: 1, state: "pending" };
   try {
-    if (assertUnsupportedStrictInspection(input, context)) {
-      assert.deepEqual(await readdir(dir), []);
-      return;
-    }
     await mkdir(`${path}.segments`);
     for (const version of [1, 2] as const) {
       const entries = [{ ...entry, ...(version === 2 ? { preApprovalExcluded: false } : {}) }];
@@ -3095,7 +3087,7 @@ for (const scenario of ["root-file", "session-alias", "session-file", "unknown-f
   });
 }
 
-test("Strict family inspection preserves legacy failures, queue owners and handoffs", async (context) => {
+test("Strict family inspection preserves legacy failures, queue owners and handoffs", async () => {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-strict-metadata-")));
   const path = join(dir, "journal.json");
   const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "synthetic-metadata" });
@@ -3114,27 +3106,26 @@ test("Strict family inspection preserves legacy failures, queue owners and hando
       await writeFile(path, text);
       const input = { directory: dir, path, profile: "default", botIdentity,
         limits: { maxFiles: 1, maxBytes: 100_000, maxEntries: 10, maxWork: 100 } };
-      if (!assertUnsupportedStrictInspection(input, context)) {
-        const first = inspectTelegramUpdateJournalFamily(input);
-        const second = inspectTelegramUpdateJournalFamily(input);
-        assert.deepEqual(readTelegramUpdateJournalSource({ ...input, version }), first);
-        assert.deepEqual(second, first);
-        assert.equal(first.kind, "present");
-        if (first.kind === "present") {
-          assert.deepEqual(first.file.entries[0], entries[0]);
-          assert.deepEqual(first.file.entries[1], { ...entries[1], terminalFailureId: first.file.entries[1]!.terminalFailureId });
-          assert.match(first.file.entries[1]!.terminalFailureId!, /^failure-[a-f0-9]{32}$/u);
-          assert.equal(first.file.revision, undefined);
-          assert.equal(first.file.acceptedThroughUpdateId, version === 2 ? 2 : undefined);
-        }
+      const first = inspectTelegramUpdateJournalFamily(input);
+      const second = inspectTelegramUpdateJournalFamily(input);
+      assert.deepEqual(readTelegramUpdateJournalSource({ ...input, version }), first);
+      assert.deepEqual(second, first);
+      assert.equal(first.kind, "present");
+      if (first.kind === "present") {
+        assert.deepEqual(first.file.entries[0], entries[0]);
+        assert.deepEqual(first.file.entries[1], { ...entries[1], terminalFailureId: first.file.entries[1]!.terminalFailureId });
+        assert.match(first.file.entries[1]!.terminalFailureId!, /^failure-[a-f0-9]{32}$/u);
+        assert.equal(first.file.revision, undefined);
+        assert.equal(first.file.acceptedThroughUpdateId, version === 2 ? 2 : undefined);
       }
+
       assert.equal(await readFile(path, "utf8"), text);
       assert.deepEqual(await readdir(dir), ["journal.json"]);
     }
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test("Session namespace shares budgets, covers segment tails and leaves foreign contents unread", async (context) => {
+test("Session namespace shares budgets, covers segment tails and leaves foreign contents unread", async () => {
   const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-session-census-")));
   const directory = join(agentDir, "tmp", "pi-telegram");
   const oldPath = resolveTelegramSessionJournalPath("session-old", "manual:recipient", agentDir, "work");
@@ -3150,7 +3141,6 @@ test("Session namespace shares budgets, covers segment tails and leaves foreign 
   try {
     await mkdir(dirname(oldPath), { recursive: true });
     await mkdir(dirname(newPath), { recursive: true });
-    if (assertUnsupportedStrictInspection({ ...input, path: oldPath }, context, inspect)) return;
     await writeFile(legacy, file([]));
     await writeFile(oldPath, file([entry(1)]));
     await writeFile(newPath, file([]));
@@ -3191,7 +3181,7 @@ test("Session namespace shares budgets, covers segment tails and leaves foreign 
   } finally { await rm(agentDir, { recursive: true, force: true }); }
 });
 
-test("Temporary cleanup namespace requires present exact references and complete-empty shared evidence", async (context) => {
+test("Temporary cleanup namespace requires present exact references and complete-empty shared evidence", async () => {
   const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-temporary-census-")));
   const directory = join(agentDir, "tmp", "pi-telegram"), profile = "work";
   const pollingPath = resolveTelegramSessionPollingJournalPath("leader", agentDir, profile);
@@ -3214,7 +3204,6 @@ test("Temporary cleanup namespace requires present exact references and complete
   const empty = JSON.stringify({ version: 1, revision: 1, profile, botIdentity, entries: [] });
   try {
     for (const path of paths) { await mkdir(dirname(path), { recursive: true }); await writeFile(path, empty); }
-    if (assertUnsupportedStrictInspection({ ...input, path: pollingPath }, context, inspect)) return;
     const before = await readJournalFixtureTree(directory);
     const originalOpen = fs.openSync;
     const opened = new Set<string>();
@@ -3263,7 +3252,7 @@ test("Temporary cleanup namespace requires present exact references and complete
   } finally { await rm(agentDir, { recursive: true, force: true }); }
 });
 
-test("Session namespace reads the owners-named polling journal from a session folder", async (context) => {
+test("Session namespace reads the owners-named polling journal from a session folder", async () => {
   const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-session-polling-")));
   const directory = join(agentDir, "tmp", "pi-telegram");
   const pollingPath = resolveTelegramSessionPollingJournalPath("leader-session", agentDir, "work");
@@ -3277,7 +3266,6 @@ test("Session namespace reads the owners-named polling journal from a session fo
   try {
     await mkdir(dirname(pollingPath), { recursive: true });
     await mkdir(dirname(otherPolling), { recursive: true });
-    if (assertUnsupportedStrictInspection({ ...input, path: pollingPath }, context, () => inspectTelegramSessionJournalNamespace(input))) return;
     await writeFile(pollingPath, file([entry(1)]));
     await writeFile(staleRoot, file([entry(2)]));
     await writeFile(otherPolling, file([entry(3)]));
@@ -3291,7 +3279,7 @@ test("Session namespace reads the owners-named polling journal from a session fo
 });
 
 for (const kind of ["alias", "unknown", "retained", "linked-session", "linked-snapshot", "linked-segment", "orphan-segments", "identity-conflict"] as const) {
-  test(`Session namespace rejects unclassified or foreign authority (${kind})`, { skip: kind.startsWith("linked") && process.platform === "win32" }, async (context) => {
+  test(`Session namespace rejects unclassified or foreign authority (${kind})`, { skip: kind.startsWith("linked") && process.platform === "win32" }, async () => {
     const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-session-census-refusal-")));
     const directory = join(agentDir, "tmp", "pi-telegram");
     const folder = join(directory, "sessions", kind === "alias" ? "%61" : "session");
@@ -3302,7 +3290,6 @@ for (const kind of ["alias", "unknown", "retained", "linked-session", "linked-sn
     const inspect = () => inspectTelegramSessionJournalNamespace(input);
     try {
       await mkdir(join(directory, "sessions"), { recursive: true });
-      if (assertUnsupportedStrictInspection({ ...input, path }, context, inspect)) return;
       const outside = join(agentDir, "outside");
       await mkdir(outside);
       const original = "private outside data stays unread";
@@ -3333,7 +3320,7 @@ for (const kind of ["alias", "unknown", "retained", "linked-session", "linked-sn
 }
 
 for (const change of ["segment-body", "legacy-segment-body", "new-session", "foreign-body"] as const) {
-  test(`Session namespace recensus refuses changes after the last family read (${change})`, async (context) => {
+  test(`Session namespace recensus refuses changes after the last family read (${change})`, async () => {
     const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-session-recensus-")));
     const directory = join(agentDir, "tmp", "pi-telegram");
     const path = resolveTelegramSessionJournalPath("session", "manual:recipient", agentDir);
@@ -3345,7 +3332,6 @@ for (const change of ["segment-body", "legacy-segment-body", "new-session", "for
     const segmentPath = join(`${path}.segments`, "0000000000000002.json");
     try {
       await mkdir(dirname(path), { recursive: true });
-      if (assertUnsupportedStrictInspection({ ...input, path }, context, inspect)) return;
       await writeFile(path, JSON.stringify({ version: 1, revision: 1, profile: "default", botIdentity, entries: [] }));
       await mkdir(`${path}.segments`);
       await writeFile(segmentPath, JSON.stringify({ version: 1, revision: 2, previousRevision: 1,
@@ -3377,13 +3363,12 @@ for (const change of ["segment-body", "legacy-segment-body", "new-session", "for
   });
 }
 
-test("Session namespace accounts preserved originals across polling, flat and session families", async (context) => {
+test("Session namespace accounts preserved originals across polling, flat and session families", async () => {
   await withJournalTempDir(async ({ dir, path }) => {
     const paths = [path, join(dir, "follower-inbox-aaaaaaaaaaaaaaaa.work.json"),
       join(dir, "sessions", "session", "journal.aaaaaaaaaaaaaaaa.work.json")];
     const input = { directory: dir, profile: "work", botIdentity: identity,
       limits: { maxDirectoryEntries: 100, maxFiles: 100, maxBytes: 1_000_000, maxEntries: 100, maxWork: 10_000 } };
-    if (assertUnsupportedStrictInspection({ ...input, path }, context, () => inspectTelegramSessionJournalNamespace(input))) return;
     for (const journalPath of paths) {
       const store = createStore(journalPath);
       store.appendBatch([{ update_id: 1 }]);
@@ -3411,12 +3396,11 @@ async function readJournalFixtureTree(directory: string): Promise<unknown> {
 }
 
 for (const state of ["committed", "uncommitted", "tampered", "foreign-key", "tombstone-conflict", "missing-snapshot", "unknown-leaf", "linked-leaf"] as const) {
-  test(`Strict private retention inspection verifies exact tombstones (${state})`, { skip: state === "linked-leaf" && process.platform === "win32" }, async (context) => {
+  test(`Strict private retention inspection verifies exact tombstones (${state})`, { skip: state === "linked-leaf" && process.platform === "win32" }, async () => {
     await withJournalTempDir(async ({ dir, path }) => {
       const input = { directory: dir, path, profile: "work", botIdentity: identity,
         limits: { maxFiles: 100, maxBytes: 1_000_000, maxEntries: 100, maxWork: 10_000 } };
       const inspect = () => inspectTelegramUpdateJournalRetention(input);
-      if (assertUnsupportedStrictInspection(input, context, inspect)) return;
       const store = createStore(path);
       store.appendBatch([{ update_id: 1, message: { text: "Original private input" } }]);
       const entry = store.read().entries[0]!;
@@ -3473,17 +3457,13 @@ for (const state of ["committed", "uncommitted", "tampered", "foreign-key", "tom
   });
 }
 
-test("Canonical namespace inventory shares budgets, orders families and preserves foreign evidence", async (context) => {
+test("Canonical namespace inventory shares budgets, orders families and preserves foreign evidence", async () => {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-inventory-")));
   const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "synthetic-inventory" });
   const limits = { maxDirectoryEntries: 20, maxFiles: 20, maxBytes: 100_000, maxEntries: 10, maxWork: 20 };
   const input = { directory: dir, profile: "default", botIdentity, limits };
   const inspect = () => inspectTelegramProfileJournalNamespace(input);
   try {
-    if (assertUnsupportedStrictInspection({ ...input, path: join(dir, "inbox.json") }, context, inspect)) {
-      assert.deepEqual(await readdir(dir), []);
-      return;
-    }
     assert.deepEqual(inspect().accounting, { directoryEntries: 0, files: 0, bytes: 0, work: 1 });
     for (const profile of ["default", "work"]) {
       input.profile = profile;
@@ -3526,14 +3506,13 @@ test("Canonical namespace inventory shares budgets, orders families and preserve
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test("Canonical namespace rejects aliases, residue and foreign links/types without traversal, ignoring legacy recovery", async (context) => {
+test("Canonical namespace rejects aliases, residue and foreign links/types without traversal, ignoring legacy recovery", async () => {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-inventory-reject-")));
   const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "synthetic-inventory" });
   const input = { directory: dir, profile: "default", botIdentity,
     limits: { maxDirectoryEntries: 20, maxFiles: 20, maxBytes: 100_000, maxEntries: 10, maxWork: 20 } };
   const inspect = () => inspectTelegramProfileJournalNamespace(input);
   try {
-    if (assertUnsupportedStrictInspection({ ...input, path: join(dir, "inbox.json") }, context, inspect)) return;
     for (const profile of ["Default", "work-x", "a".repeat(33), "", "work.x"]) {
       assert.throws(() => inspectTelegramProfileJournalNamespace({ ...input, profile }), TelegramUpdateJournalError);
     }
@@ -3565,7 +3544,7 @@ test("Canonical namespace rejects aliases, residue and foreign links/types witho
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test("Canonical namespace carries segment-only bot constraints and detects root changes and vanished families", async (context) => {
+test("Canonical namespace carries segment-only bot constraints and detects root changes and vanished families", async () => {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-inventory-identity-")));
   const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "synthetic-inventory" });
   const input = { directory: dir, profile: "default", botIdentity,
@@ -3573,7 +3552,6 @@ test("Canonical namespace carries segment-only bot constraints and detects root 
   const inspect = () => inspectTelegramProfileJournalNamespace(input);
   const paths = [join(dir, "inbox.json"), join(dir, "follower-inbox-aaaaaaaaaaaaaaaa.json")];
   try {
-    if (assertUnsupportedStrictInspection({ ...input, path: paths[0]! }, context, inspect)) return;
     for (const [index, path] of paths.entries()) {
       await writeFile(path, JSON.stringify({ version: 1, revision: 1, profile: "default", botIdentity, entries: [] }));
       await mkdir(`${path}.segments`);
@@ -3735,9 +3713,8 @@ function createStore(
 }
 
 const sourceLimits = { maxFiles: 1024, maxBytes: 64 * 1024 * 1024, maxEntries: 10_000, maxWork: 10_000_000 };
-const sourceTestOptions = { skip: !fs.constants.O_NOFOLLOW || !fs.constants.O_NONBLOCK };
 
-for (const liveSource of [false, true]) test(`Pending abandonment retains the original privately and atomically publishes a replay veto (live=${liveSource})`, { skip: liveSource && sourceTestOptions.skip }, async () => {
+for (const liveSource of [false, true]) test(`Pending abandonment retains the original privately and atomically publishes a replay veto (live=${liveSource})`, async () => {
   await withJournalTempDir(async ({ dir, path }) => {
     const options = liveSource ? {
       sourceAccess: { directory: dir, limits: sourceLimits },
@@ -4032,7 +4009,7 @@ test("Pending abandonment remains unavailable to exclusion-schema inputs", async
   });
 });
 
-for (const liveSource of [false, true]) test(`Source serialization gates every store operation once while retaining receipt authority (live=${liveSource})`, { skip: liveSource && sourceTestOptions.skip }, async () => {
+for (const liveSource of [false, true]) test(`Source serialization gates every store operation once while retaining receipt authority (live=${liveSource})`, async () => {
   await withJournalTempDir(async ({ dir, path }) => {
     const configPath = join(dir, "telegram.json");
     const config = createTelegramConfigStore({ agentDir: dir, configPath });
@@ -4104,7 +4081,7 @@ for (const liveSource of [false, true]) test(`Source serialization gates every s
   });
 });
 
-test("Live v1 publication refuses an omitted cursor that would trail new entries", sourceTestOptions, async () => {
+test("Live v1 publication refuses an omitted cursor that would trail new entries", async () => {
   await withJournalTempDir(async ({ dir, path }) => {
     const config = createTelegramConfigStore({ agentDir: dir, configPath: join(dir, "telegram.json") });
     let publications = 0;
@@ -4133,7 +4110,7 @@ test("Live v1 publication refuses an omitted cursor that would trail new entries
   });
 });
 
-for (const version of [1, 2] as const) test(`Live v${version} publication refuses generated attempt overflow before writing`, sourceTestOptions, async () => {
+for (const version of [1, 2] as const) test(`Live v${version} publication refuses generated attempt overflow before writing`, async () => {
   await withJournalTempDir(async ({ dir, path }) => {
     const config = createTelegramConfigStore({ agentDir: dir, configPath: join(dir, "telegram.json") });
     let publications = 0;
@@ -4172,7 +4149,7 @@ for (const version of [1, 2] as const) test(`Live v${version} publication refuse
   });
 });
 
-test("Live source refuses references and retained authority before journal staging", sourceTestOptions, async () => {
+test("Live source refuses references and retained authority before journal staging", async () => {
   await withJournalTempDir(async ({ dir, path }) => {
     const config = createTelegramConfigStore({ agentDir: dir, configPath: join(dir, "telegram.json") });
     assert.throws(() => createStore(path, { sourceAccess: { directory: dir, limits: sourceLimits } }), /requires source serialization/);
@@ -4214,7 +4191,7 @@ test("Live source refuses references and retained authority before journal stagi
   });
 });
 
-test("Live source logical revision bytes and physical publication limits are independent and captured", sourceTestOptions, async () => {
+test("Live source logical revision bytes and physical publication limits are independent and captured", async () => {
   await withJournalTempDir(async ({ dir, path }) => {
     const config = createTelegramConfigStore({ agentDir: dir, configPath: join(dir, "telegram.json") });
     const access = { directory: dir, limits: { ...sourceLimits } };
@@ -4256,7 +4233,7 @@ test("Live source logical revision bytes and physical publication limits are ind
 });
 
 for (const version of [1, 2] as const) for (const interruption of ["none", "snapshot", "cleanup"] as const) {
-  test(`Live compaction preserves receipt scope and redundant identity witness (v${version}, ${interruption})`, sourceTestOptions, async () => {
+  test(`Live compaction preserves receipt scope and redundant identity witness (v${version}, ${interruption})`, async () => {
     await withJournalTempDir(async ({ dir, path }) => {
       const tokenOnly = { tokenSha256: identity.tokenSha256 };
       const config = createTelegramConfigStore({ agentDir: dir, configPath: join(dir, "telegram.json") });
@@ -4309,7 +4286,7 @@ for (const version of [1, 2] as const) for (const interruption of ["none", "snap
       const originalUnlink = fs.unlinkSync;
       if (interruption === "cleanup") {
         fs.unlinkSync = ((target: fs.PathLike) => {
-          if (String(target).startsWith(`${path}.segments/`)) throw new Error("Synthetic cleanup refusal");
+          if (String(target).startsWith(`${path}.segments${sep}`)) throw new Error("Synthetic cleanup refusal");
           return originalUnlink(target);
         }) as typeof fs.unlinkSync;
         syncBuiltinESMExports();
@@ -4347,7 +4324,7 @@ for (const version of [1, 2] as const) for (const interruption of ["none", "snap
   });
 }
 
-test("Live exact accepted receipts survive current config credential changes without adopting them", sourceTestOptions, async () => {
+test("Live exact accepted receipts survive current config credential changes without adopting them", async () => {
   await withJournalTempDir(async ({ dir, path }) => {
     const configPath = join(dir, "telegram.json");
     await writeFile(configPath, JSON.stringify({ profiles: { work: { botToken: "123:journal-secret", allowedUserId: 7 } } }));
@@ -4375,7 +4352,7 @@ test("Live exact accepted receipts survive current config credential changes wit
   });
 });
 
-test("Live consumption and publication do not return to ordinary journal scans", sourceTestOptions, async () => {
+test("Live consumption and publication do not return to ordinary journal scans", async () => {
   await withJournalTempDir(async ({ dir, path }) => {
     const config = createTelegramConfigStore({ agentDir: dir, configPath: join(dir, "telegram.json") });
     const store = createStore(path, { sourceAccess: { directory: dir, limits: sourceLimits }, withSourceSerialization: config.withSourceSerialization });
@@ -4401,7 +4378,7 @@ test("Live consumption and publication do not return to ordinary journal scans",
   });
 });
 
-for (const initial of [true, false]) test(`Live publication process interruption leaves a readable family (initial=${initial})`, sourceTestOptions, async () => {
+for (const initial of [true, false]) test(`Live publication process interruption leaves a readable family (initial=${initial})`, async () => {
   await withJournalTempDir(async ({ dir, path }) => {
     if (!initial) createStore(path).appendBatch([{ update_id: 1 }]);
     const script = `
@@ -4488,7 +4465,7 @@ test("Source guard rejection precedes every journal transaction and preserves co
   });
 });
 
-for (const liveSource of [false, true]) test(`Bare v1 source serialization follows Workspace admission and shares canonical input once (live=${liveSource})`, { skip: liveSource && sourceTestOptions.skip }, async () => {
+for (const liveSource of [false, true]) test(`Bare v1 source serialization follows Workspace admission and shares canonical input once (live=${liveSource})`, async () => {
   await withJournalTempDir(async ({ dir, path }) => {
     const configPath = join(dir, "telegram.json");
     const config = createTelegramConfigStore({ agentDir: dir, configPath });
@@ -4539,7 +4516,7 @@ for (const liveSource of [false, true]) test(`Bare v1 source serialization follo
   });
 });
 
-for (const liveSource of [false, true]) test(`Real config contention excludes every store operation; legacy read is a negative control (live=${liveSource})`, { skip: liveSource && sourceTestOptions.skip }, async () => {
+for (const liveSource of [false, true]) test(`Real config contention excludes every store operation; legacy read is a negative control (live=${liveSource})`, async () => {
   await withJournalTempDir(async ({ dir, path }) => {
     const configPath = join(dir, "telegram.json");
     const config = createTelegramConfigStore({ agentDir: dir, configPath });
@@ -4586,8 +4563,9 @@ for (const liveSource of [false, true]) test(`Real config contention excludes ev
       console.log(JSON.stringify({ contentions, methods }));
     `;
     config.withSourceSerialization(() => {
+      // Every method waits out one lock timeout; slower runners (Windows) need headroom beyond the sum.
       const child = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", script],
-        { encoding: "utf8", timeout: 10_000 });
+        { encoding: "utf8", timeout: 60_000 });
       assert.equal(child.error, undefined);
       assert.equal(child.status, 0, child.stderr);
       const result = JSON.parse(child.stdout);
@@ -4605,7 +4583,7 @@ for (const liveSource of [false, true]) test(`Real config contention excludes ev
   });
 });
 
-for (const liveSource of [false, true]) test(`Paired v1 journal holds Workspace/config/journal order and preserves unordered canonical deliveries (live=${liveSource})`, { skip: liveSource && sourceTestOptions.skip }, async () => {
+for (const liveSource of [false, true]) test(`Paired v1 journal holds Workspace/config/journal order and preserves unordered canonical deliveries (live=${liveSource})`, async () => {
   await withJournalTempDir(async ({ dir, path }) => {
     const configPath = join(dir, "telegram.json");
     await writeFile(configPath, JSON.stringify({ profiles: { work: { botToken: "123:journal-secret" } } }));
@@ -4735,7 +4713,7 @@ test("Journal refuses mixed paired-only and exclusion admission modes", async ()
   });
 });
 
-for (const liveSource of [false, true]) test(`Exclusion journal serializes Workspace/config/journal admission and preserves the veto after grant (live=${liveSource})`, { skip: liveSource && sourceTestOptions.skip }, async () => {
+for (const liveSource of [false, true]) test(`Exclusion journal serializes Workspace/config/journal admission and preserves the veto after grant (live=${liveSource})`, async () => {
   await withJournalTempDir(async ({ dir, path }) => {
     const configPath = join(dir, "telegram.json");
     await writeFile(configPath, JSON.stringify({ profiles: { work: { botToken: "123:journal-secret" } } }));
@@ -4899,11 +4877,6 @@ test("Workspace protection reads journal evidence without recovery, repair, or p
   try {
     const binding = resolveBinding()!;
     const read = binding.readForProtection!;
-    if (!fs.constants.O_NOFOLLOW || !fs.constants.O_NONBLOCK) {
-      assert.throws(read);
-      assert.equal(existsSync(path), false);
-      return;
-    }
     assert.deepEqual(read(), { entries: [], exists: false });
     assert.equal(existsSync(path), false);
     binding.journal.appendBatch([{ update_id: 1, message: { chat: { id: 7 }, message_thread_id: 42 } }]);
@@ -5002,7 +4975,7 @@ test("Update journal runtime binding separates worker and process recovery ident
 });
 
 for (const queueKind of ["prompt", "control"] as const) {
-  test(`Historical receipt/completion proofs stay scoped across session replacement (${queueKind})`, async context => {
+  test(`Historical receipt/completion proofs stay scoped across session replacement (${queueKind})`, async () => {
     await withJournalTempDir(async ({ dir }) => {
       const config = createTelegramConfigStore({ agentDir: dir });
       let sessionId: string | undefined = "session-a";
@@ -5015,10 +4988,7 @@ for (const queueKind of ["prompt", "control"] as const) {
         getActiveFollowerBindingKey: () => "manual:same-process", getActiveFollowerSessionId: () => sessionId,
         isFollowerRegistered: () => true,
       });
-      const original = runtime.resolveActive()!, path = getTelegramUpdateJournalBindingPath(original.recoveryKey)!;
-      const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "historical-receipt-token", botId: 7 });
-      if (assertUnsupportedStrictInspection({ directory: dir, path, profile: "work", botIdentity,
-        limits: sourceLimits }, context)) return;
+      const original = runtime.resolveActive()!;
       original.journal.appendBatch([1, 2].map(update_id => ({ update_id, message: { text: "old-session-custody" } })), 2);
       const group = { queueKind, receiptId: "same-receipt", sourceUpdateIds: [1, 2] };
       const acquired = original.journal.markQueued({ ...group, owner: { ...runtimeIdentity, sessionGeneration: 1 } });
@@ -5062,7 +5032,7 @@ for (const queueKind of ["prompt", "control"] as const) {
   });
 }
 
-test("Session succession adopts only unclaimed predecessor pending input, committing it away before successor admission", { skip: !constants.O_NOFOLLOW || !constants.O_NONBLOCK }, async () => {
+test("Session succession adopts only unclaimed predecessor pending input, committing it away before successor admission", async () => {
   await withJournalTempDir(async ({ dir }) => {
     const config = createTelegramConfigStore({ agentDir: dir });
     const runtimeIdentity = { instanceId: "same-process", processId: process.pid, processBirthId: "fixture-birth" };
@@ -5120,7 +5090,7 @@ test("Session succession adopts only unclaimed predecessor pending input, commit
   });
 });
 
-test("Active follower succession records the first session and advances only after adoption succeeds", { skip: !constants.O_NOFOLLOW || !constants.O_NONBLOCK }, async () => {
+test("Active follower succession records the first session and advances only after adoption succeeds", async () => {
   await withJournalTempDir(async ({ dir }) => {
     const config = createTelegramConfigStore({ agentDir: dir });
     let sessionId: string | undefined, key = "manual:a";
@@ -5148,7 +5118,7 @@ test("Active follower succession records the first session and advances only aft
 });
 
 for (const state of ["committed", "bot-id-discovery", "uncommitted", "damaged", "linked-ancestor", "lost-snapshot", "unprepared", "profile-drift", "release-drift"] as const) {
-  test(`Historical abandonment lookup is exact, read-only and never prepares a successor (${state})`, async context => {
+  test(`Historical abandonment lookup is exact, read-only and never prepares a successor (${state})`, async () => {
     await withJournalTempDir(async ({ dir }) => {
       let sessionId: string | undefined = "session-a", profile = "work";
       let botId: number | undefined = state === "bot-id-discovery" ? undefined : 7;
@@ -5171,8 +5141,6 @@ for (const state of ["committed", "bot-id-discovery", "uncommitted", "damaged", 
       });
       const original = runtime.resolveActive()!, path = getTelegramUpdateJournalBindingPath(original.recoveryKey)!;
       const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "historical-proof-token", botId: 7 });
-      if (assertUnsupportedStrictInspection({ directory: dir, path, profile: "work", botIdentity,
-        limits: { maxFiles: 1024, maxBytes: 64 * 1024 * 1024, maxEntries: 10_000, maxWork: 10_000_000 } }, context)) return;
       original.journal.appendBatch([{ update_id: 1, message: { text: "old-session" } }]);
       const { exists: _exists, serializedBytes: _bytes, ...beforeCancel } = original.journal.read();
       const cancellation = original.journal.abandonPending({ journalBindingKey: original.recoveryKey, entry: beforeCancel.entries[0]!,
@@ -5222,7 +5190,7 @@ for (const state of ["committed", "bot-id-discovery", "uncommitted", "damaged", 
   });
 }
 
-test("Historical chooser expiry proof is body-free, exact-scope and read-only", async context => {
+test("Historical chooser expiry proof is body-free, exact-scope and read-only", async () => {
   await withJournalTempDir(async ({ dir }) => {
     let session = "before", now = Date.now();
     const token = "fixture:expiry-proof", profile = "work";
@@ -5235,8 +5203,6 @@ test("Historical chooser expiry proof is body-free, exact-scope and read-only", 
       isFollowerRegistered: () => true,
     });
     const binding = runtime.resolveActive()!, path = getTelegramUpdateJournalBindingPath(binding.recoveryKey)!;
-    if (assertUnsupportedStrictInspection({ directory: dir, path, profile, botIdentity: identity,
-      limits: { maxFiles: 1024, maxBytes: 64 * 1024 * 1024, maxEntries: 10_000, maxWork: 10_000_000 } }, context)) return;
     const journal = createTelegramUpdateJournalStore({ path, profileName: profile, botIdentity: identity, getNowMs: () => now });
     journal.appendBatch([{ update_id: 1, message: { text: "expires without archive" } },
       { update_id: 2, message: { text: "independent accepted sibling" } }]);
@@ -5741,7 +5707,7 @@ test("Update journal appends batches, deduplicates exact replay, and removes ent
 for (const liveSource of [false, true]) {
   for (const scenario of ["match", "content", "retry", "queued", "failed", "missing", "invalid", "batch-mismatch", "no-guard"] as const) {
     test(`Exact completed-source removal is atomic and never guesses missing evidence (${scenario}, live=${liveSource})`,
-      { skip: liveSource && sourceTestOptions.skip }, async () => {
+      async () => {
       await withJournalTempDir(async ({ dir, path }) => {
         const configPath = join(dir, "telegram.json");
         const config = createTelegramConfigStore({ agentDir: dir, configPath });
@@ -5798,7 +5764,7 @@ for (const liveSource of [false, true]) {
 
 for (const scenario of ["match", "missing", "pending", "completed", "subset", "superset", "kind", "owner", "acquisition",
   "detached", "invalid", "corrupt", "foreign-token", "unprepared", "offered"] as const) {
-  test(`Strict queued receipt inspection observes complete immutable source authority without publication (${scenario})`, sourceTestOptions, async () => {
+  test(`Strict queued receipt inspection observes complete immutable source authority without publication (${scenario})`, async () => {
     await withJournalTempDir(async ({ dir, path }) => {
       const config = createTelegramConfigStore({ agentDir: dir });
       const options = { sourceAccess: { directory: dir, limits: sourceLimits }, withSourceSerialization: config.withSourceSerialization };
@@ -5856,7 +5822,7 @@ for (const scenario of ["match", "missing", "pending", "completed", "subset", "s
 
 for (const scenario of ["normal", "control", "subset-proof", "ordinary", "before-write", "after-write-before-rename", "lost-ack", "detached-input",
   "partial-receipt", "owner", "runtime", "offered", "pending-digest", "unrelated-source", "malformed", "unprepared", "writer-ended", "capacity", "resolver"] as const) {
-  test(`Queued source completion requires whole receipt ownership and one atomic scoped ACK (${scenario})`, sourceTestOptions, async () => {
+  test(`Queued source completion requires whole receipt ownership and one atomic scoped ACK (${scenario})`, async () => {
     await withJournalTempDir(async ({ dir, path }) => {
       const configPath = join(dir, "telegram.json"), config = createTelegramConfigStore({ agentDir: dir, configPath });
       let armed = false;
@@ -5940,7 +5906,7 @@ for (const scenario of ["normal", "control", "subset-proof", "ordinary", "before
 }
 
 for (const scenario of ["partial", "reintroduced", "digest", "erasure"] as const) {
-  test(`Cold queued completion rejects incomplete or contradictory receipt disposal (${scenario})`, sourceTestOptions, async () => {
+  test(`Cold queued completion rejects incomplete or contradictory receipt disposal (${scenario})`, async () => {
     await withJournalTempDir(async ({ dir, path }) => {
       const options = { sourceAccess: { directory: dir, limits: sourceLimits },
         withSourceSerialization: createTelegramConfigStore({ agentDir: dir }).withSourceSerialization };
@@ -5969,7 +5935,7 @@ for (const scenario of ["partial", "reintroduced", "digest", "erasure"] as const
 }
 
 for (const scenario of ["normal", "before-write", "after-write-before-rename", "lost-ack", "changed", "detached-input", "capacity", "work-bound"] as const) {
-  test(`Journal source completion is one atomic, scoped removal ACK (${scenario})`, sourceTestOptions, async () => {
+  test(`Journal source completion is one atomic, scoped removal ACK (${scenario})`, async () => {
     await withJournalTempDir(async ({ dir, path }) => {
       const configPath = join(dir, "telegram.json");
       const config = createTelegramConfigStore({ agentDir: dir, configPath });
@@ -6046,7 +6012,7 @@ for (const scenario of ["normal", "before-write", "after-write-before-rename", "
 }
 
 for (const scenario of ["bad-hash", "duplicate-id", "duplicate-scope", "foreign-source", "missing-removal", "erasure", "rewrite", "unrelated-revision", "active", "missing-proof"] as const) {
-  test(`Cold source completion retains unknown or contradictory evidence (${scenario})`, sourceTestOptions, async () => {
+  test(`Cold source completion retains unknown or contradictory evidence (${scenario})`, async () => {
     await withJournalTempDir(async ({ dir, path }) => {
       const options = { sourceAccess: { directory: dir, limits: sourceLimits },
         withSourceSerialization: createTelegramConfigStore({ agentDir: dir }).withSourceSerialization };
@@ -6086,7 +6052,7 @@ for (const scenario of ["bad-hash", "duplicate-id", "duplicate-scope", "foreign-
   });
 }
 
-test("Source completion survives ordinary publishers and compaction without replay or empty-scope rebinding", sourceTestOptions, async () => {
+test("Source completion survives ordinary publishers and compaction without replay or empty-scope rebinding", async () => {
   await withJournalTempDir(async ({ dir, path }) => {
     const options = { sourceAccess: { directory: dir, limits: sourceLimits },
       withSourceSerialization: createTelegramConfigStore({ agentDir: dir }).withSourceSerialization };
@@ -6117,15 +6083,15 @@ test("Source completion survives ordinary publishers and compaction without repl
   });
 });
 
-test("Scoped queued completion is absent from the raw input custody surface", async context => {
-  await withInputCustodyFixture(context, async ({ options }) => {
+test("Scoped queued completion is absent from the raw input custody surface", async () => {
+  await withInputCustodyFixture(async ({ options }) => {
     const raw = createTelegramInputJournalStore(options);
     assert.equal("completeQueuedExact" in raw, false);
     assert.equal("routingInputs" in raw, false);
   });
 });
 
-test("Source completion refuses unguarded, malformed, unsupported and foreign-scope publication", sourceTestOptions, async () => {
+test("Source completion refuses unguarded, malformed, unsupported and foreign-scope publication", async () => {
   await withJournalTempDir(async ({ dir, path }) => {
     const store = createStore(path, { sourceAccess: { directory: dir, limits: sourceLimits },
       withSourceSerialization: createTelegramConfigStore({ agentDir: dir }).withSourceSerialization });
@@ -6288,7 +6254,7 @@ test("Update journal reconstructs ordered segments, rejects foreign identity, an
   });
 });
 
-test("Follower, recipient and path journal bindings expose the same exact queue receipt ports as the leader", async context => {
+test("Follower, recipient and path journal bindings expose the same exact queue receipt ports as the leader", async () => {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-binding-ports-")));
   try {
     const config = createTelegramConfigStore({ agentDir: dir, configPath: join(dir, "telegram.json") });
@@ -6301,9 +6267,6 @@ test("Follower, recipient and path journal bindings expose the same exact queue 
       getActiveFollowerBindingKey: () => "workspace:follower", isFollowerRegistered: () => true });
     const resolvers = [["leader", bindings.resolveLeader], ["follower", bindings.resolveFollower],
       ["recipient", bindings.createRecipientResolver("workspace:follower")], ["path", bindings.createPathResolver(join(dir, "other.work.json"))]] as const;
-    if (assertUnsupportedStrictInspection({ directory: dir, path: join(dir, "inbox.work.json"), profile: "work",
-      botIdentity: createTelegramUpdateJournalBotIdentity({ botToken: "123:synthetic-binding-ports", botId: 42 }),
-      limits: { maxFiles: 10, maxBytes: 1_000_000, maxEntries: 10, maxWork: 100 } }, context)) return;
     for (const [name, resolve] of resolvers) {
       const binding = resolve()!;
       for (const port of ["isQueueReceiptCurrent", "inspectQueuedReceipt", "completeQueuedExact", "inspectSourceCompletion"] as const) {
@@ -8199,7 +8162,7 @@ test("Update journal dead-owner cleanup requires exact negative liveness proof",
     });
     assert.equal(
       retained.status,
-      process.platform === "win32" ? "owner-unverifiable" : "owner-alive",
+      "owner-alive",
     );
     assert.deepEqual(
       defaultProofStore.read().entries[0]?.queueOwner,
@@ -8619,5 +8582,25 @@ test("Update journal transaction serializes concurrent process appenders", async
     assert.equal(ids.length, workers * updatesPerWorker);
     assert.deepEqual(ids, [...ids].sort((left, right) => left - right));
     assert.equal(new Set(ids).size, ids.length);
+  });
+});
+
+test("Routing clocks record their chooser location once and reject malformed locations", async () => {
+  await withJournalTempDir(async ({ path }) => {
+    let now = 1000;
+    const options = { path, botIdentity: createTelegramUpdateJournalBotIdentity({ botToken: "fixture:routing-chooser" }), getNowMs: () => now };
+    const journal = createTelegramUpdateJournalStore(options);
+    const binding = createTelegramUpdateJournalBindingKey(options);
+    journal.appendBatch([{ update_id: 1, message: { message_id: 11, text: "chooser", from: { id: 7, is_bot: false }, chat: { id: 7, type: "private" } } }]);
+    const input = { journalBindingKey: binding, entries: journal.read().entries, operatorUserId: 7, publishedAtMs: now, isCurrent: () => true };
+    assert.throws(() => journal.routingInputs!.arm({ ...input, chooser: { chatId: 7, messageId: 0 } }), /chooser location/);
+    const chooser = { chatId: 7, threadId: 55, messageId: 501 };
+    const [armed] = journal.routingInputs!.arm({ ...input, chooser });
+    assert.deepEqual(armed!.routingInput, { operatorUserId: 7, publishedAtMs: 1000, expiresAtMs: 3_601_000, phase: "waiting", chooser });
+    now += 60_000;
+    const [again] = journal.routingInputs!.arm({ ...input, entries: [armed!], publishedAtMs: now, chooser: { ...chooser, messageId: 999 } });
+    assert.deepEqual(again!.routingInput, armed!.routingInput, "re-arming never renews the deadline or moves the chooser");
+    assert.deepEqual(createTelegramUpdateJournalStore(options).read().entries[0]!.routingInput, armed!.routingInput,
+      "the location survives a cold reload");
   });
 });
