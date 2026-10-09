@@ -13,8 +13,10 @@ import {
   buildCommandTemplateInvocation,
   execCommandTemplate,
   expandCommandTemplateConfigs,
-  getCommandTemplateRiskLabels,
-  getCommandTemplateWarnings,
+  getCommandTemplateCompositionSteps,
+  getCommandTemplateConfiguredTimeout,
+  getCommandTemplateStepTimeout,
+  shouldRunCommandTemplateConfig,
   shouldRunCommandTemplateNode,
   splitCommandTemplate,
 } from "../lib/command-templates.ts";
@@ -165,29 +167,6 @@ test("Command template repeat expands numbered defaults", () => {
     "prev=page02.html",
     "next=page01.html",
     "raw=2/3",
-  ]);
-});
-
-test("Command templates detect high-risk trusted executable shapes", () => {
-  const config = {
-    template: [
-      "bash -c {script}",
-      "node -e {code}",
-      "rm -rf {work_dir}",
-      "npm publish",
-    ],
-  };
-  const warnings = getCommandTemplateWarnings(config);
-  assert.equal(warnings.length, 3);
-  assert.match(warnings[0], /bash/);
-  assert.match(warnings[1], /eval/);
-  assert.match(warnings[2], /removes filesystem paths/);
-  assert.deepEqual(getCommandTemplateRiskLabels(config), [
-    "risk.shell",
-    "risk.eval",
-    "risk.destructive_fs",
-    "risk.external_side_effect",
-    "risk.network",
   ]);
 });
 
@@ -398,4 +377,65 @@ test("Command templates report missing required placeholders", () => {
     () => buildCommandTemplateInvocation("tool {missing}", {}, "/work"),
     /Missing command template value: missing/,
   );
+});
+
+test("Command template step timeouts honor the node timeout within the remaining handler budget", () => {
+  assert.equal(getCommandTemplateConfiguredTimeout("tool {file}"), undefined);
+  assert.equal(getCommandTemplateConfiguredTimeout({ template: "tool", timeout: "250" }), 250);
+  assert.equal(getCommandTemplateStepTimeout(1000, "tool"), 1000, "First step receives the full budget");
+  assert.equal(getCommandTemplateStepTimeout(1000, { template: "tool", timeout: 300 }), 300);
+  assert.equal(getCommandTemplateStepTimeout(1000, "tool", 400), 600);
+  assert.equal(getCommandTemplateStepTimeout(1000, { template: "tool", timeout: 900 }, 400), 600);
+  assert.equal(getCommandTemplateStepTimeout(1000, "tool", 5000), 1, "An exhausted budget still yields a positive timeout");
+});
+
+test("Command template composition steps exist only for array templates", () => {
+  assert.deepEqual(getCommandTemplateCompositionSteps({ template: "tool" }), []);
+  assert.deepEqual(
+    getCommandTemplateCompositionSteps({ template: ["first", { template: "second", timeout: 5 }] })
+      .map((step) => [step.template, step.timeout]),
+    [["first", undefined], ["second", 5]],
+  );
+});
+
+test("Command template expansion carries ancestor when guards and keeps recover out of the sequence", () => {
+  const steps = expandCommandTemplateConfigs({
+    when: "enabled",
+    recover: "cleanup",
+    template: ["first", { when: "!dry", template: "second" }],
+  });
+  assert.deepEqual(steps.map((step) => step.template), ["first", "second"]);
+  const run = (values: Record<string, unknown>) =>
+    steps.map((step) => shouldRunCommandTemplateConfig(step, values));
+  assert.deepEqual(run({ enabled: false, dry: false }), [false, false]);
+  assert.deepEqual(run({ enabled: true, dry: true }), [true, false]);
+  assert.deepEqual(run({ enabled: true, dry: false }), [true, true]);
+  assert.equal(shouldRunCommandTemplateConfig("plain", {}), true);
+  assert.equal(
+    shouldRunCommandTemplateConfig({ when: "{mode?yes:}", defaults: { mode: "on" }, template: "run" }, {}),
+    true,
+  );
+});
+
+test("Command template recover runs only between failed attempts and stops retries when it fails", async () => {
+  const failing = ["-e", "process.exit(3)"];
+  let recoveries = 0;
+  const result = await execCommandTemplate(process.execPath, failing, {
+    retry: 3,
+    recover: async () => { recoveries += 1; },
+  });
+  assert.equal(result.code, 3);
+  assert.equal(recoveries, 2);
+  let passing = 0;
+  await execCommandTemplate(process.execPath, ["-e", ""], { retry: 3, recover: async () => { passing += 1; } });
+  assert.equal(passing, 0);
+  let attempts = 0;
+  await assert.rejects(
+    execCommandTemplate(process.execPath, failing, {
+      retry: 3,
+      recover: async () => { attempts += 1; throw new Error("cleanup failed"); },
+    }),
+    /cleanup failed/,
+  );
+  assert.equal(attempts, 1);
 });

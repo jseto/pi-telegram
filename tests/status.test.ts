@@ -21,6 +21,7 @@ import {
   type TelegramRuntimeProjectionStoreOptions,
   type TelegramRuntimeProjectionStorage,
   type TelegramStatusSnapshot,
+  type TelegramStatusBarState,
   createTelegramRuntimeEventRecorder,
   createTelegramRuntimeLogScope,
   createTelegramStatusHtmlBuilder,
@@ -107,6 +108,43 @@ test("Consolidated runtime projection compares fresh content, excludes event his
     assert.equal(await store.persist(f.snapshot), true, "A remembered no-op cannot skip changed current disk content");
     assert.equal(store.read()?.diagnostics.pendingDispatch, false);
     assert.deepEqual(readdirSync(f.dir).sort(), ["runtime", "state.json"], "No status sidecar is created");
+  } finally { rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test("Consolidated runtime projection skips the transaction when published content already matches", async () => {
+  const f = createProjectionFixture();
+  try {
+    f.owner.acquire({ cwd: "/repo" });
+    let publications = 0;
+    const store = f.createStore({ storage: { read: f.storage.read, publish(...args) {
+      publications += 1;
+      return f.storage.publish(...args);
+    } } });
+    assert.equal(await store.persist(f.snapshot), true);
+    assert.equal(publications, 1);
+    f.scope.now = 9000;
+    assert.equal(await store.persist(f.snapshot), false);
+    assert.equal(publications, 1, "An unchanged idle snapshot creates no transaction guard");
+    assert.equal(await store.persist({ ...f.snapshot, runtime: { pollingActive: false } }), true);
+    assert.equal(publications, 2);
+  } finally { rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test("Consolidated runtime projection never persists poll-cycle timestamps", async () => {
+  const f = createProjectionFixture();
+  try {
+    f.owner.acquire({ cwd: "/repo" });
+    let publications = 0;
+    const store = f.createStore({ storage: { read: f.storage.read, publish(...args) {
+      publications += 1;
+      return f.storage.publish(...args);
+    } } });
+    const polled = (atMs: number): TelegramStatusSnapshot => ({ ...f.snapshot, runtime: { ...f.snapshot.runtime,
+      polling: { phase: "long-poll", phaseStartedAtMs: atMs, lastSuccessfulResponseAtMs: atMs, lastSuccessfulResponseUpdateCount: 0, startedAtMs: 1 } } });
+    assert.equal(await store.persist(polled(100)), true);
+    assert.deepEqual(store.read()?.runtime.polling, { phase: "long-poll", startedAtMs: 1 });
+    assert.equal(await store.persist(polled(30_100)), false);
+    assert.equal(publications, 1, "Another idle poll response writes nothing");
   } finally { rmSync(f.dir, { recursive: true, force: true }); }
 });
 
@@ -448,6 +486,33 @@ test("Status snapshot queued microtasks cannot renew a revoked session scope", a
   await schedule.suspend();
 });
 
+for (const name of ["Telegram", "TeLeGrAm", "LeAdEr", "FoLlOwEr", "CuStOm"] as const) {
+  test(`Explicit Thread status labels preserve acknowledged title casing in every connection state (${name})`, () => {
+    const theme = { fg: (token: string, text: string) => `<${token}>${text}</${token}>` };
+    const base: TelegramStatusBarState = { hasBotToken: true, pollingActive: true, paired: true, busRole: "leader",
+      compactionInProgress: false, processing: false, queuedStatus: " +2", instanceThreadName: name };
+    const cases: { state: Partial<TelegramStatusBarState>; suffix: string }[] = [
+      { state: {}, suffix: "<success>leader</success><warning> +2</warning>" },
+      { state: { busRole: "follower", pollingActive: false }, suffix: "<success>follower</success><warning> +2</warning>" },
+      { state: { busRole: undefined }, suffix: "<success>connected</success><warning> +2</warning>" },
+      { state: { pollingActive: false }, suffix: "<dim>disconnected</dim><warning> +2</warning>" },
+      { state: { busLifecyclePhase: "electing" }, suffix: "<warning>electing</warning><warning> +2</warning>" },
+      { state: { busRole: "follower", followerRegistered: false }, suffix: "<warning>reconnecting</warning><warning> +2</warning>" },
+      { state: { error: "transport failure" }, suffix: "<error>error</error><warning> +2</warning>" },
+      { state: { pollingStopReason: "persistent-conflict" }, suffix: "<error>error</error>" },
+      { state: { paired: false }, suffix: "<warning>awaiting pairing</warning><warning> +2</warning>" },
+      { state: { hasBotToken: false }, suffix: "<muted>not configured</muted><warning> +2</warning>" },
+    ];
+    for (const { state, suffix } of cases) assert.equal(buildTelegramStatusBarText(theme, { ...base, ...state }), `<accent>${name}</accent> ${suffix}`);
+  });
+}
+
+test("Thread status uses the generic bridge label only when its title is absent", () => {
+  const theme = { fg: (_token: string, text: string) => text };
+  for (const instanceThreadName of [undefined, "", "  "]) assert.equal(buildTelegramStatusBarText(theme,
+    { hasBotToken: true, pollingActive: true, paired: true, compactionInProgress: false, processing: false, queuedStatus: "", instanceThreadName }), "telegram connected");
+});
+
 test("Status bar text renders bridge connection and queue states", () => {
   const theme = {
     fg: (token: string, text: string) => `<${token}>${text}</${token}>`,
@@ -532,7 +597,7 @@ test("Status bar text renders bridge connection and queue states", () => {
       processingStatus: "queued",
       queuedStatus: " +2",
     }),
-    "<accent>telegram</accent> <dim>disconnected</dim><warning> +2</warning>",
+    "<accent>Aurora</accent> <dim>disconnected</dim><warning> +2</warning>",
   );
   assert.equal(
     buildTelegramStatusBarText(theme, {
@@ -623,7 +688,7 @@ test("Status bar text renders bridge connection and queue states", () => {
       processing: false,
       queuedStatus: "",
     }),
-    "<accent>telegram</accent> <success>follower</success>",
+    "<accent>Follower</accent> <success>follower</success>",
   );
   assert.equal(
     buildTelegramStatusBarText(theme, {

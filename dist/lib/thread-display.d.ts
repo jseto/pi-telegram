@@ -1,6 +1,6 @@
 import type { TelegramThreadDisplayMode } from "./config.ts";
-import type { TelegramTopicTargetStore, TelegramWorkspaceDisplayBinding, TelegramWorkspaceThreadBinding } from "./threads.ts";
 import type { TelegramApiCallOptions } from "./telegram-api.ts";
+import type { TelegramTopicTargetStore, TelegramWorkspaceDisplayBinding, TelegramWorkspaceThreadBinding } from "./threads.ts";
 /** Pure directory tokenization shared by previews, initial titles, and reconciliation. */
 export declare function tokenizeTelegramDirectorySegment(segment: string): string[];
 /** Maps one leader-captured authenticated owner roster onto retained binding identities. */
@@ -13,7 +13,6 @@ export declare function resolveTelegramLiveWorkspaceBindingKeys(bindings: readon
         threadId?: number;
     };
 }[]): ReadonlySet<string>;
-/** Missing or ambiguous metadata yields no label rather than inventing identity. */
 export declare function resolveTelegramWorkspaceDisplayNames(bindings: readonly TelegramWorkspaceDisplayBinding[], mode: TelegramThreadDisplayMode, liveBindingKeys?: ReadonlySet<string>): Map<string, string>;
 export declare function resolveTelegramInitialWorkspaceDisplayName(input: {
     bindings: readonly TelegramWorkspaceDisplayBinding[];

@@ -1,4 +1,5 @@
 /** Native routing composition shared by route regressions and cross-domain custody acceptance. */
+import * as Bindings from "../../lib/bindings.ts";
 import * as Commands from "../../lib/commands.ts";
 import * as Media from "../../lib/media.ts";
 import * as Menu from "../../lib/menu.ts";
@@ -44,7 +45,16 @@ export interface RouteHarnessOptions {
   configStore?: Routing.TelegramInboundRouteRuntimeDeps<
     TestMessage, TestCallbackQuery, TestContext, TestModel
   >["configStore"];
-  sendStatusMessage?: () => Promise<void>;
+  sendStatusMessage?: Menu.TelegramMenuActionRuntime<TestContext, TestModel>["sendStatusMessage"];
+  beginCommandEffectWork?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["beginCommandEffectWork"];
+  recordRuntimeEvent?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["recordRuntimeEvent"];
+  isIdle?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["isIdle"];
+  dispatchNextQueuedTelegramTurn?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["dispatchNextQueuedTelegramTurn"];
+  requestNextDispatchAnnouncement?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["requestNextDispatchAnnouncement"];
+  cancelNextDispatchAnnouncement?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["cancelNextDispatchAnnouncement"];
+  menuActions?: Menu.TelegramMenuActionRuntime<TestContext, TestModel>;
+  openQueueMenu?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["openQueueMenu"];
+  openSettingsMenu?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["openSettingsMenu"];
   sendInteractiveMessage?: Routing.TelegramInboundRouteRuntimeDeps<
     TestMessage, TestCallbackQuery, TestContext, TestModel
   >["sendInteractiveMessage"];
@@ -96,8 +106,12 @@ export interface RouteHarnessOptions {
   inspectRestoreSourceCompletion?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["inspectRestoreSourceCompletion"];
   inspectRestoreQueuedReceipt?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["inspectRestoreQueuedReceipt"];
   hasWorkspaceRestoreAuthority?: () => boolean;
+  hasWorkspaceLiveRebindAuthority?: () => boolean;
   inspectTemporaryThreadSources?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["inspectTemporaryThreadSources"];
   onItemsDiscarded?: Queue.TelegramQueueMutationControllerDeps<TestContext>["onItemsDiscarded"];
+  queueAdmission?: Parameters<typeof Bindings.createTelegramQueueBindingRuntime<TestContext>>[0]["admission"];
+  hasPendingMessages?: (ctx: TestContext) => boolean;
+  liveRebindCleanupSchedule?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["liveRebindCleanupSchedule"];
   temporaryThreadCleanupDelayMs?: number;
   getSessionGeneration?: () => number;
   foreignOwnedUpdateForwarder?: Routing.TelegramInboundRouteRuntimeDeps<
@@ -123,6 +137,7 @@ export interface RouteHarnessOptions {
     target: Queue.TelegramQueueTarget,
   ) => string | undefined;
   instanceId?: string;
+  isVoiceReplyActive?: () => boolean;
   getCommands?: () => any[];
   mediaGroupRuntime?: Media.TelegramMediaGroupController<
     TestMessage,
@@ -149,6 +164,8 @@ export interface RouteHarnessOptions {
   validateThreadName?: (name: string) => string | undefined;
   renameCurrentThread?: Commands.TelegramThreadDisplayNameRenamePort;
   resetCurrentThreadName?: Commands.TelegramThreadDisplayNameResetPort;
+  setMyCommands?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["setMyCommands"];
+  sendTextReply?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["sendTextReply"];
   observeTextReply?: (
     text: string,
     options: Parameters<
@@ -169,7 +186,16 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
   const activeTurnRuntime = Queue.createTelegramActiveTurnStore();
   const telegramQueueStore = Queue.createTelegramQueueStore<TestContext>();
   const buttonActionStore = Outbound.createTelegramButtonActionStore();
-  const queueMutationRuntime = Queue.createTelegramQueueMutationController({
+  const deferredDispatch = Queue.createTelegramDeferredQueueDispatchRuntime<TestContext>();
+  deferredDispatch.bind({ cwd: "/repo" });
+  const queueBinding = options.queueAdmission && Bindings.createTelegramQueueBindingRuntime<TestContext>({
+    store: telegramQueueStore, queue: bridgeRuntime.queue, lifecycle: bridgeRuntime.lifecycle, activeTurn: activeTurnRuntime,
+    admission: options.queueAdmission, deferredDispatch, transportStamp: { isActive: () => true },
+    promptDispatch: { startTypingLoop() {}, onPromptDispatchStart() {}, onPromptDispatchFailure() {} },
+    isIdle: options.isIdle ?? (() => true), hasPendingMessages: options.hasPendingMessages ?? (() => false), updateStatus: () => events.push("status"),
+    sendTextReply: async () => { events.push("queue-notice"); }, sendUserMessage: () => events.push("queue-model-send"),
+  });
+  const queueMutationRuntime = queueBinding?.mutation ?? Queue.createTelegramQueueMutationController({
     ...telegramQueueStore,
     hasPendingDispatch: bridgeRuntime.lifecycle.hasDispatchPending,
     onItemsDiscarded: options.onItemsDiscarded,
@@ -205,20 +231,14 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
     updateModelMenuMessage: async () => undefined,
     updateThinkingMenuMessage: async () => undefined,
     updateStatusMessage: async () => undefined,
-    sendStatusMessage: async () => {
+    sendStatusMessage: async (...args) => {
       events.push("status-menu");
-      await options.sendStatusMessage?.();
+      await options.sendStatusMessage?.(...args);
     },
     openModelMenu: async () => undefined,
     openThinkingMenu: async () => undefined,
   };
-  const routeRuntime = Routing.createTelegramInboundRouteRuntime<
-    TestUpdate,
-    TestMessage,
-    TestCallbackQuery,
-    TestContext,
-    TestModel
-  >({
+  const routingDeps: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel> = {
     configStore: options.configStore ?? {
       get: () => (options.config ?? {}) as never,
       getAllowedUserId: () => 7,
@@ -234,8 +254,10 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
     inspectRestoreSourceCompletion: options.inspectRestoreSourceCompletion,
     inspectRestoreQueuedReceipt: options.inspectRestoreQueuedReceipt,
     hasWorkspaceRestoreAuthority: options.hasWorkspaceRestoreAuthority,
+    hasWorkspaceLiveRebindAuthority: options.hasWorkspaceLiveRebindAuthority,
     inspectTemporaryThreadSources: options.inspectTemporaryThreadSources,
     temporaryThreadCleanupDelayMs: options.temporaryThreadCleanupDelayMs,
+    liveRebindCleanupSchedule: options.liveRebindCleanupSchedule,
     getSessionGeneration: options.getSessionGeneration,
     foreignOwnedUpdateForwarder: options.foreignOwnedUpdateForwarder,
     getTargetOwnership: options.getTargetOwnership,
@@ -263,8 +285,9 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
     modelMenuRuntime: Menu.createTelegramModelMenuRuntime<TestModel>(),
     currentModelRuntime,
     modelSwitchController,
-    menuActions,
-    openQueueMenu: async () => undefined,
+    menuActions: options.menuActions ?? menuActions,
+    openQueueMenu: options.openQueueMenu ?? (async () => undefined),
+    openSettingsMenu: options.openSettingsMenu,
     queueMenuCallbackHandler: async () => false,
     inboundHandlerRuntime: {
       process:
@@ -281,7 +304,9 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
     buttonActionStore,
     invokeBoundButtonAction: options.invokeBoundButtonAction,
     updateStatus: () => events.push("status"),
-    dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+    dispatchNextQueuedTelegramTurn: options.dispatchNextQueuedTelegramTurn ?? queueBinding?.dispatchNext ?? (() => events.push("dispatch")),
+    requestNextDispatchAnnouncement: options.requestNextDispatchAnnouncement ?? queueBinding?.requestNextDispatchAnnouncement,
+    cancelNextDispatchAnnouncement: options.cancelNextDispatchAnnouncement ?? queueBinding?.cancelNextDispatchAnnouncement,
     answerCallbackQuery: async (_id, text) => {
       if (text) events.push(`answer:${text}`);
     },
@@ -296,7 +321,7 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
       events.push(`interactive-options:${JSON.stringify(sendOptions ?? {})}`);
       return 99;
     }),
-    sendTextReply: async (_chatId, _replyToMessageId, text, replyOptions) => {
+    sendTextReply: options.sendTextReply ?? (async (_chatId, _replyToMessageId, text, replyOptions) => {
       options.observeTextReply?.(text, replyOptions);
       events.push(`reply:${text}`);
       if (typeof replyOptions?.target?.threadId === "number") {
@@ -305,13 +330,13 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
         );
       }
       return undefined;
-    },
+    }),
     deleteMessage:
       options.deleteMessage ??
       (async (chatId, messageId) => {
         events.push(`delete-message:${chatId}:${messageId}`);
       }),
-    setMyCommands: async () => undefined,
+    setMyCommands: options.setMyCommands ?? (async () => undefined),
     validateThreadName: options.validateThreadName,
     renameCurrentThread: options.renameCurrentThread,
     resetCurrentThreadName: options.resetCurrentThreadName,
@@ -321,16 +346,19 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
       (async (_fileId, fileName) => `/tmp/${fileName}`),
     getThinkingLevel: () => "high",
     setThinkingLevel: () => undefined,
+    isVoiceReplyActive: options.isVoiceReplyActive,
     setModel: async () => true,
     sendUserMessage: (message, opts) => {
       events.push(`user:${message}:${opts?.deliverAs ?? "default"}`);
     },
-    isIdle: () => true,
+    isIdle: options.isIdle ?? (() => true),
     hasPendingMessages: () => false,
     compact: () => undefined,
-    recordRuntimeEvent: (category, error) => {
+    beginCommandEffectWork: options.beginCommandEffectWork,
+    recordRuntimeEvent: options.recordRuntimeEvent ?? ((category, error) => {
       events.push(`event:${category}:${String(error)}`);
-    },
-  });
-  return { buttonActionStore, bridgeRuntime, events, routeRuntime, telegramQueueStore, activeTurnRuntime };
+    }),
+  };
+  const routeRuntime = Routing.createTelegramInboundRouteRuntime<TestUpdate, TestMessage, TestCallbackQuery, TestContext, TestModel>(routingDeps);
+  return { buttonActionStore, bridgeRuntime, events, routeRuntime, routingDeps, telegramQueueStore, activeTurnRuntime, queueBinding };
 }

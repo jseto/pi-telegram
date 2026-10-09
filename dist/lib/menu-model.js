@@ -4,9 +4,49 @@
  * Owns model-menu state, scoped model pages, model callback planning, and model-menu message rendering
  */
 import { getCanonicalModelId, modelsMatch, parseTelegramCliScopedModelPatterns, resolveScopedModelPatterns, sortScopedModels, } from "./model.js";
+import { TelegramApiAuthorityError, } from "./telegram-api.js";
 const TELEGRAM_MODEL_MENU_CACHE_TTL_MS = 5000;
 const TELEGRAM_MODEL_MENU_STATE_TTL_MS = 10 * 60 * 1000;
 const MAX_STORED_TELEGRAM_MODEL_MENUS = 50;
+/** Per-open delivery lifetime; never retain this guard in stored callback state. */
+export function createTelegramMenuDelivery(target, options, deps) {
+    const assertAuthority = options?.assertAuthority, capturedTarget = { ...target };
+    const sendInteractiveMessage = deps.sendInteractiveMessage, storeModelMenuState = deps.storeModelMenuState;
+    let requestIssued = false;
+    const assertCurrent = () => {
+        try {
+            assertAuthority?.();
+        }
+        catch {
+            throw new TelegramApiAuthorityError(requestIssued);
+        }
+    };
+    assertCurrent();
+    return {
+        assertCurrent,
+        assertAuthority,
+        sendInteractiveMessage: async (...args) => {
+            assertCurrent();
+            const [chatId, text, mode, replyMarkup, sendOptions] = args;
+            const messageId = await sendInteractiveMessage(assertAuthority ? capturedTarget.chatId : chatId, text, mode, replyMarkup, assertAuthority
+                ? { ...sendOptions, target: { ...capturedTarget }, assertAuthority }
+                : sendOptions);
+            requestIssued = true;
+            assertCurrent();
+            return messageId;
+        },
+        storeModelMenuState: (state) => {
+            assertCurrent();
+            if (assertAuthority &&
+                (state.chatId !== capturedTarget.chatId ||
+                    state.threadId !== capturedTarget.threadId)) {
+                throw new TelegramApiAuthorityError(requestIssued);
+            }
+            storeModelMenuState(state);
+            assertCurrent();
+        },
+    };
+}
 export const TELEGRAM_MODEL_PAGE_SIZE = 6;
 const TELEGRAM_MODEL_PAGE_PICKER_ROW_SIZE = 4;
 export const MODEL_MENU_TITLE = "<b>🤖 Choose a model:</b>";
@@ -42,11 +82,13 @@ function applyTelegramMenuRenderPayload(state, payload) {
     state.mode = payload.nextMode;
     return payload;
 }
-async function editTelegramMenuMessage(state, payload, deps) {
+/** Apply the payload mode to state, then edit the existing menu message in place. */
+export async function editTelegramMenuMessage(state, payload, deps) {
     const appliedPayload = applyTelegramMenuRenderPayload(state, payload);
     await deps.editInteractiveMessage(state.chatId, state.messageId, appliedPayload.text, appliedPayload.mode, appliedPayload.replyMarkup);
 }
-function sendTelegramMenuMessage(state, payload, deps) {
+/** Apply the payload mode to state, then send a fresh menu message to its exact chat/Thread. */
+export function sendTelegramMenuMessage(state, payload, deps) {
     const appliedPayload = applyTelegramMenuRenderPayload(state, payload);
     return deps.sendInteractiveMessage(state.chatId, appliedPayload.text, appliedPayload.mode, appliedPayload.replyMarkup, state.threadId !== undefined
         ? { target: { chatId: state.chatId, threadId: state.threadId } }
@@ -366,7 +408,7 @@ export function buildTelegramModelCallbackPlan(params) {
     if (action.action === "open") {
         const detailResult = applyTelegramModelDetailSelection(params.state, action.value);
         if (detailResult === "invalid") {
-            return { kind: "answer", text: "Selected model is no longer available." };
+            return { kind: "answer", text: "Selected model is no longer available" };
         }
         return { kind: "update-menu" };
     }
@@ -376,12 +418,12 @@ export function buildTelegramModelCallbackPlan(params) {
         if (params.state.canMutateScope === false) {
             return {
                 kind: "answer",
-                text: "Model scope is controlled by CLI --models.",
+                text: "Model scope is controlled by CLI --models",
             };
         }
         const selectionResult = getTelegramSelectedDetailModel(params.state);
         if (selectionResult.kind !== "selected") {
-            return { kind: "answer", text: "Selected model is no longer available." };
+            return { kind: "answer", text: "Selected model is no longer available" };
         }
         const model = selectionResult.selection.model;
         const enabled = action.action === "scope-toggle"
@@ -406,10 +448,10 @@ export function buildTelegramModelCallbackPlan(params) {
         ? getTelegramSelectedDetailModel(params.state)
         : getTelegramModelSelection(params.state, action.value);
     if (selectionResult.kind === "invalid") {
-        return { kind: "answer", text: "Invalid model selection." };
+        return { kind: "answer", text: "Invalid model selection" };
     }
     if (selectionResult.kind === "missing") {
-        return { kind: "answer", text: "Selected model is no longer available." };
+        return { kind: "answer", text: "Selected model is no longer available" };
     }
     const selection = selectionResult.selection;
     if (modelsMatch(selection.model, params.activeModel)) {
@@ -428,7 +470,7 @@ export function buildTelegramModelCallbackPlan(params) {
         if (!params.canRestartBusyRun) {
             return {
                 kind: "answer",
-                text: "Pi is busy. Send /abort, /next, or /stop.",
+                text: "Pi is busy. Send /abort, /next, or /stop",
             };
         }
         return {
@@ -481,7 +523,7 @@ export async function handleTelegramModelMenuCallbackAction(callbackQueryId, par
     }
     if (plan.kind === "persist-scope") {
         if (!deps.persistScopedModelPatterns) {
-            await deps.answerCallbackQuery(callbackQueryId, "Scoped model persistence is unavailable.");
+            await deps.answerCallbackQuery(callbackQueryId, "Scoped model persistence is unavailable");
             return true;
         }
         await deps.persistScopedModelPatterns(plan.patterns);
@@ -499,7 +541,7 @@ export async function handleTelegramModelMenuCallbackAction(callbackQueryId, par
     }
     const changed = await deps.setModel(plan.selection.model);
     if (changed === false) {
-        await deps.answerCallbackQuery(callbackQueryId, "Model is not available.");
+        await deps.answerCallbackQuery(callbackQueryId, "Model is not available");
         return true;
     }
     deps.setCurrentModel(plan.selection.model);
@@ -526,7 +568,7 @@ export async function handleTelegramModelMenuCallbackAction(callbackQueryId, par
         const restarted = await deps.restartInterruptedTelegramTurn(plan.selection, continuationTurn);
         await deps.updateModelMenuMessage();
         if (!restarted) {
-            await deps.answerCallbackQuery(callbackQueryId, "Pi is busy. Send /abort, /next, or /stop.");
+            await deps.answerCallbackQuery(callbackQueryId, "Pi is busy. Send /abort, /next, or /stop");
             return true;
         }
     }

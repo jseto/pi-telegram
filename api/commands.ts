@@ -6,6 +6,9 @@
 
 export {
   registerTelegramCommand,
+  type PreparedSelectedCommand,
+  type SelectedCommandExecution,
+  type SelectedPreparationInput,
   type TelegramExtensionCommandContext,
   type TelegramExtensionCommandRegistration,
 } from "../lib/commands.ts";

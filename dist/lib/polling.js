@@ -158,7 +158,10 @@ export function createTelegramDurablePollingRuntimeAssembly(deps) {
             }
             catch (error) {
                 try {
-                    deps.recordRuntimeEvent?.("polling", error, { phase: "batch-preparation", updateCount: updates.length });
+                    deps.recordRuntimeEvent?.("polling", error, {
+                        phase: "batch-preparation",
+                        updateCount: updates.length,
+                    });
                 }
                 catch {
                     // Already-published input must still reach the worker if diagnostics fail.
@@ -362,8 +365,13 @@ export function startTelegramPollingRuntime(ctx, deps) {
             deps.setPollingController(undefined);
         if (!ownsPromise && !ownsController)
             return;
-        deps.onPollingStopped?.(controller.signal.aborted ? "requested" : persistentConflict
-            ? "persistent-conflict" : failed ? "failed" : "completed");
+        deps.onPollingStopped?.(controller.signal.aborted
+            ? "requested"
+            : persistentConflict
+                ? "persistent-conflict"
+                : failed
+                    ? "failed"
+                    : "completed");
         // Detach the inner promise before outer teardown calls polling.stop().
         if (persistentConflict && !controller.signal.aborted) {
             try {
@@ -373,12 +381,15 @@ export function startTelegramPollingRuntime(ctx, deps) {
                 else {
                     deps.stopTypingLoop();
                     deps.recordRuntimeEvent?.("polling", persistentConflict, {
-                        phase: "persistent-conflict", count: persistentConflict.count,
+                        phase: "persistent-conflict",
+                        count: persistentConflict.count,
                     });
                 }
             }
             catch (error) {
-                deps.recordRuntimeEvent?.("polling", error, { phase: "conflict-stand-down" });
+                deps.recordRuntimeEvent?.("polling", error, {
+                    phase: "conflict-stand-down",
+                });
             }
             if (deps.getPollingController() || deps.getPollingPromise())
                 return;
@@ -435,7 +446,9 @@ export function createTelegramThreadCapabilityOrchestration(deps) {
             const expected = generation;
             return () => expected === generation;
         },
-        invalidate() { generation++; },
+        invalidate() {
+            generation++;
+        },
     };
     const capabilityDeps = {
         lifecycle,
@@ -543,6 +556,29 @@ function hasTelegramThreadCapabilityBindings(store) {
             record.status !== "stale");
     }) ?? false);
 }
+/** Falls back to classic polling, recording a failed restore durably; false once the attempt is stale. */
+async function restoreTelegramClassicPolling(ctx, phase, deps, isCurrent) {
+    try {
+        await deps.startClassicPolling(ctx);
+        return isCurrent();
+    }
+    catch (classicError) {
+        if (!isCurrent())
+            return false;
+        deps.topicTargetStore.setBotState({
+            threadMode: "disabled",
+            updatedAtMs: (deps.getNowMs ?? Date.now)(),
+            lastReconcileAction: `${phase}-classic-restore-failed`,
+        });
+        await deps.topicTargetStore.persist();
+        if (!isCurrent())
+            return false;
+        deps.recordEvent("bus", classicError, {
+            phase: `${phase}-classic-restore`,
+        });
+        return true;
+    }
+}
 export async function applyTelegramThreadCapability(ctx, threadModeEnabled, phase, deps, isCurrent = deps.lifecycle?.capture() ?? (() => true)) {
     if (!isCurrent())
         return;
@@ -580,26 +616,8 @@ export async function applyTelegramThreadCapability(ctx, threadModeEnabled, phas
             deps.setPollingStartedWithTelegramBus(false);
             if (hadLiveThreadTransport)
                 deps.suspendLiveThreadTarget?.();
-            try {
-                await deps.startClassicPolling(ctx);
-                if (!isCurrent())
-                    return;
-            }
-            catch (classicError) {
-                if (!isCurrent())
-                    return;
-                deps.topicTargetStore.setBotState({
-                    threadMode: "disabled",
-                    updatedAtMs: (deps.getNowMs ?? Date.now)(),
-                    lastReconcileAction: `${phase}-classic-restore-failed`,
-                });
-                await deps.topicTargetStore.persist();
-                if (!isCurrent())
-                    return;
-                deps.recordEvent("bus", classicError, {
-                    phase: `${phase}-classic-restore`,
-                });
-            }
+            if (!(await restoreTelegramClassicPolling(ctx, phase, deps, isCurrent)))
+                return;
         }
         deps.updateStatus(ctx);
         return;
@@ -641,26 +659,8 @@ export async function applyTelegramThreadCapability(ctx, threadModeEnabled, phas
                     return;
                 deps.setTopicModeUnavailable(true);
             }
-            try {
-                await deps.startClassicPolling(ctx);
-                if (!isCurrent())
-                    return;
-            }
-            catch (classicError) {
-                if (!isCurrent())
-                    return;
-                deps.topicTargetStore.setBotState({
-                    threadMode: "disabled",
-                    updatedAtMs: (deps.getNowMs ?? Date.now)(),
-                    lastReconcileAction: `${phase}-classic-restore-failed`,
-                });
-                await deps.topicTargetStore.persist();
-                if (!isCurrent())
-                    return;
-                deps.recordEvent("bus", classicError, {
-                    phase: `${phase}-classic-restore`,
-                });
-            }
+            if (!(await restoreTelegramClassicPolling(ctx, phase, deps, isCurrent)))
+                return;
             deps.updateStatus(ctx);
             if (threadModeUnavailable)
                 return;
@@ -759,11 +759,17 @@ export function createTelegramThreadAwarePollingPorts(deps) {
     };
     const restoreFollowerWithOwner = async (ctx, owner) => {
         if (!(await refreshFollowerState())) {
-            deps.recordEvent("bus", "Telegram follower auto-connect skipped: Threaded Mode is not enabled.", { phase: "follower-auto-connect-skip", reason: "thread-mode-unavailable" });
+            deps.recordEvent("bus", "Telegram follower auto-connect skipped: Threaded Mode is not enabled.", {
+                phase: "follower-auto-connect-skip",
+                reason: "thread-mode-unavailable",
+            });
             return undefined;
         }
         if (!deps.hasRememberedWorkspaceBinding?.(ctx)) {
-            deps.recordEvent("bus", "Telegram follower auto-connect skipped: no binding for this session.", { phase: "follower-auto-connect-skip", reason: "session-binding-unavailable" });
+            deps.recordEvent("bus", "Telegram follower auto-connect skipped: no binding for this session.", {
+                phase: "follower-auto-connect-skip",
+                reason: "session-binding-unavailable",
+            });
             return undefined;
         }
         return deps.restoreFollowerWithLeader?.(ctx, owner);
@@ -898,7 +904,9 @@ export function createTelegramThreadCapabilityMonitor(deps) {
                     try {
                         stop();
                     }
-                    catch { /* Timer shutdown must not escape the callback. */ }
+                    catch {
+                        /* Timer shutdown must not escape the callback. */
+                    }
                     try {
                         deps.recordEvent("bus", error, { phase: "capability-monitor" });
                     }
@@ -1115,7 +1123,8 @@ export async function runTelegramPollLoop(deps) {
         if (consecutiveGetUpdatesConflicts >= TELEGRAM_GET_UPDATES_CONFLICT_STOP_LIMIT) {
             throw new TelegramPersistentGetUpdatesConflictError(consecutiveGetUpdatesConflicts);
         }
-        await deps.sleep(consecutiveGetUpdatesConflicts < TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_LIMIT
+        await deps.sleep(consecutiveGetUpdatesConflicts <
+            TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_LIMIT
             ? TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_MS
             : TELEGRAM_GET_UPDATES_CONFLICT_SLOW_RETRY_MS, deps.signal);
     };

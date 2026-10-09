@@ -83,12 +83,14 @@ function escapeTelegramRichButtonText(text) {
     return text.replace(/[&<>"'`\\*_\[\]{}$~\r\n]/g, (character) => `&#${character.charCodeAt(0)};`);
 }
 function renderTelegramRichButtonRow(row) {
-    return `<tg-button-row>${row.map((button) => {
+    return `<tg-button-row>${row
+        .map((button) => {
         const attributes = button.disabled
             ? 'type="disabled"'
             : `type="callback_data" data="${escapeTelegramRichButtonText(button.callback_data)}"`;
         return `<tg-button ${attributes}>${escapeTelegramRichButtonText(button.text)}</tg-button>`;
-    }).join("")}</tg-button-row>`;
+    })
+        .join("")}</tg-button-row>`;
 }
 export function planTelegramButtonReply(markdown, deps) {
     const keyboard = [];
@@ -96,12 +98,14 @@ export function planTelegramButtonReply(markdown, deps) {
         const actions = payloadRows.map((row) => row.map(parseTelegramButtonAction));
         if (actions.some((row) => row.some((action) => !action)))
             return undefined;
-        if (rich && actions.some((row) => {
-            const projected = row.map((action) => action.disabled
-                ? { text: action.text || "\u00a0", disabled: {} }
-                : { text: action.text, callback_data: "x".repeat(64) });
-            return row.length > 8 || renderTelegramRichButtonRow(projected).length > 32768;
-        }))
+        if (rich &&
+            actions.some((row) => {
+                const projected = row.map((action) => action.disabled
+                    ? { text: action.text || "\u00a0", disabled: {} }
+                    : { text: action.text, callback_data: "x".repeat(64) });
+                return (row.length > 8 ||
+                    renderTelegramRichButtonRow(projected).length > 32768);
+            }))
             return undefined;
         return actions.map((row) => row.map((action) => action.disabled
             ? { text: action.text || "\u00a0", disabled: {} }
@@ -131,7 +135,9 @@ export function planTelegramButtonReply(markdown, deps) {
     });
     const stripped = replaceTopLevelHtmlComments(withRichButtons, (comment) => {
         const command = "telegram_button";
-        const normalizedContent = comment.content.replace(/^\s+/, "").replace(/^!/, "");
+        const normalizedContent = comment.content
+            .replace(/^\s+/, "")
+            .replace(/^!/, "");
         if (!normalizedContent.startsWith(command))
             return comment.raw;
         const payloadRows = parseTelegramActionPayloadRows(comment, command);
@@ -186,19 +192,19 @@ export async function handleTelegramButtonCallbackQuery(query, ctx, deps) {
     const action = deps.resolveAction(query.data);
     if (!action) {
         if (query.data?.startsWith(`${TELEGRAM_BUTTON_CALLBACK_PREFIX}:`)) {
-            await deps.answerCallbackQuery(query.id, "Button action expired.");
+            await deps.answerCallbackQuery(query.id, "Button action expired");
             return true;
         }
         return false;
     }
     if (action.disabled) {
-        await deps.answerCallbackQuery(query.id, "Button action unavailable.");
+        await deps.answerCallbackQuery(query.id, "Button action unavailable");
         return true;
     }
     const chatId = query.message?.chat?.id;
     const messageId = query.message?.message_id;
     if (typeof chatId !== "number" || typeof messageId !== "number") {
-        await deps.answerCallbackQuery(query.id, "Button action expired.");
+        await deps.answerCallbackQuery(query.id, "Button action expired");
         return true;
     }
     if (deps.invokeBoundAction) {
@@ -216,18 +222,18 @@ export async function handleTelegramButtonCallbackQuery(query, ctx, deps) {
                         }
                     }
                 }
-                await deps.answerCallbackQuery(query.id, "Done.");
+                await deps.answerCallbackQuery(query.id, "Done");
                 return true;
             }
         }
         catch (error) {
-            await deps.answerCallbackQuery(query.id, "Generative App action failed.");
+            await deps.answerCallbackQuery(query.id, "Generative App action failed");
             throw error;
         }
     }
     const enqueued = deps.enqueueButtonPrompt(query, action, ctx);
     if (enqueued === false) {
-        await deps.answerCallbackQuery(query.id, "Already queued.");
+        await deps.answerCallbackQuery(query.id, "Already queued");
         return true;
     }
     const selectedMarkup = query.data && query.message?.reply_markup
@@ -236,6 +242,6 @@ export async function handleTelegramButtonCallbackQuery(query, ctx, deps) {
     if (selectedMarkup && deps.editMessageReplyMarkup) {
         await deps.editMessageReplyMarkup(chatId, messageId, selectedMarkup);
     }
-    await deps.answerCallbackQuery(query.id, "Queued.");
+    await deps.answerCallbackQuery(query.id, "Queued");
     return true;
 }

@@ -3,9 +3,9 @@
  * Zones: telegram config, pairing, filesystem
  * Owns persisted bot/session pairing state, local config storage, live config controls, authorization policy, and first-user pairing side effects
  */
-export { TELEGRAM_DEFAULT_PROFILE_NAME } from "./paths.ts";
 import type { CommandTemplateObjectConfig } from "./command-templates.ts";
 import type { TelegramInboundHandlerConfig } from "./inbound.ts";
+export { TELEGRAM_DEFAULT_PROFILE_NAME } from "./paths.ts";
 /** Parsed stored bot-token form: a literal secret or one environment-variable reference. */
 export type TelegramBotTokenReference = {
     kind: "literal";
@@ -116,12 +116,6 @@ export interface TelegramConfigStore {
     setAllowedUserId: (userId: number) => void;
     /** Publish an unpaired profile owner atomically; true only for the resulting exact owner. */
     persistAllowedUserId: (userId: number, assertExecutionCurrent?: () => void, commitIfOwned?: (commit: () => void) => boolean) => Promise<boolean>;
-    /** Lock-only serialization for trusted synchronous source operations, not authorization.
-     * Does not read/adopt config. Acquire required Workspace admission first; never
-     * acquire owners or nest config admission here. Do not pass async callbacks:
-     * returned promises are not protected after their synchronous prefix.
-     */
-    withSourceSerialization: <T>(operation: () => T) => T;
     /** Trusted synchronous publication only; caller acquires Workspace admission before this config transaction. */
     withPairingAdmission: <T>(profileName: string, tokenSha256: string, publish: (preApprovalExcluded: boolean) => T) => T;
     /** Observe an existing exact owner and refresh an unpaired cache; never create an owner. Callback must be synchronous. */
@@ -152,20 +146,13 @@ export interface TelegramInvalidConfigRecovery {
     recoveryPath: string;
     error: unknown;
 }
-export interface TelegramConfigRuntime {
-    updateVoiceConfig: (voice: NonNullable<TelegramConfig["voice"]>) => void;
-}
-export declare function setGlobalTelegramConfigRuntime(runtime: TelegramConfigRuntime | undefined): void;
-export declare function updateTelegramVoiceConfig(voice: NonNullable<TelegramConfig["voice"]>): boolean;
 type TelegramMutableConfigStore = Pick<TelegramConfigStore, "get" | "set" | "persist"> & {
     load?: () => Promise<void>;
     didLastLoadRecoverInvalidConfig?: () => boolean;
 };
-export declare function bindGlobalTelegramConfigRuntime(configStore: TelegramMutableConfigStore): void;
 export declare function readTelegramConfig(configPath: string, options?: {
     onInvalidConfig?: (recovery: TelegramInvalidConfigRecovery) => void;
 }): Promise<TelegramConfig>;
-export declare function writeTelegramConfig(agentDir: string, configPath: string, config: TelegramConfig): Promise<void>;
 export declare function getTelegramProfileFields(config: TelegramConfig): TelegramBotProfile | undefined;
 export declare function normalizeTelegramDefaultProfileConfig(config: TelegramConfig): {
     config: TelegramConfig;

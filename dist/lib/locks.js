@@ -3,12 +3,13 @@
  * Zones: telegram ownership, filesystem, transport authority
  * Owns filesystem authority, atomic runtime-section publication and Telegram bridge ownership semantics
  */
-import { chmodSync, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync, } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { isDeepStrictEqual } from "node:util";
+import { chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync, } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { isWireRecord as runtimeStateRecord } from "./wire.js";
+import { isDeepStrictEqual } from "node:util";
 import { isTelegramSessionPollingJournalPath, resolveTelegramOwnersPath, resolveTelegramSessionPollingJournalPath, resolveTelegramUpdateJournalPathForProfile, } from "./paths.js";
+import { isProcessAlive } from "./process-identity.js";
+import { isWireRecord as runtimeStateRecord } from "./wire.js";
 export const TELEGRAM_LOCK_KEY = "default";
 export const TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS = 8_000;
 export const TELEGRAM_OWNERSHIP_CHECK_MS = 1_000;
@@ -58,7 +59,9 @@ export function createTelegramOwnedStateAuthorityCapture(lock, session) {
         const epoch = lock.getOwnedLeaderEpoch();
         if (epoch === undefined)
             return undefined;
-        const current = () => session.isCurrent(ctx, generation) && lock.owns(ctx) && lock.getOwnedLeaderEpoch() === epoch;
+        const current = () => session.isCurrent(ctx, generation) &&
+            lock.owns(ctx) &&
+            lock.getOwnedLeaderEpoch() === epoch;
         return current() ? current : undefined;
     };
 }
@@ -73,16 +76,20 @@ export function createTelegramLeaderJournalPathResolver(deps) {
         if (existsSync(root))
             return root;
         const sessionId = deps.getSessionId();
-        return sessionId === undefined ? undefined : resolveTelegramSessionPollingJournalPath(sessionId, undefined, profileName);
+        return sessionId === undefined
+            ? undefined
+            : resolveTelegramSessionPollingJournalPath(sessionId, undefined, profileName);
     };
     return {
         createJournalPath: () => createOwn(),
         resolve(profileName) {
             const named = deps.getNamedJournalPath();
-            if (named && (isTelegramSessionPollingJournalPath(named) ||
-                named === resolveTelegramUpdateJournalPathForProfile(profileName)))
+            if (named &&
+                (isTelegramSessionPollingJournalPath(named) ||
+                    named === resolveTelegramUpdateJournalPathForProfile(profileName)))
                 return named;
-            return createOwn(profileName) ?? resolveTelegramUpdateJournalPathForProfile(profileName);
+            return (createOwn(profileName) ??
+                resolveTelegramUpdateJournalPathForProfile(profileName));
         },
     };
 }
@@ -129,6 +136,93 @@ function isRetryableLockWriteError(error) {
 function sleepSync(ms) {
     const buffer = new SharedArrayBuffer(4);
     Atomics.wait(new Int32Array(buffer), 0, 0, ms);
+}
+/** Typed private-file refusal; owners map the failure into their own error vocabulary. */
+export class TelegramPrivateFileError extends Error {
+    failure;
+    constructor(failure, message) {
+        super(message);
+        this.failure = failure;
+        this.name = "TelegramPrivateFileError";
+    }
+}
+/**
+ * Read flags for private runtime files. Where the platform offers them, no-follow and non-blocking opens refuse a
+ * swapped link or FIFO at open time. Windows has neither flag and no FIFOs in the file namespace; there the
+ * lstat-before/fstat-after identity binding every strict reader performs is the guard, so a link swapped in after
+ * inspection opens a different file and is refused as changed.
+ */
+export const TELEGRAM_STRICT_READ_FLAGS = constants.O_RDONLY |
+    (constants.O_NOFOLLOW ?? 0) |
+    (constants.O_NONBLOCK ?? 0);
+/** POSIX owner and permission bits; Windows has no uid, so its ACL-protected agent directory carries privacy. */
+export function isTelegramOwnerPrivate(stat) {
+    const uid = process.getuid?.();
+    return (uid === undefined ||
+        (stat.uid === BigInt(uid) && (stat.mode & 63n) === 0n));
+}
+/**
+ * Read one owner-private, single-link, bounded regular file without following links. Absence returns undefined;
+ * an inode or metadata change between inspection and open refuses as `changed`.
+ */
+export function readTelegramPrivateFile(path, maxBytes) {
+    let before;
+    try {
+        before = lstatSync(path, { bigint: true });
+    }
+    catch (error) {
+        if (error?.code === "ENOENT")
+            return undefined;
+        throw error;
+    }
+    if (!before.isFile() ||
+        before.isSymbolicLink() ||
+        !isTelegramOwnerPrivate(before) ||
+        before.nlink !== 1n ||
+        before.size > BigInt(maxBytes)) {
+        throw new TelegramPrivateFileError(before.size > BigInt(maxBytes) ? "capacity" : "unsafe", "Telegram private file is not a bounded no-follow regular file.");
+    }
+    const fd = openSync(path, TELEGRAM_STRICT_READ_FLAGS);
+    try {
+        const opened = fstatSync(fd, { bigint: true });
+        if (!opened.isFile() ||
+            opened.dev !== before.dev ||
+            opened.ino !== before.ino ||
+            opened.uid !== before.uid ||
+            opened.nlink !== 1n ||
+            !isTelegramOwnerPrivate(opened) ||
+            opened.size !== before.size ||
+            opened.mtimeNs !== before.mtimeNs) {
+            throw new TelegramPrivateFileError("changed", "Telegram private file changed during inspection.");
+        }
+        return readFileSync(fd, "utf8");
+    }
+    finally {
+        closeSync(fd);
+    }
+}
+/** Atomically publish owner-private contents through a unique staging file; the rename consumes staging. */
+export function publishTelegramPrivateFile(path, temporaryBasePath, contents, label, onBoundary) {
+    const temporaryPath = `${temporaryBasePath}.${process.pid}.${randomUUID()}.tmp`;
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    mkdirSync(dirname(temporaryPath), { recursive: true, mode: 0o700 });
+    try {
+        writeFileSync(temporaryPath, contents, { encoding: "utf8", mode: 0o600 });
+        chmodSync(temporaryPath, 0o600);
+        onBoundary?.("after-write-before-rename");
+        if (!renameTelegramPathWithRetry(temporaryPath, path))
+            throw new Error(`${label} staging file disappeared before publication.`);
+        chmodSync(path, 0o600);
+        onBoundary?.("after-rename");
+    }
+    finally {
+        try {
+            unlinkSync(temporaryPath);
+        }
+        catch {
+            /* Atomic rename consumes the temporary path. */
+        }
+    }
 }
 /** Rename one Telegram runtime artifact with bounded Windows sharing retries. */
 export function renameTelegramPathWithRetry(sourcePath, destinationPath, options = {}) {
@@ -545,7 +639,10 @@ function requireRuntimeStatePath(path) {
         throw new TelegramRuntimeStateError("invalid", "Telegram runtime state path must be canonical and absolute.");
 }
 function requireRuntimeStateProfile(profile) {
-    if (typeof profile !== "string" || !profile.length || profile.length > 512 || /[\x00-\x1f]/u.test(profile))
+    if (typeof profile !== "string" ||
+        !profile.length ||
+        profile.length > 512 ||
+        /[\x00-\x1f]/u.test(profile))
         throw new TelegramRuntimeStateError("invalid", "Telegram runtime state profile is invalid.");
 }
 /** Private single-link regular file read with identity continuity; initial absence only is positive. */
@@ -556,13 +653,17 @@ function readTelegramRuntimeSource(path) {
     try {
         const stat = lstatSync(path);
         observed = true;
-        if (!stat.isFile() || stat.nlink !== 1 ||
+        if (!stat.isFile() ||
+            stat.nlink !== 1 ||
             (process.platform !== "win32" && (stat.mode & 0o077) !== 0))
             throw new TelegramRuntimeStateError("invalid", "Telegram runtime state must be a private regular file.");
         const fd = openSync(path, "r");
         try {
             const opened = fstatSync(fd);
-            if (opened.dev !== stat.dev || opened.ino !== stat.ino || opened.nlink !== 1 || !opened.isFile() ||
+            if (opened.dev !== stat.dev ||
+                opened.ino !== stat.ino ||
+                opened.nlink !== 1 ||
+                !opened.isFile() ||
                 (process.platform !== "win32" && (opened.mode & 0o077) !== 0))
                 throw new TelegramRuntimeStateError("invalid", "Telegram runtime state identity changed before reading.");
             source = readFileSync(fd).toString("utf8");
@@ -571,7 +672,11 @@ function readTelegramRuntimeSource(path) {
             closeSync(fd);
         }
         const after = lstatSync(path);
-        if (after.dev !== stat.dev || after.ino !== stat.ino || after.size !== stat.size || after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs)
+        if (after.dev !== stat.dev ||
+            after.ino !== stat.ino ||
+            after.size !== stat.size ||
+            after.mtimeMs !== stat.mtimeMs ||
+            after.ctimeMs !== stat.ctimeMs)
             throw new TelegramRuntimeStateError("invalid", "Telegram runtime state changed during observation.");
     }
     catch (error) {
@@ -593,12 +698,15 @@ export function readTelegramRuntimeState(path) {
     catch (error) {
         throw new TelegramRuntimeStateError("invalid", "Telegram runtime state is unreadable.", { cause: error });
     }
-    if (!runtimeStateRecord(value) || value.version !== 2 || !runtimeStateRecord(value.profiles) ||
-        Object.keys(value).some(key => key !== "version" && key !== "profiles"))
+    if (!runtimeStateRecord(value) ||
+        value.version !== 2 ||
+        !runtimeStateRecord(value.profiles) ||
+        Object.keys(value).some((key) => key !== "version" && key !== "profiles"))
         throw new TelegramRuntimeStateError("invalid", "Telegram runtime state envelope is unsupported or malformed.");
     for (const [profile, sections] of Object.entries(value.profiles)) {
         requireRuntimeStateProfile(profile);
-        if (!runtimeStateRecord(sections) || Object.keys(sections).some(key => !TELEGRAM_RUNTIME_STATE_SECTIONS.includes(key)))
+        if (!runtimeStateRecord(sections) ||
+            Object.keys(sections).some((key) => !TELEGRAM_RUNTIME_STATE_SECTIONS.includes(key)))
             throw new TelegramRuntimeStateError("invalid", "Telegram runtime state sections are malformed.");
     }
     return value;
@@ -674,12 +782,19 @@ export function mutateTelegramRuntimeStateSection(path, profile, section, mutate
         return withTelegramFileTransaction(join(runtimeDir, `${basename(path)}.transaction`), () => {
             assertCurrent();
             const file = readTelegramRuntimeState(path);
-            const previous = Object.hasOwn(file.profiles, profile) ? file.profiles[profile] : {};
+            const previous = Object.hasOwn(file.profiles, profile)
+                ? file.profiles[profile]
+                : {};
             const outcome = mutate(structuredClone(previous[section]), structuredClone(previous));
-            if (!runtimeStateRecord(outcome) || !Object.hasOwn(outcome, "value") || !Object.hasOwn(outcome, "result") || "then" in outcome)
+            if (!runtimeStateRecord(outcome) ||
+                !Object.hasOwn(outcome, "value") ||
+                !Object.hasOwn(outcome, "result") ||
+                "then" in outcome)
                 throw new TelegramRuntimeStateError("invalid", "Telegram runtime state mutations must return a synchronous value and result.");
             // Normalize intentional optional properties to their wire representation before comparison/publication.
-            const next = outcome.value === undefined ? undefined : JSON.parse(JSON.stringify(outcome.value));
+            const next = outcome.value === undefined
+                ? undefined
+                : JSON.parse(JSON.stringify(outcome.value));
             assertCurrent();
             if (isDeepStrictEqual(previous[section], next))
                 return outcome.result;
@@ -689,18 +804,32 @@ export function mutateTelegramRuntimeStateSection(path, profile, section, mutate
             else
                 updated[section] = next;
             if (Object.keys(updated).length)
-                Object.defineProperty(file.profiles, profile, { value: updated, enumerable: true, configurable: true, writable: true });
+                Object.defineProperty(file.profiles, profile, {
+                    value: updated,
+                    enumerable: true,
+                    configurable: true,
+                    writable: true,
+                });
             else
                 delete file.profiles[profile];
             const tempPath = join(runtimeDir, `${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
             try {
                 options.onPublicationBoundary?.("before-write");
                 assertCurrent();
-                writeFileSync(tempPath, `${JSON.stringify(file, null, 2)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+                writeFileSync(tempPath, `${JSON.stringify(file, null, 2)}\n`, {
+                    encoding: "utf8",
+                    flag: "wx",
+                    mode: 0o600,
+                });
                 options.onPublicationBoundary?.("after-write-before-rename");
                 assertCurrent();
                 try {
-                    if (!renameTelegramPathWithRetry(tempPath, path, { rename: options.publishRename }))
+                    if (!renameTelegramPathWithRetry(tempPath, path, {
+                        rename(from, to) {
+                            assertCurrent();
+                            (options.publishRename ?? renameSync)(from, to);
+                        },
+                    }))
                         throw new Error("Telegram runtime state temporary publication disappeared.");
                     options.onPublicationBoundary?.("after-rename");
                     assertCurrent();
@@ -787,20 +916,10 @@ export function parseTelegramLockEntry(value) {
             ? record.busSocketPath
             : undefined,
         busSecret: typeof record.busSecret === "string" ? record.busSecret : undefined,
-        ...(readTelegramLockJournalPath(record) ? { journalPath: readTelegramLockJournalPath(record) } : {}),
+        ...(readTelegramLockJournalPath(record)
+            ? { journalPath: readTelegramLockJournalPath(record) }
+            : {}),
     };
-}
-export function isProcessAlive(pid) {
-    if (!Number.isInteger(pid) || pid <= 0)
-        return false;
-    try {
-        process.kill(pid, 0);
-        return true;
-    }
-    catch (error) {
-        // Only an absent PID proves death; permission and unexpected failures do not.
-        return error.code !== "ESRCH";
-    }
 }
 function formatTelegramLockEntry(lock) {
     return lock.cwd ? `pid ${lock.pid}, cwd ${lock.cwd}` : `pid ${lock.pid}`;
@@ -842,6 +961,10 @@ function hasSameLockOwner(current, expected) {
         current.leaderEpoch === expected.leaderEpoch &&
         current.runtimeGeneration === expected.runtimeGeneration);
 }
+/** Exact owner identity (pid, cwd, instance, leader epoch, runtime generation); absent entries never match. */
+export function isSameTelegramLockOwner(current, expected) {
+    return hasSameLockOwner(current, expected);
+}
 function canSupersedeSameProcessOwner(current, pid, ctx, instanceId, runtimeGeneration) {
     if (current.pid !== pid ||
         (current.cwd !== undefined && current.cwd !== ctx.cwd) ||
@@ -856,9 +979,7 @@ function createLockEntry(pid, ctx, options) {
     if (options.journalPath)
         lock.journalPath = options.journalPath;
     if (options.instanceId) {
-        const nowMs = options.getNowMs?.();
         lock.instanceId = options.instanceId;
-        lock.heartbeatMs = nowMs;
         lock.leaderEpoch = options.mintLeaderEpoch?.() ?? randomUUID();
         lock.runtimeGeneration = options.runtimeGeneration;
     }
@@ -885,14 +1006,29 @@ function assertTelegramStateTransport(value) {
         return;
     if (!runtimeStateRecord(value))
         throw new TelegramRuntimeStateError("invalid", "Telegram state transport is malformed.");
-    const keys = ["pid", "cwd", "instanceId", "heartbeatMs", "leaderEpoch", "runtimeGeneration", "busSocketPath", "busSecret", "journalPath"];
-    if (Object.keys(value).some(key => !keys.includes(key)) ||
-        (value.pid === undefined ? Object.keys(value).length !== 1 || !readTelegramLockJournalPath(value) :
-            !Number.isSafeInteger(value.pid) || value.pid <= 0) ||
-        ["cwd", "instanceId", "busSocketPath", "busSecret", "journalPath"].some(key => value[key] !== undefined && typeof value[key] !== "string") ||
-        ["heartbeatMs", "runtimeGeneration"].some(key => value[key] !== undefined && (!Number.isSafeInteger(value[key]) || value[key] < 0)) ||
+    const keys = [
+        "pid",
+        "cwd",
+        "instanceId",
+        "heartbeatMs",
+        "leaderEpoch",
+        "runtimeGeneration",
+        "busSocketPath",
+        "busSecret",
+        "journalPath",
+    ];
+    if (Object.keys(value).some((key) => !keys.includes(key)) ||
+        (value.pid === undefined
+            ? Object.keys(value).length !== 1 || !readTelegramLockJournalPath(value)
+            : !Number.isSafeInteger(value.pid) || value.pid <= 0) ||
+        ["cwd", "instanceId", "busSocketPath", "busSecret", "journalPath"].some((key) => value[key] !== undefined && typeof value[key] !== "string") ||
+        ["heartbeatMs", "runtimeGeneration"].some((key) => value[key] !== undefined &&
+            (!Number.isSafeInteger(value[key]) || value[key] < 0)) ||
         (value.journalPath !== undefined && !readTelegramLockJournalPath(value)) ||
-        (value.leaderEpoch !== undefined && (typeof value.leaderEpoch === "string" ? value.leaderEpoch.length === 0 : !Number.isSafeInteger(value.leaderEpoch))))
+        (value.leaderEpoch !== undefined &&
+            (typeof value.leaderEpoch === "string"
+                ? value.leaderEpoch.length === 0
+                : !Number.isSafeInteger(value.leaderEpoch))))
         throw new TelegramRuntimeStateError("invalid", "Telegram state transport is malformed.");
 }
 export function createTelegramLockRuntime(options = {}) {
@@ -921,28 +1057,36 @@ export function createTelegramLockRuntime(options = {}) {
         if (!statePath)
             return readLocks(locksPath);
         // Read-only ownership queries fail closed (no owner); acquisition/publication still refuse malformed state.
-        try {
-            const transports = Object.fromEntries(Object.entries(readTelegramRuntimeState(statePath).profiles)
-                .filter(([, value]) => Object.hasOwn(value, "transport")).map(([profile, value]) => [profile, value.transport]));
-            assertTelegramStateTransport(transports[resolveEffectiveKey()]);
-            return transports;
+        // A strict read racing a concurrent atomic replace fails transiently, so retry before failing closed.
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+            try {
+                const transports = Object.fromEntries(Object.entries(readTelegramRuntimeState(statePath).profiles)
+                    .filter(([, value]) => Object.hasOwn(value, "transport"))
+                    .map(([profile, value]) => [profile, value.transport]));
+                assertTelegramStateTransport(transports[resolveEffectiveKey()]);
+                return transports;
+            }
+            catch {
+                // Retry; a persistent failure falls through to no owner.
+            }
         }
-        catch {
-            return {};
-        }
+        return {};
     };
     const transactOwners = (mutate) => {
         if (!statePath)
             return withLockTransaction(locksPath, mutate);
         const profile = resolveEffectiveKey();
-        return mutateTelegramRuntimeStateSection(statePath, profile, "transport", current => {
+        return mutateTelegramRuntimeStateSection(statePath, profile, "transport", (current) => {
             assertTelegramStateTransport(current);
             const locks = { [profile]: current };
             const outcome = mutate(locks);
             const value = outcome.changed ? locks[profile] : current;
             assertTelegramStateTransport(value);
             return { value, result: outcome.result };
-        }, { ...options.statePublication, isCurrent: () => resolveEffectiveKey() === profile });
+        }, {
+            ...options.statePublication,
+            isCurrent: () => resolveEffectiveKey() === profile,
+        });
     };
     const readLock = () => {
         const effectiveKey = resolveEffectiveKey();
@@ -951,19 +1095,30 @@ export function createTelegramLockRuntime(options = {}) {
     // A live older-release leader polls the same bot from its own directory. Only identity is exposed: its bus
     // endpoint, secret and epoch belong to another protocol and must never become a follower target.
     const readLegacyOwner = (effectiveKey) => {
-        if (!options.legacyLocksPath || options.legacyLocksPath === (statePath ?? locksPath))
+        if (!options.legacyLocksPath ||
+            options.legacyLocksPath === (statePath ?? locksPath))
             return undefined;
         try {
-            const records = statePath ? readLocksForTransaction(options.legacyLocksPath) : readLocks(options.legacyLocksPath);
+            const records = statePath
+                ? readLocksForTransaction(options.legacyLocksPath)
+                : readLocks(options.legacyLocksPath);
             if (statePath)
                 for (const value of Object.values(records))
                     assertTelegramStateTransport(value);
             const raw = records[effectiveKey];
             const legacy = parseTelegramLockEntry(raw);
-            if (!legacy || getLockState(legacy, -1, isAlive, stateOptions()).kind !== "active-elsewhere")
+            if (!legacy ||
+                getLockState(legacy, -1, isAlive, stateOptions()).kind !==
+                    "active-elsewhere")
                 return undefined;
-            return { pid: legacy.pid, ...(legacy.cwd ? { cwd: legacy.cwd } : {}), ...(legacy.instanceId ? { instanceId: legacy.instanceId } : {}),
-                ...(legacy.heartbeatMs !== undefined ? { heartbeatMs: legacy.heartbeatMs } : {}) };
+            return {
+                pid: legacy.pid,
+                ...(legacy.cwd ? { cwd: legacy.cwd } : {}),
+                ...(legacy.instanceId ? { instanceId: legacy.instanceId } : {}),
+                ...(legacy.heartbeatMs !== undefined
+                    ? { heartbeatMs: legacy.heartbeatMs }
+                    : {}),
+            };
         }
         catch (error) {
             if (statePath)
@@ -992,9 +1147,16 @@ export function createTelegramLockRuntime(options = {}) {
             const effectiveKey = resolveEffectiveKey();
             const legacy = readLegacyOwner(effectiveKey);
             if (legacy)
-                return { result: { ok: false, lock: legacy }, changed: false };
+                return {
+                    result: { ok: false, lock: legacy },
+                    changed: false,
+                };
             const current = parseTelegramLockEntry(locks[effectiveKey]);
-            const state = getLockState(current, pid, isAlive, stateOptions());
+            const observedState = getLockState(current, pid, isAlive, stateOptions());
+            const state = observedState.kind === "active-elsewhere" &&
+                hasSameLockOwner(current, acquireOptions.unresponsiveOwner)
+                ? { kind: "stale", lock: observedState.lock }
+                : observedState;
             const expectedOwned = adoptCompatibleOwnedLock(effectiveKey, current, ctx);
             if (state.kind === "active-here" &&
                 hasSameLockOwner(current, expectedOwned) &&
@@ -1034,13 +1196,13 @@ export function createTelegramLockRuntime(options = {}) {
                     changed: false,
                 };
             }
-            const journalPath = readTelegramLockJournalPath(locks[effectiveKey]) ?? options.createJournalPath?.(ctx);
+            const journalPath = readTelegramLockJournalPath(locks[effectiveKey]) ??
+                options.createJournalPath?.(ctx);
             const lock = createLockEntry(pid, ctx, {
                 journalPath,
                 instanceId: options.instanceId,
                 busSocketPath: options.busSocketPath,
                 busSecret: options.busSecret,
-                getNowMs,
                 mintLeaderEpoch: options.mintLeaderEpoch,
                 runtimeGeneration,
             });
@@ -1095,34 +1257,45 @@ export function createTelegramLockRuntime(options = {}) {
             const lock = parseTelegramLockEntry(readOwners()[effectiveKey]);
             return hasSameLockOwner(lock, adoptCompatibleOwnedLock(effectiveKey, lock, ctx));
         },
-        commitIfOwned: (commit) => !deliveryRevoked && transactOwners((locks) => {
-            const effectiveKey = resolveEffectiveKey();
-            const lock = parseTelegramLockEntry(locks[effectiveKey]);
-            const exactOwner = ownedLockKey === effectiveKey && hasSameLockOwner(lock, ownedLock);
-            if (!exactOwner) {
-                if (ownedLockKey === effectiveKey) {
-                    ownedLockKey = undefined;
-                    ownedLock = undefined;
+        commitIfOwned: (commit) => !deliveryRevoked &&
+            transactOwners((locks) => {
+                const effectiveKey = resolveEffectiveKey();
+                const lock = parseTelegramLockEntry(locks[effectiveKey]);
+                const exactOwner = ownedLockKey === effectiveKey && hasSameLockOwner(lock, ownedLock);
+                if (!exactOwner) {
+                    if (ownedLockKey === effectiveKey) {
+                        ownedLockKey = undefined;
+                        ownedLock = undefined;
+                    }
+                    return { result: false, changed: false };
                 }
-                return { result: false, changed: false };
-            }
-            commit();
-            // External-file commits may retain an independent effect; never acknowledge under a changed unified owner.
-            const current = !statePath || (!deliveryRevoked && hasSameLockOwner(parseTelegramLockEntry(readOwners()[effectiveKey]), ownedLock));
-            return { result: current, changed: false };
-        }),
+                commit();
+                // External-file commits may retain an independent effect; never acknowledge under a changed unified owner.
+                const current = !statePath ||
+                    (!deliveryRevoked &&
+                        hasSameLockOwner(parseTelegramLockEntry(readOwners()[effectiveKey]), ownedLock));
+                return { result: current, changed: false };
+            }),
         publishStateSectionIfOwned(section, mutate, publication) {
             if (section !== "workspace" && section !== "runtime")
                 throw new TelegramRuntimeStateError("invalid", "Telegram owner section publication is restricted to Workspace and runtime observations.");
             if (!statePath)
                 throw new TelegramRuntimeStateError("invalid", "Consolidated transport storage is not selected.");
             const profile = resolveEffectiveKey(), expected = ownedLock ? { ...ownedLock } : undefined;
-            if (publication.expectedScope && (publication.expectedScope.path !== statePath || publication.expectedScope.profile !== profile))
+            if (publication.expectedScope &&
+                (publication.expectedScope.path !== statePath ||
+                    publication.expectedScope.profile !== profile))
                 return { committed: false };
-            if (deliveryRevoked || ownedLockKey !== profile || !expected || !publication.isCurrent())
+            if (deliveryRevoked ||
+                ownedLockKey !== profile ||
+                !expected ||
+                !publication.isCurrent())
                 return { committed: false };
-            const isCurrent = () => !deliveryRevoked && resolveEffectiveKey() === profile && ownedLockKey === profile &&
-                hasSameLockOwner(ownedLock, expected) && publication.isCurrent() &&
+            const isCurrent = () => !deliveryRevoked &&
+                resolveEffectiveKey() === profile &&
+                ownedLockKey === profile &&
+                hasSameLockOwner(ownedLock, expected) &&
+                publication.isCurrent() &&
                 hasSameLockOwner(parseTelegramLockEntry(readOwners()[profile]), expected);
             if (!isCurrent())
                 return { committed: false };
@@ -1131,40 +1304,62 @@ export function createTelegramLockRuntime(options = {}) {
                 if (!hasSameLockOwner(parseTelegramLockEntry(observed.transport), expected))
                     return { value: current, result: { committed: false } };
                 const outcome = mutate(current, observed);
-                return { value: outcome.value, result: { committed: true, result: outcome.result } };
+                return {
+                    value: outcome.value,
+                    result: { committed: true, result: outcome.result },
+                };
             }, { ...publication, isCurrent });
         },
-        refresh: (ctx) => !deliveryRevoked && transactOwners((locks) => {
-            const effectiveKey = resolveEffectiveKey();
-            const lock = parseTelegramLockEntry(locks[effectiveKey]);
-            const expectedOwner = adoptCompatibleOwnedLock(effectiveKey, lock, ctx);
-            if (!lock || !hasSameLockOwner(lock, expectedOwner)) {
-                if (ownedLockKey === effectiveKey) {
-                    ownedLockKey = undefined;
-                    ownedLock = undefined;
-                }
-                return { result: false, changed: false };
-            }
-            if (!options.instanceId)
-                return { result: true, changed: false };
-            const refreshedLock = {
-                pid: lock.pid,
-                ...(lock.cwd ? { cwd: lock.cwd } : {}),
-                instanceId: options.instanceId,
-                heartbeatMs: getNowMs(),
-                leaderEpoch: lock.leaderEpoch ?? options.mintLeaderEpoch?.() ?? randomUUID(),
-                runtimeGeneration: lock.runtimeGeneration ?? runtimeGeneration,
-                ...(options.busSocketPath
-                    ? { busSocketPath: options.busSocketPath }
-                    : {}),
-                busSecret: options.busSecret ?? lock.busSecret,
-                ...(lock.journalPath ? { journalPath: lock.journalPath } : {}),
+        refresh: (ctx) => {
+            if (deliveryRevoked)
+                return false;
+            // Owner fields only, never a timestamp: liveness is proven over the bus, so an exact owner needs no write.
+            const refreshedEntry = (lock) => {
+                const busSecret = options.busSecret ?? lock.busSecret;
+                return {
+                    pid: lock.pid,
+                    ...(lock.cwd ? { cwd: lock.cwd } : {}),
+                    instanceId: options.instanceId,
+                    leaderEpoch: lock.leaderEpoch ?? options.mintLeaderEpoch?.() ?? randomUUID(),
+                    runtimeGeneration: lock.runtimeGeneration ?? runtimeGeneration,
+                    ...(options.busSocketPath
+                        ? { busSocketPath: options.busSocketPath }
+                        : {}),
+                    ...(busSecret !== undefined ? { busSecret } : {}),
+                    ...(lock.journalPath ? { journalPath: lock.journalPath } : {}),
+                };
             };
-            locks[effectiveKey] = refreshedLock;
-            ownedLockKey = effectiveKey;
-            ownedLock = refreshedLock;
-            return { result: true, changed: true };
-        }),
+            // Parsed entries carry explicit `undefined` fields; compare only the published ones.
+            const isCurrentEntry = (lock) => lock.leaderEpoch !== undefined &&
+                isDeepStrictEqual(Object.fromEntries(Object.entries(lock).filter(([, value]) => value !== undefined)), refreshedEntry(lock));
+            const effectiveKey = resolveEffectiveKey();
+            const observed = readLock();
+            if (observed &&
+                hasSameLockOwner(observed, adoptCompatibleOwnedLock(effectiveKey, observed, ctx)) &&
+                (!options.instanceId || isCurrentEntry(observed))) {
+                return true;
+            }
+            return transactOwners((locks) => {
+                const lock = parseTelegramLockEntry(locks[effectiveKey]);
+                const expectedOwner = adoptCompatibleOwnedLock(effectiveKey, lock, ctx);
+                if (!lock || !hasSameLockOwner(lock, expectedOwner)) {
+                    if (ownedLockKey === effectiveKey) {
+                        ownedLockKey = undefined;
+                        ownedLock = undefined;
+                    }
+                    return { result: false, changed: false };
+                }
+                if (!options.instanceId)
+                    return { result: true, changed: false };
+                if (isCurrentEntry(lock))
+                    return { result: true, changed: false };
+                const refreshedLock = refreshedEntry(lock);
+                locks[effectiveKey] = refreshedLock;
+                ownedLockKey = effectiveKey;
+                ownedLock = refreshedLock;
+                return { result: true, changed: true };
+            });
+        },
     };
 }
 export function createTelegramLockOwnershipGuard(lock) {
@@ -1223,7 +1418,9 @@ export function createTelegramLockedPollingRuntime(deps) {
             }
             await deps.stopPolling();
             // Unsettled starts, overlapping stops or stale completion cannot certify quiescence.
-            if (generation === pollingGeneration && suspensionsInFlight === 1 && startupsInFlight === 0) {
+            if (generation === pollingGeneration &&
+                suspensionsInFlight === 1 &&
+                startupsInFlight === 0) {
                 suspendedGeneration = generation;
             }
         }
@@ -1253,7 +1450,8 @@ export function createTelegramLockedPollingRuntime(deps) {
             let owned = false;
             let failure;
             try {
-                owned = deps.lock.owns(owner);
+                // A lock-free miss can be a strict read racing an atomic replace; refresh confirms through the serialized path.
+                owned = deps.lock.owns(owner) || deps.lock.refresh(owner);
             }
             catch (error) {
                 failure = error;
@@ -1400,6 +1598,9 @@ export function createTelegramLockedPollingRuntime(deps) {
                 expectedOwner: options.election?.expectedOwner ??
                     (options.force ? takeoverCandidate : undefined),
                 election: options.election !== undefined,
+                unresponsiveOwner: options.election?.unresponsive
+                    ? options.election.expectedOwner
+                    : undefined,
             });
             if (!acquired.ok && !options.election) {
                 const currentState = deps.lock.getState();
@@ -1442,22 +1643,33 @@ export function createTelegramLockedPollingRuntime(deps) {
                         });
                     }
                     if (failureMessage) {
-                        const owner = formatTelegramLockEntry(acquired.lock);
-                        return {
-                            ok: false,
-                            canTakeover: false,
-                            owner,
-                            message: `Telegram bridge is active in another Pi instance (${owner}); follower registration failed: ${formatTelegramFollowerRegistrationFailure(failureMessage)}.`,
-                        };
+                        const unresponsiveOwner = acquired.lock;
+                        if (deps.proveOwnerUnresponsive &&
+                            (await deps.proveOwnerUnresponsive(unresponsiveOwner))) {
+                            if (!isCurrent())
+                                return cancelled;
+                            acquired = deps.lock.acquire(ctx, { unresponsiveOwner });
+                        }
+                        if (!acquired.ok) {
+                            const owner = formatTelegramLockEntry(acquired.lock);
+                            return {
+                                ok: false,
+                                canTakeover: false,
+                                owner,
+                                message: `Telegram bridge is active in another Pi instance (${owner}); follower registration failed: ${formatTelegramFollowerRegistrationFailure(failureMessage)}.`,
+                            };
+                        }
                     }
                 }
-                const owner = formatTelegramLockEntry(acquired.lock);
-                return {
-                    ok: false,
-                    canTakeover: true,
-                    owner,
-                    message: `Telegram bridge is active in another Pi instance (${owner}).`,
-                };
+                if (!acquired.ok) {
+                    const owner = formatTelegramLockEntry(acquired.lock);
+                    return {
+                        ok: false,
+                        canTakeover: true,
+                        owner,
+                        message: `Telegram bridge is active in another Pi instance (${owner}).`,
+                    };
+                }
             }
             takeoverCandidate = undefined;
             if (!(await runOwnedPollingStart(ctx, options, isCurrent))) {
@@ -1492,12 +1704,18 @@ export function createTelegramLockedPollingRuntime(deps) {
         suspend: suspendPolling,
         captureTransportAuthority(ctx) {
             const generation = pollingGeneration;
-            const current = () => generation === pollingGeneration && activeContext === ctx && !ownershipStop &&
-                (deps.isContextCurrent?.(ctx) ?? true) && deps.lock.owns(snapshotLockContext(ctx));
+            const current = () => generation === pollingGeneration &&
+                activeContext === ctx &&
+                !ownershipStop &&
+                (deps.isContextCurrent?.(ctx) ?? true) &&
+                deps.lock.owns(snapshotLockContext(ctx));
             return current() ? current : undefined;
         },
         isSuspended: () => suspendedGeneration === pollingGeneration &&
-            suspensionsInFlight === 0 && startupsInFlight === 0 && !sessionAutoStartRun && !ownershipStop,
+            suspensionsInFlight === 0 &&
+            startupsInFlight === 0 &&
+            !sessionAutoStartRun &&
+            !ownershipStop,
         onPersistentConflict: async (ctx, count) => {
             if (activeContext === undefined || ownershipStop)
                 return;
@@ -1524,13 +1742,17 @@ export function createTelegramLockedPollingRuntime(deps) {
             }
             ownershipStop = Promise.resolve()
                 .then(() => deps.stopPolling())
-                .catch((error) => { cleanupErrors.push(String(error)); })
+                .catch((error) => {
+                cleanupErrors.push(String(error));
+            })
                 .finally(() => {
                 ownershipStop = undefined;
                 deps.recordRuntimeEvent?.("polling", ownership === "lost"
                     ? "Telegram transport stopped: local ownership lost; check for another Pi instance."
                     : "Telegram transport stopped: competing getUpdates client or ownership mismatch.", {
-                    phase: "persistent-conflict", count, ownership,
+                    phase: "persistent-conflict",
+                    count,
+                    ownership,
                     ...(cleanupErrors.length ? { cleanupErrors } : {}),
                 });
                 deps.updateStatus(ctx);
@@ -1572,7 +1794,8 @@ export function createTelegramLockedPollingRuntime(deps) {
                     await ownershipStop;
                 if (!isCurrent())
                     return;
-                if (canRestoreRememberedFollower && state?.kind === "active-elsewhere") {
+                if (canRestoreRememberedFollower &&
+                    state?.kind === "active-elsewhere") {
                     const restored = await deps.restoreFollowerWithOwner?.(ctx, state.lock);
                     if (!isCurrent())
                         return;

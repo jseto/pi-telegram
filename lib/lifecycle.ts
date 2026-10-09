@@ -6,10 +6,8 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { formatTelegramConnectionFailure } from "./status.ts";
+
 import * as BusFollower from "./bus-follower.ts";
-import * as Queue from "./queue.ts";
-import * as TextGroups from "./text-groups.ts";
 import type {
   AgentEndEvent,
   AgentSettledEvent,
@@ -31,24 +29,22 @@ import type {
   UIPromptEndEvent,
   UIPromptStartEvent,
 } from "./pi.ts";
-
-let resetTransportReplyDedupFn: (() => void) | undefined;
-
-export function setResetTransportReplyDedup(fn: () => void): void {
-  resetTransportReplyDedupFn = fn;
-}
+import * as Queue from "./queue.ts";
+import { formatTelegramConnectionFailure } from "./status.ts";
+import * as TextGroups from "./text-groups.ts";
 
 export function createAgentStartDedupHook(
   inner: (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void>,
+  resetReplyDedup: () => void,
   schedulePublication?: (task: () => Promise<void>) => void,
 ): (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void> {
   return async (event, ctx) => {
-    const reset = resetTransportReplyDedupFn;
-    if (reset) {
-      // A new turn must not erase the anchor of a final still ahead in the FIFO.
-      if (schedulePublication) schedulePublication(async () => { reset(); });
-      else reset();
-    }
+    // A new turn must not erase the anchor of a final still ahead in the FIFO.
+    if (schedulePublication)
+      schedulePublication(async () => {
+        resetReplyDedup();
+      });
+    else resetReplyDedup();
     return inner(event, ctx);
   };
 }
@@ -175,12 +171,18 @@ export interface TelegramConnectionHandoffStore {
 }
 const HANDOFF_KEY = Symbol.for("pi-telegram.connection-resume.v1");
 function processHandoffStore(): TelegramConnectionHandoffStore {
-  const globals = globalThis as unknown as Record<symbol, TelegramConnectionHandoffStore>;
-  return globals[HANDOFF_KEY] ??= {};
+  const globals = globalThis as unknown as Record<
+    symbol,
+    TelegramConnectionHandoffStore
+  >;
+  return (globals[HANDOFF_KEY] ??= {});
 }
 
 export interface TelegramConnectionLifecycle {
-  prepare(event: SessionStartEvent, ctx: ExtensionContext): (() => void) | undefined;
+  prepare(
+    event: SessionStartEvent,
+    ctx: ExtensionContext,
+  ): (() => void) | undefined;
   onSessionShutdown(event: SessionShutdownEvent, ctx: ExtensionContext): void;
 }
 
@@ -190,52 +192,81 @@ export function createTelegramConnectionLifecycle(deps: {
   isCurrent(ctx: ExtensionContext): boolean;
   getProfileName(): string | undefined;
   isConnected(): boolean;
-  activateProfile(profileName: string | undefined, isCurrent: () => boolean): Promise<boolean>;
+  activateProfile(
+    profileName: string | undefined,
+    isCurrent: () => boolean,
+  ): Promise<boolean>;
   start(ctx: ExtensionContext): Promise<{ ok: boolean; message?: string }>;
   recordError(error: unknown): void;
 }): TelegramConnectionLifecycle {
   return {
     onSessionShutdown(event, ctx) {
-      deps.intent.suspend({ reason: event.reason, cwd: ctx.cwd,
-        targetSessionFile: event.targetSessionFile, connected: deps.isConnected(),
-        profileName: deps.getProfileName() });
+      deps.intent.suspend({
+        reason: event.reason,
+        cwd: ctx.cwd,
+        targetSessionFile: event.targetSessionFile,
+        connected: deps.isConnected(),
+        profileName: deps.getProfileName(),
+      });
     },
     prepare(event, ctx) {
-      const intent = deps.intent.resume({ reason: event.reason, cwd: ctx.cwd,
-        sessionFile: event.reason === "resume" ? ctx.sessionManager.getSessionFile() : undefined });
+      const intent = deps.intent.resume({
+        reason: event.reason,
+        cwd: ctx.cwd,
+        sessionFile:
+          event.reason === "resume"
+            ? ctx.sessionManager.getSessionFile()
+            : undefined,
+      });
       if (!intent) return undefined;
       const generation = deps.getGeneration();
-      const isCurrent = () => deps.intent.isActive(intent.id) &&
-        generation === deps.getGeneration() && deps.isCurrent(ctx);
+      const isCurrent = () =>
+        deps.intent.isActive(intent.id) &&
+        generation === deps.getGeneration() &&
+        deps.isCurrent(ctx);
       return () => {
         // Startup remains extension-owned background work; no captured command ctx crosses resume.
         void (async () => {
           if (!isCurrent()) return;
-          if (!await deps.activateProfile(intent.profileName, isCurrent)) {
-            if (isCurrent()) ctx.ui.notify("Telegram profile unavailable. Run /telegram-setup.", "warning");
+          if (!(await deps.activateProfile(intent.profileName, isCurrent))) {
+            if (isCurrent())
+              ctx.ui.notify(
+                "Telegram profile unavailable. Run /telegram-setup.",
+                "warning",
+              );
             return;
           }
           if (!isCurrent()) return;
           const result = await deps.start(ctx);
           if (!isCurrent()) return;
           if (!result.ok) {
-            deps.recordError(new Error(result.message ?? "Telegram resume connection failed."));
-            ctx.ui.notify(formatTelegramConnectionFailure(result.message), "warning");
+            deps.recordError(
+              new Error(result.message ?? "Telegram resume connection failed."),
+            );
+            ctx.ui.notify(
+              formatTelegramConnectionFailure(result.message),
+              "warning",
+            );
           }
-        })().catch((error) => {
-          deps.recordError(error);
-          if (isCurrent()) ctx.ui.notify(formatTelegramConnectionFailure(error), "warning");
-        }).finally(() => deps.intent.finish(intent.id));
+        })()
+          .catch((error) => {
+            deps.recordError(error);
+            if (isCurrent())
+              ctx.ui.notify(formatTelegramConnectionFailure(error), "warning");
+          })
+          .finally(() => deps.intent.finish(intent.id));
       };
     },
   };
 }
 
-export function createTelegramConnectionIntentRuntime(options: {
-  store?: TelegramConnectionHandoffStore;
-  now?: () => number;
-  pid?: number;
-} = {}) {
+export function createTelegramConnectionIntentRuntime(
+  options: {
+    store?: TelegramConnectionHandoffStore;
+    now?: () => number;
+    pid?: number;
+  } = {},
+) {
   const store = options.store ?? processHandoffStore();
   const now = options.now ?? Date.now;
   const pid = options.pid ?? process.pid;
@@ -263,22 +294,45 @@ export function createTelegramConnectionIntentRuntime(options: {
       connected: boolean;
       profileName?: string;
     }): void {
-      const intent = active ?? (input.connected
-        ? { id: randomUUID(), cwd: input.cwd, profileName: input.profileName }
-        : undefined);
+      const intent =
+        active ??
+        (input.connected
+          ? { id: randomUUID(), cwd: input.cwd, profileName: input.profileName }
+          : undefined);
       active = undefined;
-      store.pending = input.reason === "resume" && input.targetSessionFile &&
-          intent?.cwd === input.cwd
-        ? { ...intent, pid, targetSessionFile: input.targetSessionFile, expiresAtMs: now() + 30_000 }
-        : undefined;
+      store.pending =
+        input.reason === "resume" &&
+        input.targetSessionFile &&
+        intent?.cwd === input.cwd
+          ? {
+              ...intent,
+              pid,
+              targetSessionFile: input.targetSessionFile,
+              expiresAtMs: now() + 30_000,
+            }
+          : undefined;
     },
-    resume(input: { reason: string; cwd: string; sessionFile?: string }): TelegramConnectionIntent | undefined {
+    resume(input: {
+      reason: string;
+      cwd: string;
+      sessionFile?: string;
+    }): TelegramConnectionIntent | undefined {
       const handoff = store.pending;
       store.pending = undefined;
-      if (!handoff || handoff.pid !== pid || now() >= handoff.expiresAtMs ||
-          input.reason !== "resume" || input.cwd !== handoff.cwd ||
-          input.sessionFile !== handoff.targetSessionFile) return undefined;
-      active = { id: randomUUID(), cwd: handoff.cwd, profileName: handoff.profileName };
+      if (
+        !handoff ||
+        handoff.pid !== pid ||
+        now() >= handoff.expiresAtMs ||
+        input.reason !== "resume" ||
+        input.cwd !== handoff.cwd ||
+        input.sessionFile !== handoff.targetSessionFile
+      )
+        return undefined;
+      active = {
+        id: randomUUID(),
+        cwd: handoff.cwd,
+        profileName: handoff.profileName,
+      };
       return { ...active };
     },
   };
@@ -394,7 +448,9 @@ export interface TelegramBridgeSessionServiceRuntime {
   capabilityMonitor: { start(ctx: ExtensionContext): void; stop(): void };
   queueWatchdog: { start(ctx: ExtensionContext): void; stop(): void };
   guestPlaceholder?: { stopAll(): void };
-  prepareThreadPreservationOnQuit?: (isSessionCurrent: () => boolean) => (() => Promise<void>) | undefined;
+  prepareThreadPreservationOnQuit?: (
+    isSessionCurrent: () => boolean,
+  ) => (() => Promise<void>) | undefined;
 }
 
 export interface TelegramBridgeSessionLifecycleAssemblyDeps<
@@ -482,7 +538,8 @@ export function createTelegramBridgeSessionLifecycleDeps<
       capabilityMonitor: ports.services.capabilityMonitor,
       queueWatchdog: ports.services.queueWatchdog,
       guestPlaceholder: ports.services.guestPlaceholder,
-      prepareThreadPreservationOnQuit: ports.services.prepareThreadPreservationOnQuit,
+      prepareThreadPreservationOnQuit:
+        ports.services.prepareThreadPreservationOnQuit,
     },
   };
 }
@@ -530,9 +587,12 @@ export function createTelegramBridgeSessionLifecycleAssembly<
       let preserveThread: (() => Promise<void>) | undefined;
       if (event.reason === "quit") {
         try {
-          preserveThread = deps.services.prepareThreadPreservationOnQuit?.(isCurrent);
+          preserveThread =
+            deps.services.prepareThreadPreservationOnQuit?.(isCurrent);
         } catch (error) {
-          deps.follower.recordRuntimeEvent("session", error, { phase: "preserve-thread-on-quit" });
+          deps.follower.recordRuntimeEvent("session", error, {
+            phase: "preserve-thread-on-quit",
+          });
         }
       }
       deps.services.guestPlaceholder?.stopAll();
@@ -547,7 +607,9 @@ export function createTelegramBridgeSessionLifecycleAssembly<
       try {
         await preserveThread?.();
       } catch (error) {
-        deps.follower.recordRuntimeEvent("session", error, { phase: "preserve-thread-on-quit" });
+        deps.follower.recordRuntimeEvent("session", error, {
+          phase: "preserve-thread-on-quit",
+        });
       }
     },
   };
@@ -623,6 +685,13 @@ export function createTelegramCompactionObserverRuntime<TContext>(
     clearTimer(fallbackTimer);
     fallbackTimer = undefined;
   };
+  // Stop only a typing loop this observer started; a pre-existing agent-owned loop is preserved.
+  const releaseCompactionPresence = (ctx: TContext): void => {
+    deps.setCompactionInProgress(false);
+    if (typingStartedByObserver) deps.stopTypingLoop?.();
+    typingStartedByObserver = false;
+    deps.updateStatus(ctx);
+  };
   const requestDispatch = (): void => {
     deps.requestDeferredDispatchNextQueuedTelegramTurn(
       deps.dispatchNextQueuedTelegramTurn,
@@ -643,10 +712,7 @@ export function createTelegramCompactionObserverRuntime<TContext>(
         observationGeneration += 1;
         fallbackTimer = undefined;
         if (deps.isContextActive && !deps.isContextActive(ctx)) return;
-        deps.setCompactionInProgress(false);
-        if (typingStartedByObserver) deps.stopTypingLoop?.();
-        typingStartedByObserver = false;
-        deps.updateStatus(ctx);
+        releaseCompactionPresence(ctx);
         deps.recordRuntimeEvent?.(
           "compact",
           new Error("Compaction observer timed out"),
@@ -659,19 +725,13 @@ export function createTelegramCompactionObserverRuntime<TContext>(
     onSessionCompact: (_event, ctx) => {
       if (deps.isContextActive && !deps.isContextActive(ctx)) return;
       clearFallbackTimer();
-      deps.setCompactionInProgress(false);
-      if (typingStartedByObserver) deps.stopTypingLoop?.();
-      typingStartedByObserver = false;
-      deps.updateStatus(ctx);
+      releaseCompactionPresence(ctx);
       requestDispatch();
     },
     onSessionCompactFailed: (_event, ctx) => {
       if (deps.isContextActive && !deps.isContextActive(ctx)) return;
       clearFallbackTimer();
-      deps.setCompactionInProgress(false);
-      if (typingStartedByObserver) deps.stopTypingLoop?.();
-      typingStartedByObserver = false;
-      deps.updateStatus(ctx);
+      releaseCompactionPresence(ctx);
       deps.onCompactionAbandoned?.();
       requestDispatch();
     },
@@ -727,16 +787,6 @@ export function createTelegramMessageActivityTypingHooks<
       handleMessageActivity("start", event, ctx, deps.onMessageStart),
     onMessageUpdate: (event, ctx) =>
       handleMessageActivity("update", event, ctx, deps.onMessageUpdate),
-  };
-}
-
-export function createDedupAgentStartHook(
-  dedup: { reset(): void },
-  inner: (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void>,
-): (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void> {
-  return async (event, ctx) => {
-    dedup.reset();
-    await inner(event, ctx);
   };
 }
 

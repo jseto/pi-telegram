@@ -5,10 +5,11 @@
  * successor recovery, and fenced one-shot deletion before durable slot reuse.
  */
 import { isDeepStrictEqual } from "node:util";
-import { areTelegramTargetsEqual as sameTarget } from "./target.js";
+import { areTelegramTargetsEqual as sameTarget, } from "./target.js";
 import { getTelegramApiErrorRequestTarget, isTelegramApiRequestRejected, } from "./telegram-api.js";
-import { planTelegramWorkspaceSlotAllocation, TelegramWorkspaceSlotUnavailableError, } from "./workspace-slots.js";
+import { isTelegramTopicDeletedErrorMessage } from "./thread-reconciler.js";
 import { createTelegramWorkspaceAdmissionOperationId, isTelegramWorkspaceRetirementFence, runWithTelegramWorkspaceAdmissionsAsync, } from "./workspace-admission.js";
+import { planTelegramWorkspaceSlotAllocation, TelegramWorkspaceSlotUnavailableError, } from "./workspace-slots.js";
 export function createTelegramWorkspaceOperationGate() {
     let tail = Promise.resolve();
     return {
@@ -56,8 +57,12 @@ export function captureTelegramWorkspaceJournalProtectionSources(input) {
             const snapshot = input.withJournalReference
                 ? input.withJournalReference(binding, read)
                 : read();
-            sources.push({ kind: "available", scope, entries: snapshot.entries,
-                ...(snapshot.exists === undefined ? {} : { exists: snapshot.exists }) });
+            sources.push({
+                kind: "available",
+                scope,
+                entries: snapshot.entries,
+                ...(snapshot.exists === undefined ? {} : { exists: snapshot.exists }),
+            });
         }
         catch {
             complete = false;
@@ -73,8 +78,12 @@ export function captureTelegramWorkspaceJournalProtectionSources(input) {
         }, input.createFollowerResolver(journalBindingKey));
     }
     for (const source of input.binding.journalSources ?? []) {
-        capture({ kind: "binding", bindingKey: input.binding.bindingKey,
-            journalBindingKey: source.recipientBindingKey, sessionId: source.sessionId }, input.createSessionResolver?.(source.recipientBindingKey, source.sessionId) ?? (() => undefined));
+        capture({
+            kind: "binding",
+            bindingKey: input.binding.bindingKey,
+            journalBindingKey: source.recipientBindingKey,
+            sessionId: source.sessionId,
+        }, input.createSessionResolver?.(source.recipientBindingKey, source.sessionId) ?? (() => undefined));
     }
     for (const path of input.discovery?.paths ?? []) {
         capture({ kind: "discovered", path }, input.discovery.createResolver(path));
@@ -89,9 +98,10 @@ function getJournalUpdateTarget(update) {
         return undefined;
     const direct = record.message ?? record.edited_message ?? record.guest_message;
     const callback = record.callback_query;
-    const message = direct ?? (callback && typeof callback === "object" && !Array.isArray(callback)
-        ? callback.message
-        : undefined);
+    const message = direct ??
+        (callback && typeof callback === "object" && !Array.isArray(callback)
+            ? callback.message
+            : undefined);
     if (!message || typeof message !== "object" || Array.isArray(message))
         return undefined;
     const messageRecord = message;
@@ -121,7 +131,9 @@ export function resolveTelegramWorkspaceAcceptedWorkProtection(input) {
             unknown = true;
             continue;
         }
-        if (input.requireBindingProvenance && source.scope.kind === "binding" && source.exists === false) {
+        if (input.requireBindingProvenance &&
+            source.scope.kind === "binding" &&
+            source.exists === false) {
             unknown = true;
             continue;
         }
@@ -166,37 +178,49 @@ export async function pruneTelegramWorkspaceJournalEvidence(input) {
         const keys = input.binding.journalBindingKeys ?? [];
         const sessions = input.binding.journalSources ?? [];
         const expected = [
-            ...keys.map(key => address(key)),
-            ...sessions.map(source => address(source.recipientBindingKey, source.sessionId)),
+            ...keys.map((key) => address(key)),
+            ...sessions.map((source) => address(source.recipientBindingKey, source.sessionId)),
         ];
-        const shared = capture.sources.filter(source => source.scope.kind === "shared");
-        const bindingSources = capture.sources.filter(source => source.scope.kind === "binding" &&
+        const shared = capture.sources.filter((source) => source.scope.kind === "shared");
+        const bindingSources = capture.sources.filter((source) => source.scope.kind === "binding" &&
             source.scope.bindingKey === input.binding.bindingKey);
-        const sourceByAddress = new Map(bindingSources.flatMap(source => source.scope.kind === "binding"
-            ? [[address(source.scope.journalBindingKey, source.scope.sessionId), source]] : []));
-        if (!capture.complete || shared.length !== 1 || shared[0]?.kind !== "available" ||
-            bindingSources.length !== expected.length || sourceByAddress.size !== expected.length ||
-            expected.some(key => sourceByAddress.get(key)?.kind !== "available")) {
+        const sourceByAddress = new Map(bindingSources.flatMap((source) => source.scope.kind === "binding"
+            ? [
+                [
+                    address(source.scope.journalBindingKey, source.scope.sessionId),
+                    source,
+                ],
+            ]
+            : []));
+        if (!capture.complete ||
+            shared.length !== 1 ||
+            shared[0]?.kind !== "available" ||
+            bindingSources.length !== expected.length ||
+            sourceByAddress.size !== expected.length ||
+            expected.some((key) => sourceByAddress.get(key)?.kind !== "available")) {
             return { kind: "blocked", reason: "incomplete-evidence" };
         }
-        const empty = new Set(expected.filter(key => {
+        const empty = new Set(expected.filter((key) => {
             const source = sourceByAddress.get(key);
             return source?.kind === "available" && source.entries.length === 0;
         }));
         const emptyWriterKeys = new Set([
-            ...keys.filter(key => empty.has(address(key))),
-            ...sessions.filter(source => empty.has(address(source.recipientBindingKey, source.sessionId)))
-                .map(source => source.recipientBindingKey),
+            ...keys.filter((key) => empty.has(address(key))),
+            ...sessions
+                .filter((source) => empty.has(address(source.recipientBindingKey, source.sessionId)))
+                .map((source) => source.recipientBindingKey),
         ]);
-        const quiescent = new Set([...emptyWriterKeys].filter(key => input.getJournalWriterProtection(key) === "clear"));
-        const removedKeys = keys.filter(key => empty.has(address(key)) && quiescent.has(key));
-        const removedSources = sessions.filter(source => empty.has(address(source.recipientBindingKey, source.sessionId)) &&
+        const quiescent = new Set([...emptyWriterKeys].filter((key) => input.getJournalWriterProtection(key) === "clear"));
+        const removedKeys = keys.filter((key) => empty.has(address(key)) && quiescent.has(key));
+        const removedSources = sessions.filter((source) => empty.has(address(source.recipientBindingKey, source.sessionId)) &&
             quiescent.has(source.recipientBindingKey));
-        if (empty.size > 0 && removedKeys.length === 0 && removedSources.length === 0) {
+        if (empty.size > 0 &&
+            removedKeys.length === 0 &&
+            removedSources.length === 0) {
             return { kind: "blocked", reason: "writer-not-quiescent" };
         }
-        const retainedKeys = keys.filter(key => !removedKeys.includes(key));
-        const retainedSources = sessions.filter(source => !removedSources.includes(source));
+        const retainedKeys = keys.filter((key) => !removedKeys.includes(key));
+        const retainedSources = sessions.filter((source) => !removedSources.includes(source));
         if (!isCurrent()) {
             throw new Error("Telegram Workspace journal pruning lost leader authority.");
         }
@@ -213,8 +237,14 @@ export async function pruneTelegramWorkspaceJournalEvidence(input) {
         if (!isCurrent()) {
             throw new Error("Telegram Workspace journal pruning lost leader authority.");
         }
-        return { kind: "committed", binding, removedKeys,
-            ...(removedSources.length ? { removedSources: removedSources.map(source => ({ ...source })) } : {}) };
+        return {
+            kind: "committed",
+            binding,
+            removedKeys,
+            ...(removedSources.length
+                ? { removedSources: removedSources.map((source) => ({ ...source })) }
+                : {}),
+        };
     };
     return runWithTelegramWorkspaceAdmissionsAsync({
         ledger: input.admission,
@@ -252,7 +282,8 @@ export function captureTelegramWorkspaceExternalProtection(input) {
         // Unavailable queue or journal evidence must not clear accepted work.
     }
     try {
-        deliveryAuthority = input.getDeliveryAuthorityProtection?.(input.binding) ?? "unknown";
+        deliveryAuthority =
+            input.getDeliveryAuthorityProtection?.(input.binding) ?? "unknown";
     }
     catch {
         // Unavailable delivery evidence must not clear a binding.
@@ -263,24 +294,44 @@ export function captureTelegramWorkspaceExternalProtection(input) {
 export function createTelegramWorkspaceProtectionObserver(deps) {
     const captureJournalSources = (candidate) => {
         const namespace = deps.inspectJournalNamespace?.();
-        if (deps.inspectJournalNamespace && (!namespace || namespace.sources.filter(source => source.role === "polling").length !== 1))
+        if (deps.inspectJournalNamespace &&
+            (!namespace ||
+                namespace.sources.filter((source) => source.role === "polling")
+                    .length !== 1))
             throw new Error("Telegram strict namespace evidence is unavailable or incomplete.");
-        if (namespace?.retainedInputs?.some(original => original.state !== "committed"))
+        if (namespace?.retainedInputs?.some((original) => original.state !== "committed"))
             throw new Error("Telegram namespace contains uncommitted private retention evidence.");
         const discovery = namespace
-            ? { paths: namespace.sources.filter(source => source.role !== "polling" && source.evidence.kind === "present")
-                    .map(source => source.path), complete: true }
-            : candidate.journalBindingsComplete === true ? undefined : deps.discoverFollowerJournals?.();
+            ? {
+                paths: namespace.sources
+                    .filter((source) => source.role !== "polling" &&
+                    source.evidence.kind === "present")
+                    .map((source) => source.path),
+                complete: true,
+            }
+            : candidate.journalBindingsComplete === true
+                ? undefined
+                : deps.discoverFollowerJournals?.();
         if (namespace && !deps.createJournalPathResolver)
             throw new Error("Telegram strict namespace protection requires discovered source resolution.");
         return captureTelegramWorkspaceJournalProtectionSources({
             binding: candidate,
             resolveLeader: deps.resolveLeaderJournal,
             createFollowerResolver: deps.createFollowerJournalResolver,
-            ...(deps.createSessionJournalResolver ? { createSessionResolver: deps.createSessionJournalResolver } : {}),
-            ...(deps.withJournalReference ? { withJournalReference: deps.withJournalReference } : {}),
+            ...(deps.createSessionJournalResolver
+                ? { createSessionResolver: deps.createSessionJournalResolver }
+                : {}),
+            ...(deps.withJournalReference
+                ? { withJournalReference: deps.withJournalReference }
+                : {}),
             ...(discovery && deps.createJournalPathResolver
-                ? { discovery: { ...discovery, createResolver: deps.createJournalPathResolver } } : {}),
+                ? {
+                    discovery: {
+                        ...discovery,
+                        createResolver: deps.createJournalPathResolver,
+                    },
+                }
+                : {}),
         });
     };
     const capture = function (binding, options) {
@@ -288,14 +339,17 @@ export function createTelegramWorkspaceProtectionObserver(deps) {
             binding,
             requireBindingProvenance: options?.requireBindingProvenance,
             getLiveOwnerProtection(candidate) {
-                if (deps.listFollowers().some((follower) => !!follower.target && sameTarget(follower.target, candidate.target)))
+                if (deps
+                    .listFollowers()
+                    .some((follower) => !!follower.target &&
+                    sameTarget(follower.target, candidate.target)))
                     return "protected";
                 if (!deps.getJournalWriterProtection)
                     return "unknown";
                 let unknown = candidate.journalBindingsComplete !== true;
                 const writerKeys = new Set([
                     ...(candidate.journalBindingKeys ?? []),
-                    ...(candidate.journalSources ?? []).map(source => source.recipientBindingKey),
+                    ...(candidate.journalSources ?? []).map((source) => source.recipientBindingKey),
                 ]);
                 for (const journalBindingKey of writerKeys) {
                     const protection = deps.getJournalWriterProtection(journalBindingKey);
@@ -323,12 +377,17 @@ export function createTelegramWorkspaceProtectionObserver(deps) {
             },
             captureJournalSources,
             ...(deps.getDeliveryAuthorityProtection
-                ? { getDeliveryAuthorityProtection: deps.getDeliveryAuthorityProtection }
+                ? {
+                    getDeliveryAuthorityProtection: deps.getDeliveryAuthorityProtection,
+                }
                 : {}),
         });
     };
-    return { capture, captureJournalSources,
-        getJournalWriterProtection: deps.getJournalWriterProtection ?? (() => "unknown") };
+    return {
+        capture,
+        captureJournalSources,
+        getJournalWriterProtection: deps.getJournalWriterProtection ?? (() => "unknown"),
+    };
 }
 /** Callable protection view retained for callers that need no metadata observation ports. */
 export function createTelegramWorkspaceExternalProtectionCapture(deps) {
@@ -341,7 +400,10 @@ export function createTelegramWorkspaceJournalEvidencePruner(deps) {
             return { kind: "blocked", reason: "state-changed" };
         const profileKey = admission.getProfileKey();
         return pruneTelegramWorkspaceJournalEvidence({
-            store: deps.store, binding, admission, runExclusive: deps.runExclusive,
+            store: deps.store,
+            binding,
+            admission,
+            runExclusive: deps.runExclusive,
             capture: () => deps.protection.captureJournalSources(binding),
             getJournalWriterProtection: deps.protection.getJournalWriterProtection,
             getLeaderEpoch: deps.getLeaderEpoch,
@@ -351,7 +413,9 @@ export function createTelegramWorkspaceJournalEvidencePruner(deps) {
     };
 }
 export function isCurrentTelegramWorkspaceBinding(store, expected) {
-    return store.listWorkspaceBindings().some((binding) => isDeepStrictEqual(binding, expected));
+    return store
+        .listWorkspaceBindings()
+        .some((binding) => isDeepStrictEqual(binding, expected));
 }
 /**
  * Demand-only preparation for pressure retirement. Every removed group is still
@@ -380,7 +444,8 @@ export function createTelegramWorkspaceDeadOwnerQueueReclaimer(deps) {
         if (binding.journalSources?.length && !deps.createSessionJournalResolver)
             return { kind: "blocked", reason: "incomplete-source" };
         const initial = deps.getExternalProtection(binding);
-        if (initial.liveOwner !== "clear" || initial.deliveryAuthority !== "clear") {
+        if (initial.liveOwner !== "clear" ||
+            initial.deliveryAuthority !== "clear") {
             return { kind: "blocked", reason: "live-owner" };
         }
         if (localProtection(binding) !== "clear") {
@@ -437,29 +502,35 @@ export function createTelegramWorkspaceDeadOwnerQueueReclaimer(deps) {
                     const target = getJournalUpdateTarget(entry.update);
                     return !!target && sameTarget(target, binding.target);
                 });
-            if (source.scope === "binding" && relevant.some((entry) => {
-                const target = getJournalUpdateTarget(entry.update);
-                return !target || !sameTarget(target, binding.target);
-            }))
+            if (source.scope === "binding" &&
+                relevant.some((entry) => {
+                    const target = getJournalUpdateTarget(entry.update);
+                    return !target || !sameTarget(target, binding.target);
+                }))
                 return { kind: "blocked", reason: "unsupported-custody" };
             const seen = new Set();
             for (const entry of relevant) {
                 if (entry.state !== "queued" ||
                     (entry.queueKind !== "prompt" && entry.queueKind !== "control") ||
-                    !entry.queueReceiptId || !entry.queueOwner || entry.queueHandoff) {
+                    !entry.queueReceiptId ||
+                    !entry.queueOwner ||
+                    entry.queueHandoff) {
                     return { kind: "blocked", reason: "unsupported-custody" };
                 }
                 if (seen.has(entry.queueReceiptId))
                     continue;
                 const receiptEntries = source.entries.filter((candidate) => candidate.queueReceiptId === entry.queueReceiptId);
-                if (!receiptEntries.length || receiptEntries.some((candidate) => {
-                    const target = getJournalUpdateTarget(candidate.update);
-                    return candidate.state !== "queued" ||
-                        candidate.queueKind !== entry.queueKind ||
-                        !candidate.queueOwner || candidate.queueHandoff !== undefined ||
-                        !isDeepStrictEqual(candidate.queueOwner, entry.queueOwner) ||
-                        !target || !sameTarget(target, binding.target);
-                }))
+                if (!receiptEntries.length ||
+                    receiptEntries.some((candidate) => {
+                        const target = getJournalUpdateTarget(candidate.update);
+                        return (candidate.state !== "queued" ||
+                            candidate.queueKind !== entry.queueKind ||
+                            !candidate.queueOwner ||
+                            candidate.queueHandoff !== undefined ||
+                            !isDeepStrictEqual(candidate.queueOwner, entry.queueOwner) ||
+                            !target ||
+                            !sameTarget(target, binding.target));
+                    }))
                     return { kind: "blocked", reason: "unsupported-custody" };
                 seen.add(entry.queueReceiptId);
                 plans.push({
@@ -467,7 +538,9 @@ export function createTelegramWorkspaceDeadOwnerQueueReclaimer(deps) {
                     recovery: {
                         queueKind: entry.queueKind,
                         receiptId: entry.queueReceiptId,
-                        sourceUpdateIds: receiptEntries.map((candidate) => candidate.updateId).sort((a, b) => a - b),
+                        sourceUpdateIds: receiptEntries
+                            .map((candidate) => candidate.updateId)
+                            .sort((a, b) => a - b),
                         deadOwner: entry.queueOwner,
                         recoveryOwner: deps.getRecoveryOwner(),
                     },
@@ -481,7 +554,9 @@ export function createTelegramWorkspaceDeadOwnerQueueReclaimer(deps) {
             try {
                 liveness = deps.getQueueOwnerLiveness(plan.recovery.deadOwner);
             }
-            catch { /* Unknown process evidence is never destructive authority. */ }
+            catch {
+                /* Unknown process evidence is never destructive authority. */
+            }
             if (liveness === "alive")
                 return { kind: "blocked", reason: "owner-alive" };
             if (liveness !== "dead")
@@ -493,7 +568,8 @@ export function createTelegramWorkspaceDeadOwnerQueueReclaimer(deps) {
                 return { kind: "blocked", reason: "authority-changed" };
             }
             const current = deps.getExternalProtection(binding);
-            if (current.liveOwner !== "clear" || current.deliveryAuthority !== "clear") {
+            if (current.liveOwner !== "clear" ||
+                current.deliveryAuthority !== "clear") {
                 return { kind: "blocked", reason: "live-owner" };
             }
             if (localProtection(binding) !== "clear") {
@@ -509,7 +585,9 @@ export function createTelegramWorkspaceDeadOwnerQueueReclaimer(deps) {
                 try {
                     deps.onMutationError?.(error);
                 }
-                catch { /* Diagnostics are fail-open. */ }
+                catch {
+                    /* Diagnostics are fail-open. */
+                }
                 return { kind: "blocked", reason: "mutation-refused" };
             }
             if (result.status === "owner-alive") {
@@ -524,7 +602,8 @@ export function createTelegramWorkspaceDeadOwnerQueueReclaimer(deps) {
             return { kind: "blocked", reason: "authority-changed" };
         }
         const after = deps.getExternalProtection(binding);
-        if (after.liveOwner !== "clear" || after.acceptedWork !== "clear" ||
+        if (after.liveOwner !== "clear" ||
+            after.acceptedWork !== "clear" ||
             after.deliveryAuthority !== "clear") {
             return { kind: "blocked", reason: "protection-retained" };
         }
@@ -539,8 +618,10 @@ export async function adoptTelegramWorkspaceRetirementIntent(input) {
     return input.runExclusive(async () => {
         const leaderEpoch = input.getLeaderEpoch();
         const profileKey = input.getProfileKey();
-        const isCurrent = () => leaderEpoch !== undefined && input.getLeaderEpoch() === leaderEpoch &&
-            input.getProfileKey() === profileKey && input.isCurrent?.() !== false;
+        const isCurrent = () => leaderEpoch !== undefined &&
+            input.getLeaderEpoch() === leaderEpoch &&
+            input.getProfileKey() === profileKey &&
+            input.isCurrent?.() !== false;
         if (!isCurrent())
             throw new Error("Telegram Workspace retirement adoption requires current leader authority.");
         const intents = input.store.listWorkspaceRetirementIntents();
@@ -550,17 +631,23 @@ export async function adoptTelegramWorkspaceRetirementIntent(input) {
         if (input.intent.profileKey !== profileKey) {
             return { kind: "blocked", reason: "profile-changed" };
         }
-        const binding = input.store.listWorkspaceBindings().find((candidate) => candidate.bindingKey === input.intent.binding.bindingKey);
+        const binding = input.store
+            .listWorkspaceBindings()
+            .find((candidate) => candidate.bindingKey === input.intent.binding.bindingKey);
         if (!binding || !isDeepStrictEqual(binding, input.intent.binding)) {
             return { kind: "blocked", reason: "binding-changed" };
         }
-        const eligible = input.store.captureWorkspaceSlotOccupancy(input.getExternalProtection, { expectedRetirement: input.intent }).bindings.find((candidate) => candidate.bindingKey === binding.bindingKey)?.protection === "eligible";
+        const eligible = input.store
+            .captureWorkspaceSlotOccupancy(input.getExternalProtection, {
+            expectedRetirement: input.intent,
+        })
+            .bindings.find((candidate) => candidate.bindingKey === binding.bindingKey)?.protection === "eligible";
         if (!eligible)
             return { kind: "blocked", reason: "protection-changed" };
         const replacement = { ...input.intent, leaderEpoch: leaderEpoch };
         if (!isCurrent())
             throw new Error("Telegram Workspace retirement adoption lost leader authority.");
-        if (!await input.store.replaceWorkspaceRetirementIntent(input.intent, replacement, isCurrent))
+        if (!(await input.store.replaceWorkspaceRetirementIntent(input.intent, replacement, isCurrent)))
             return { kind: "blocked", reason: "commit-rejected" };
         return { kind: "adopted", intent: replacement };
     });
@@ -569,15 +656,9 @@ function isTelegramWorkspaceDeletionConfirmedAbsent(error) {
     if (!(error instanceof Error))
         return false;
     const status = "status" in error && typeof error.status === "number"
-        ? error.status : undefined;
-    if (status !== 400)
-        return false;
-    const message = error.message.toLowerCase();
-    return message.includes("topic_id_invalid") ||
-        message.includes("message thread not found") ||
-        message.includes("thread not found") ||
-        message.includes("topic not found") ||
-        message.includes("topic deleted");
+        ? error.status
+        : undefined;
+    return status === 400 && isTelegramTopicDeletedErrorMessage(error.message);
 }
 function matchesTelegramWorkspaceRetirementFence(fence, intent) {
     return (fence.retirementIntentId === intent.id &&
@@ -590,22 +671,34 @@ function matchesTelegramWorkspaceRetirementFence(fence, intent) {
 }
 async function cancelRejectedTelegramWorkspaceRetirement(input, retained) {
     const epoch = input.getLeaderEpoch();
-    const isCurrent = () => epoch !== undefined && input.getLeaderEpoch() === epoch &&
-        input.getProfileKey() === retained.profileKey && input.isCurrent?.() !== false;
+    const isCurrent = () => epoch !== undefined &&
+        input.getLeaderEpoch() === epoch &&
+        input.getProfileKey() === retained.profileKey &&
+        input.isCurrent?.() !== false;
     if (!isCurrent())
         return { kind: "retained", reason: "authority-changed" };
     if (retained.phase !== "deletion-rejected" ||
-        (retained.destructiveKind ?? "pressure-retirement") !== "pressure-retirement") {
+        (retained.destructiveKind ?? "pressure-retirement") !==
+            "pressure-retirement") {
         return { kind: "retained", reason: "fence-conflict" };
     }
     const owner = input.admission.getOwner();
     const fence = retained.leaderEpoch === epoch && isDeepStrictEqual(retained.owner, owner)
-        ? retained : input.admission.adoptRetirementFence(retained, { owner, leaderEpoch: epoch });
+        ? retained
+        : input.admission.adoptRetirementFence(retained, {
+            owner,
+            leaderEpoch: epoch,
+        });
     if (fence.phase !== "deletion-rejected")
         return { kind: "retained", reason: "fence-conflict" };
-    const bindingRetained = () => input.store.listWorkspaceBindings().some(binding => binding.bindingKey === fence.bindingKey && binding.slot === fence.slot && sameTarget(binding.target, fence.target));
+    const bindingRetained = () => input.store
+        .listWorkspaceBindings()
+        .some((binding) => binding.bindingKey === fence.bindingKey &&
+        binding.slot === fence.slot &&
+        sameTarget(binding.target, fence.target));
     const intents = input.store.listWorkspaceRetirementIntents();
-    if (!bindingRetained() || intents.length > 1 ||
+    if (!bindingRetained() ||
+        intents.length > 1 ||
         (intents[0] && !matchesTelegramWorkspaceRetirementFence(fence, intents[0]))) {
         return { kind: "retained", reason: "stale-intent" };
     }
@@ -617,7 +710,8 @@ async function cancelRejectedTelegramWorkspaceRetirement(input, retained) {
     await input.store.persist();
     if (!isCurrent())
         return { kind: "retained", reason: "authority-changed" };
-    if (input.store.listWorkspaceRetirementIntents().length || !bindingRetained()) {
+    if (input.store.listWorkspaceRetirementIntents().length ||
+        !bindingRetained()) {
         return { kind: "retained", reason: "commit-rejected" };
     }
     try {
@@ -636,7 +730,8 @@ export async function executeTelegramWorkspaceRetirement(input) {
             input.isCurrent?.() !== false;
         if (!isCurrent())
             return { kind: "retained", reason: "authority-changed" };
-        if (!input.intent.binding.slot || !/^[A-Z]$/u.test(input.intent.binding.slot)) {
+        if (!input.intent.binding.slot ||
+            !/^[A-Z]$/u.test(input.intent.binding.slot)) {
             return { kind: "retained", reason: "stale-intent" };
         }
         const owner = input.admission.getOwner();
@@ -645,7 +740,8 @@ export async function executeTelegramWorkspaceRetirement(input) {
             return { kind: "retained", reason: "fence-conflict" };
         }
         let fence = storedFence;
-        if (fence && !matchesTelegramWorkspaceRetirementFence(fence, input.intent)) {
+        if (fence &&
+            !matchesTelegramWorkspaceRetirementFence(fence, input.intent)) {
             return { kind: "retained", reason: "fence-conflict" };
         }
         if (fence &&
@@ -660,9 +756,15 @@ export async function executeTelegramWorkspaceRetirement(input) {
         if (fence?.phase === "deletion-rejected") {
             return cancelRejectedTelegramWorkspaceRetirement({ ...input, isCurrent }, fence);
         }
-        const intent = input.store.listWorkspaceRetirementIntents().find((candidate) => isDeepStrictEqual(candidate, input.intent));
-        const binding = input.store.listWorkspaceBindings().find((candidate) => candidate.bindingKey === input.intent.binding.bindingKey);
-        if (!intent || !binding || !isDeepStrictEqual(binding, input.intent.binding)) {
+        const intent = input.store
+            .listWorkspaceRetirementIntents()
+            .find((candidate) => isDeepStrictEqual(candidate, input.intent));
+        const binding = input.store
+            .listWorkspaceBindings()
+            .find((candidate) => candidate.bindingKey === input.intent.binding.bindingKey);
+        if (!intent ||
+            !binding ||
+            !isDeepStrictEqual(binding, input.intent.binding)) {
             if (!intent && !binding && fence?.phase === "commit-ready") {
                 try {
                     input.admission.completeRetirementFence(fence);
@@ -686,7 +788,11 @@ export async function executeTelegramWorkspaceRetirement(input) {
             // publication while this stale local projection is removed.
             input.store.markStaleByTarget(binding.target, "deleted");
         }
-        const eligible = () => input.store.captureWorkspaceSlotOccupancy(input.getExternalProtection, { expectedRetirement: input.intent }).bindings.find((candidate) => candidate.bindingKey === input.intent.binding.bindingKey)?.protection === "eligible";
+        const eligible = () => input.store
+            .captureWorkspaceSlotOccupancy(input.getExternalProtection, {
+            expectedRetirement: input.intent,
+        })
+            .bindings.find((candidate) => candidate.bindingKey === input.intent.binding.bindingKey)?.protection === "eligible";
         if (!eligible())
             return { kind: "retained", reason: "protection-changed" };
         if (!fence) {
@@ -731,10 +837,14 @@ export async function executeTelegramWorkspaceRetirement(input) {
             catch (error) {
                 if (!isTelegramWorkspaceDeletionConfirmedAbsent(error)) {
                     const target = getTelegramApiErrorRequestTarget(error);
-                    if (target && sameTarget(target, binding.target) && isTelegramApiRequestRejected(error, "deleteForumTopic")) {
+                    if (target &&
+                        sameTarget(target, binding.target) &&
+                        isTelegramApiRequestRejected(error, "deleteForumTopic")) {
                         fence = input.admission.confirmRetirementRejection(fence);
                         const cancellation = await cancelRejectedTelegramWorkspaceRetirement({ ...input, isCurrent }, fence);
-                        return cancellation.kind === "cancelled" ? { kind: "retained", reason: "delete-rejected" } : cancellation;
+                        return cancellation.kind === "cancelled"
+                            ? { kind: "retained", reason: "delete-rejected" }
+                            : cancellation;
                     }
                     return { kind: "retained", reason: "delete-unconfirmed" };
                 }
@@ -755,7 +865,7 @@ export async function executeTelegramWorkspaceRetirement(input) {
         }
         if (!eligible())
             return { kind: "retained", reason: "protection-changed" };
-        if (!await input.store.commitWorkspaceRetirement(input.intent, isCurrent)) {
+        if (!(await input.store.commitWorkspaceRetirement(input.intent, isCurrent))) {
             return { kind: "retained", reason: "commit-rejected" };
         }
         try {
@@ -802,12 +912,15 @@ export async function prepareTelegramWorkspaceRetirement(deps) {
     }
     if (existing.length === 1) {
         const intent = existing[0];
-        const binding = deps.store.listWorkspaceBindings().find((candidate) => candidate.bindingKey === intent.binding.bindingKey);
+        const binding = deps.store
+            .listWorkspaceBindings()
+            .find((candidate) => candidate.bindingKey === intent.binding.bindingKey);
         const snapshot = deps.store.captureWorkspaceSlotOccupancy(deps.getExternalProtection, { expectedRetirement: intent });
         const candidate = snapshot.bindings.find((entry) => entry.bindingKey === intent.binding.bindingKey);
         if (intent.profileKey !== profileKey ||
             intent.leaderEpoch !== leaderEpoch ||
-            !binding || !isDeepStrictEqual(binding, intent.binding) ||
+            !binding ||
+            !isDeepStrictEqual(binding, intent.binding) ||
             candidate?.protection !== "eligible") {
             return { kind: "blocked", reason: "stale-intent" };
         }
@@ -824,7 +937,9 @@ export async function prepareTelegramWorkspaceRetirement(deps) {
     if (selection.kind !== "candidate")
         return selection;
     const selected = selection.candidate;
-    const binding = deps.store.listWorkspaceBindings().find((candidate) => candidate.bindingKey === selected.bindingKey);
+    const binding = deps.store
+        .listWorkspaceBindings()
+        .find((candidate) => candidate.bindingKey === selected.bindingKey);
     if (!binding?.slot ||
         binding.slot.toLowerCase() !== selected.slot ||
         binding.inactiveSinceMs !== selected.inactiveSinceMs) {
@@ -843,7 +958,11 @@ export async function prepareTelegramWorkspaceRetirement(deps) {
     if (!deps.store.upsertWorkspaceRetirementIntent(intent)) {
         return { kind: "blocked", reason: "state-changed" };
     }
-    const rechecked = deps.store.captureWorkspaceSlotOccupancy(deps.getExternalProtection, { expectedRetirement: intent }).bindings.find((candidate) => candidate.bindingKey === binding.bindingKey);
+    const rechecked = deps.store
+        .captureWorkspaceSlotOccupancy(deps.getExternalProtection, {
+        expectedRetirement: intent,
+    })
+        .bindings.find((candidate) => candidate.bindingKey === binding.bindingKey);
     if (rechecked?.protection !== "eligible" || !isCurrent()) {
         deps.store.removeWorkspaceRetirementIntent(intent);
         if (!isCurrent())
@@ -858,54 +977,81 @@ export async function prepareTelegramWorkspaceRetirement(deps) {
 export async function runTelegramWorkspaceRetirementLifecycle(input) {
     let intent = input.store.listWorkspaceRetirementIntents()[0];
     const retainedFence = input.admission.read().fence;
-    if (retainedFence && isTelegramWorkspaceRetirementFence(retainedFence) &&
+    if (retainedFence &&
+        isTelegramWorkspaceRetirementFence(retainedFence) &&
         retainedFence.phase === "deletion-rejected") {
         return input.runExclusive(() => cancelRejectedTelegramWorkspaceRetirement(input, retainedFence));
     }
-    if (!intent && retainedFence && isTelegramWorkspaceRetirementFence(retainedFence) &&
-        (retainedFence.destructiveKind ?? "pressure-retirement") === "pressure-retirement" &&
+    if (!intent &&
+        retainedFence &&
+        isTelegramWorkspaceRetirementFence(retainedFence) &&
+        (retainedFence.destructiveKind ?? "pressure-retirement") ===
+            "pressure-retirement" &&
         retainedFence.phase === "commit-ready") {
         return input.runExclusive(async () => {
             const epoch = input.getLeaderEpoch();
-            if (epoch === undefined || input.getProfileKey() !== retainedFence.profileKey ||
+            if (epoch === undefined ||
+                input.getProfileKey() !== retainedFence.profileKey ||
                 input.isCurrent?.() === false)
                 return { kind: "retained", reason: "authority-changed" };
             if (input.store.listWorkspaceRetirementIntents().length ||
-                input.store.listWorkspaceBindings().some((binding) => binding.bindingKey === retainedFence.bindingKey)) {
+                input.store
+                    .listWorkspaceBindings()
+                    .some((binding) => binding.bindingKey === retainedFence.bindingKey)) {
                 return { kind: "retained", reason: "stale-intent" };
             }
             const owner = input.admission.getOwner();
             const fence = retainedFence.leaderEpoch === epoch &&
-                isDeepStrictEqual(retainedFence.owner, owner) ? retainedFence :
-                input.admission.adoptRetirementFence(retainedFence, { owner, leaderEpoch: epoch });
+                isDeepStrictEqual(retainedFence.owner, owner)
+                ? retainedFence
+                : input.admission.adoptRetirementFence(retainedFence, {
+                    owner,
+                    leaderEpoch: epoch,
+                });
             input.admission.completeRetirementFence(fence);
-            return { kind: "retired", bindingKey: fence.bindingKey, slot: fence.slot };
+            return {
+                kind: "retired",
+                bindingKey: fence.bindingKey,
+                slot: fence.slot,
+            };
         });
     }
     if (intent) {
-        if (retainedFence && isTelegramWorkspaceRetirementFence(retainedFence) &&
+        if (retainedFence &&
+            isTelegramWorkspaceRetirementFence(retainedFence) &&
             retainedFence.phase === "commit-ready" &&
             matchesTelegramWorkspaceRetirementFence(retainedFence, intent)) {
             const resumed = await input.runExclusive(async () => {
                 const epoch = input.getLeaderEpoch();
                 const profileKey = input.getProfileKey();
-                const isCurrent = () => epoch !== undefined && input.getLeaderEpoch() === epoch &&
-                    input.getProfileKey() === profileKey && input.isCurrent?.() !== false;
+                const isCurrent = () => epoch !== undefined &&
+                    input.getLeaderEpoch() === epoch &&
+                    input.getProfileKey() === profileKey &&
+                    input.isCurrent?.() !== false;
                 if (!isCurrent() || intent.profileKey !== profileKey)
                     return undefined;
                 const intents = input.store.listWorkspaceRetirementIntents();
-                const binding = input.store.listWorkspaceBindings().find(candidate => candidate.bindingKey === intent.binding.bindingKey);
-                if (intents.length !== 1 || !isDeepStrictEqual(intents[0], intent) ||
-                    !binding || !isDeepStrictEqual(binding, intent.binding))
+                const binding = input.store
+                    .listWorkspaceBindings()
+                    .find((candidate) => candidate.bindingKey === intent.binding.bindingKey);
+                if (intents.length !== 1 ||
+                    !isDeepStrictEqual(intents[0], intent) ||
+                    !binding ||
+                    !isDeepStrictEqual(binding, intent.binding))
                     return undefined;
                 if (intent.leaderEpoch === epoch)
                     return intent;
                 const replacement = { ...intent, leaderEpoch: epoch };
-                return await input.store.replaceWorkspaceRetirementIntent(intent, replacement, isCurrent)
-                    ? replacement : undefined;
+                return (await input.store.replaceWorkspaceRetirementIntent(intent, replacement, isCurrent))
+                    ? replacement
+                    : undefined;
             });
             if (!resumed)
-                return { kind: "blocked", stage: "adoption", reason: "commit-rejected" };
+                return {
+                    kind: "blocked",
+                    stage: "adoption",
+                    reason: "commit-rejected",
+                };
             intent = resumed;
         }
         else {
@@ -936,7 +1082,11 @@ export async function runTelegramWorkspaceRetirementLifecycle(input) {
         if (preparation.kind === "not-needed")
             return preparation;
         if (preparation.kind === "blocked") {
-            return { kind: "blocked", stage: "preparation", reason: preparation.reason };
+            return {
+                kind: "blocked",
+                stage: "preparation",
+                reason: preparation.reason,
+            };
         }
         intent = preparation.intent;
     }
@@ -975,24 +1125,36 @@ export function createTelegramWorkspaceSlotRotation(input) {
                     if (!isCurrent())
                         throw new Error("Telegram Workspace rotation lost leader authority.");
                     return runTelegramWorkspaceRetirementLifecycle({
-                        store: input.store, admission, getExternalProtection: input.getExternalProtection,
-                        getLeaderEpoch: input.getLeaderEpoch, getProfileKey: () => profileKey, isCurrent,
+                        store: input.store,
+                        admission,
+                        getExternalProtection: input.getExternalProtection,
+                        getLeaderEpoch: input.getLeaderEpoch,
+                        getProfileKey: () => profileKey,
+                        isCurrent,
                         // This entire lifecycle already owns the shared gate, without an admission lease.
                         runExclusive: async (action) => action(),
                         deleteForumTopic(permit, body) {
                             return input.deleteThread(() => {
                                 const fence = admission.read().fence;
-                                if (!isCurrent() || !fence || !isTelegramWorkspaceRetirementFence(fence) ||
-                                    (fence.destructiveKind ?? "pressure-retirement") !== "pressure-retirement" ||
-                                    (permit.destructiveKind ?? "pressure-retirement") !== "pressure-retirement" ||
+                                if (!isCurrent() ||
+                                    !fence ||
+                                    !isTelegramWorkspaceRetirementFence(fence) ||
+                                    (fence.destructiveKind ?? "pressure-retirement") !==
+                                        "pressure-retirement" ||
+                                    (permit.destructiveKind ?? "pressure-retirement") !==
+                                        "pressure-retirement" ||
                                     fence.phase !== "deletion-issued" ||
                                     !isDeepStrictEqual(fence.owner, admission.getOwner()) ||
-                                    fence.profileKey !== permit.profileKey || fence.leaderEpoch !== permit.leaderEpoch ||
-                                    fence.operationId !== permit.operationId || fence.retirementIntentId !== permit.retirementIntentId ||
-                                    fence.bindingKey !== permit.bindingKey || fence.slot !== permit.slot ||
+                                    fence.profileKey !== permit.profileKey ||
+                                    fence.leaderEpoch !== permit.leaderEpoch ||
+                                    fence.operationId !== permit.operationId ||
+                                    fence.retirementIntentId !== permit.retirementIntentId ||
+                                    fence.bindingKey !== permit.bindingKey ||
+                                    fence.slot !== permit.slot ||
                                     fence.deletionIssuedAtMs !== permit.issuedAtMs ||
                                     !sameTarget(fence.target, permit.target) ||
-                                    body.chat_id !== permit.target.chatId || body.message_thread_id !== permit.target.threadId) {
+                                    body.chat_id !== permit.target.chatId ||
+                                    body.message_thread_id !== permit.target.threadId) {
                                     throw new Error("Telegram Workspace deletion permit is stale.");
                                 }
                                 return { ...permit.target };
@@ -1000,14 +1162,20 @@ export function createTelegramWorkspaceSlotRotation(input) {
                         },
                     });
                 });
-                if (result.kind !== "retired" && result.kind !== "not-needed" && result.kind !== "cancelled") {
+                if (result.kind !== "retired" &&
+                    result.kind !== "not-needed" &&
+                    result.kind !== "cancelled") {
                     throw new Error(`Telegram Workspace slots A-Z are unavailable; rotation blocked (${result.reason}).`);
                 }
                 if (result.kind === "retired") {
                     try {
-                        input.recordEvent("Telegram Workspace slot rotated.", { slot: result.slot });
+                        input.recordEvent("Telegram Workspace slot rotated.", {
+                            slot: result.slot,
+                        });
                     }
-                    catch { /* Diagnostics cannot turn completed retirement into another attempt. */ }
+                    catch {
+                        /* Diagnostics cannot turn completed retirement into another attempt. */
+                    }
                 }
                 if (!isCurrent())
                     throw new Error("Telegram Workspace rotation lost leader authority.");
@@ -1020,8 +1188,11 @@ export function createTelegramWorkspaceSlotRotation(input) {
                 return input.store.listWorkspaceRetirementIntents().length > 0;
             });
             const fence = admission.read().fence;
-            if (pending || (fence && isTelegramWorkspaceRetirementFence(fence) &&
-                (fence.destructiveKind ?? "pressure-retirement") === "pressure-retirement")) {
+            if (pending ||
+                (fence &&
+                    isTelegramWorkspaceRetirementFence(fence) &&
+                    (fence.destructiveKind ?? "pressure-retirement") ===
+                        "pressure-retirement")) {
                 const recovered = await rotate();
                 if (recovered.kind !== "cancelled")
                     return operation();
@@ -1038,32 +1209,47 @@ export function createTelegramWorkspaceSlotRotation(input) {
                         if (!isCurrent())
                             throw new Error("Telegram Workspace reclamation lost leader authority.");
                         const snapshot = input.store.captureWorkspaceSlotOccupancy(input.getExternalProtection);
-                        const allocation = planTelegramWorkspaceSlotAllocation({ ...snapshot, nowMs: Date.now() });
-                        if (allocation.kind === "free" || (allocation.kind === "blocked" && allocation.reason !== "protected-capacity"))
+                        const allocation = planTelegramWorkspaceSlotAllocation({
+                            ...snapshot,
+                            nowMs: Date.now(),
+                        });
+                        if (allocation.kind === "free" ||
+                            (allocation.kind === "blocked" &&
+                                allocation.reason !== "protected-capacity"))
                             return [];
                         if (allocation.kind === "reclaim" && !input.pruneJournalEvidence)
                             return [];
-                        return input.store.listWorkspaceBindings().filter((binding) => (allocation.kind !== "reclaim" || binding.bindingKey === allocation.candidate.bindingKey) &&
+                        return input.store
+                            .listWorkspaceBindings()
+                            .filter((binding) => (allocation.kind !== "reclaim" ||
+                            binding.bindingKey === allocation.candidate.bindingKey) &&
                             typeof binding.inactiveSinceMs === "number" &&
                             Number.isFinite(binding.inactiveSinceMs) &&
-                            binding.inactiveSinceMs >= 0).sort((left, right) => left.inactiveSinceMs - right.inactiveSinceMs ||
+                            binding.inactiveSinceMs >= 0)
+                            .sort((left, right) => left.inactiveSinceMs - right.inactiveSinceMs ||
                             (left.slot ?? "").localeCompare(right.slot ?? ""));
                     });
                     for (const original of candidates) {
                         let binding = original;
-                        if (input.pruneJournalEvidence && ((binding.journalBindingKeys?.length ?? 0) + (binding.journalSources?.length ?? 0) > 0)) {
+                        if (input.pruneJournalEvidence &&
+                            (binding.journalBindingKeys?.length ?? 0) +
+                                (binding.journalSources?.length ?? 0) >
+                                0) {
                             const pruned = await input.pruneJournalEvidence(binding, isCurrent);
                             if (!isCurrent())
                                 throw new Error("Telegram Workspace pruning lost leader authority.");
                             if (pruned.kind !== "committed")
                                 continue;
                             binding = pruned.binding;
-                            const removed = pruned.removedKeys.length + (pruned.removedSources?.length ?? 0);
+                            const removed = pruned.removedKeys.length +
+                                (pruned.removedSources?.length ?? 0);
                             if (removed > 0) {
                                 try {
                                     input.recordEvent("Telegram Workspace journal evidence pruned.", { slot: binding.slot, removed });
                                 }
-                                catch { /* Diagnostics cannot revoke a published metadata subset. */ }
+                                catch {
+                                    /* Diagnostics cannot revoke a published metadata subset. */
+                                }
                             }
                         }
                         if (!input.reclaimDeadOwnerQueuedWork)
@@ -1082,7 +1268,9 @@ export function createTelegramWorkspaceSlotRotation(input) {
                                     updateCount: reclaimed.updateIds.length,
                                 });
                             }
-                            catch { /* Diagnostics cannot revoke journal-owned recovery. */ }
+                            catch {
+                                /* Diagnostics cannot revoke journal-owned recovery. */
+                            }
                             break;
                         }
                     }

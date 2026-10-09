@@ -4,11 +4,13 @@
  * Owns thinking-menu text, reply markup, callback handling, and thinking-menu message rendering
  */
 
-import type {
-  TelegramMenuMessageRuntimeDeps,
-  TelegramMenuRenderPayload,
-  TelegramModelMenuState,
-  TelegramReplyMarkup,
+import {
+  editTelegramMenuMessage,
+  sendTelegramMenuMessage,
+  type TelegramMenuMessageRuntimeDeps,
+  type TelegramMenuRenderPayload,
+  type TelegramModelMenuState,
+  type TelegramReplyMarkup,
 } from "./menu-model.ts";
 import {
   isThinkingLevel,
@@ -45,44 +47,33 @@ function parseTelegramThinkingMenuCallbackAction(
   return { kind: "thinking:set", level: data.slice("thinking:set:".length) };
 }
 
-function applyTelegramMenuRenderPayload(
-  state: TelegramModelMenuState,
-  payload: TelegramMenuRenderPayload,
-): TelegramMenuRenderPayload {
-  state.mode = payload.nextMode;
-  return payload;
-}
-
-async function editTelegramMenuMessage(
-  state: TelegramModelMenuState,
-  payload: TelegramMenuRenderPayload,
-  deps: TelegramMenuMessageRuntimeDeps,
-): Promise<void> {
-  const appliedPayload = applyTelegramMenuRenderPayload(state, payload);
-  await deps.editInteractiveMessage(
-    state.chatId,
-    state.messageId,
-    appliedPayload.text,
-    appliedPayload.mode,
-    appliedPayload.replyMarkup,
-  );
-}
-
-function sendTelegramMenuMessage(
-  state: TelegramModelMenuState,
-  payload: TelegramMenuRenderPayload,
-  deps: TelegramMenuMessageRuntimeDeps,
-): Promise<number | undefined> {
-  const appliedPayload = applyTelegramMenuRenderPayload(state, payload);
-  return deps.sendInteractiveMessage(
-    state.chatId,
-    appliedPayload.text,
-    appliedPayload.mode,
-    appliedPayload.replyMarkup,
-    state.threadId !== undefined
-      ? { target: { chatId: state.chatId, threadId: state.threadId } }
-      : undefined,
-  );
+/** Answers and returns true when voice replies or a non-reasoning model disable thinking controls. */
+export async function refuseUnavailableTelegramThinkingControls(
+  callbackQueryId: string,
+  activeModel: MenuModel | undefined,
+  deps: {
+    answerCallbackQuery: (
+      callbackQueryId: string,
+      text?: string,
+    ) => Promise<void>;
+    isVoiceReplyActive?: () => boolean;
+  },
+): Promise<boolean> {
+  if (deps.isVoiceReplyActive?.()) {
+    await deps.answerCallbackQuery(
+      callbackQueryId,
+      "Thinking controls are disabled during voice replies",
+    );
+    return true;
+  }
+  if (!activeModel?.reasoning) {
+    await deps.answerCallbackQuery(
+      callbackQueryId,
+      "This model has no reasoning controls",
+    );
+    return true;
+  }
+  return false;
 }
 
 export async function handleTelegramThinkingMenuCallbackAction(
@@ -94,23 +85,17 @@ export async function handleTelegramThinkingMenuCallbackAction(
   const action = parseTelegramThinkingMenuCallbackAction(data);
   if (!action) return false;
   if (!isThinkingLevel(action.level)) {
-    await deps.answerCallbackQuery(callbackQueryId, "Invalid thinking level.");
+    await deps.answerCallbackQuery(callbackQueryId, "Invalid thinking level");
     return true;
   }
-  if (deps.isVoiceReplyActive?.()) {
-    await deps.answerCallbackQuery(
+  if (
+    await refuseUnavailableTelegramThinkingControls(
       callbackQueryId,
-      "Thinking controls are disabled during voice replies.",
-    );
+      activeModel,
+      deps,
+    )
+  )
     return true;
-  }
-  if (!activeModel?.reasoning) {
-    await deps.answerCallbackQuery(
-      callbackQueryId,
-      "This model has no reasoning controls.",
-    );
-    return true;
-  }
   deps.setThinkingLevel(action.level);
   await deps.updateThinkingMenuMessage();
   await deps.answerCallbackQuery(

@@ -50,20 +50,9 @@ export interface TelegramSectionContext {
     /** Delete the message that triggered this callback (dialog cleanup) */
     deleteMessage(): Promise<void>;
 }
-export interface TelegramSectionCallbackContext {
-    sectionId: string;
-    chatId: number;
-    messageId?: number;
+export interface TelegramSectionCallbackContext extends TelegramSectionContext {
     action: string;
     payload: string;
-    answerCallback(text?: string): Promise<void>;
-    edit(view: TelegramSectionView): Promise<void>;
-    open(view: TelegramSectionView): Promise<void>;
-    openRich(message: TelegramInputRichMessage): Promise<void>;
-    enqueuePrompt(prompt: string): Promise<void>;
-    callbackData(action: string, payload?: string): string;
-    /** Delete the message that triggered this callback (dialog cleanup) */
-    deleteMessage(): Promise<void>;
 }
 /** @internal */
 export interface RegisteredTelegramSection {
@@ -144,20 +133,6 @@ export declare function parseTelegramSectionCallback(data: string): {
     action: string;
     payload: string;
 } | undefined;
-/** @internal */
-export interface TelegramSectionCallbackHandlerDeps {
-    answerCallbackQuery: (id: string, text?: string) => Promise<void>;
-    target?: TelegramSectionTarget;
-    editInteractiveMessage: (chatId: number, messageId: number, text: string, mode: "markdown" | "html" | "plain", replyMarkup: TelegramInlineKeyboardMarkup) => Promise<void>;
-    sendInteractiveMessage: (chatId: number, text: string, mode: "markdown" | "html" | "plain", replyMarkup: TelegramInlineKeyboardMarkup, options?: {
-        target?: TelegramSectionTarget;
-    }) => Promise<number | undefined>;
-    sendRichMessage: (chatId: number, message: TelegramInputRichMessage, options?: {
-        target?: TelegramSectionTarget;
-    }) => Promise<number | undefined>;
-    enqueuePrompt: (prompt: string) => Promise<void>;
-    deleteMessage: (chatId: number, messageId: number) => Promise<void>;
-}
-export declare function handleTelegramSectionOpen(registry: TelegramSectionRegistry, token: TelegramSectionToken, chatId: number, messageId: number, callbackQueryId: string, deps: TelegramSectionCallbackHandlerDeps): Promise<boolean>;
-export declare function handleTelegramSectionCallback(registry: TelegramSectionRegistry, token: TelegramSectionToken, action: string, payload: string, chatId: number, messageId: number, callbackQueryId: string, deps: TelegramSectionCallbackHandlerDeps): Promise<boolean>;
-export declare function handleTelegramSectionSettingsOpen(registry: TelegramSectionRegistry, token: TelegramSectionToken, chatId: number, messageId: number, callbackQueryId: string, deps: TelegramSectionCallbackHandlerDeps): Promise<boolean>;
+export declare function handleTelegramSectionOpen(registry: TelegramSectionRegistry, token: TelegramSectionToken, chatId: number, messageId: number, callbackQueryId: string, deps: TelegramSectionRuntimeDeps): Promise<boolean>;
+export declare function handleTelegramSectionCallback(registry: TelegramSectionRegistry, token: TelegramSectionToken, action: string, payload: string, chatId: number, messageId: number, callbackQueryId: string, deps: TelegramSectionRuntimeDeps): Promise<boolean>;
+export declare function handleTelegramSectionSettingsOpen(registry: TelegramSectionRegistry, token: TelegramSectionToken, chatId: number, messageId: number, callbackQueryId: string, deps: TelegramSectionRuntimeDeps): Promise<boolean>;

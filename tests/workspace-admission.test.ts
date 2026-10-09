@@ -20,7 +20,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { createTelegramLockRuntime, readTelegramRuntimeState, mutateTelegramRuntimeStateSection } from "../lib/locks.ts";
-import { getTelegramProcessBirthIdentity } from "../lib/bus.ts";
+import { getTelegramProcessBirthIdentity } from "../lib/process-identity.ts";
 import {
   createTelegramWorkspaceAdmissionLedger,
   createTelegramWorkspaceAdmissionProfileKey,
@@ -1282,11 +1282,11 @@ function runRaceParticipant(input: {
   stateProfile?: string;
 }): Promise<RaceResult> {
   const moduleUrl = new URL("../lib/workspace-admission.ts", import.meta.url).href;
-  const busUrl = new URL("../lib/bus.ts", import.meta.url).href;
+  const processIdentityUrl = new URL("../lib/process-identity.ts", import.meta.url).href;
   const source = `
     import { existsSync, writeFileSync } from "node:fs";
     import { createTelegramWorkspaceAdmissionLedger } from ${JSON.stringify(moduleUrl)};
-    import { getTelegramProcessBirthIdentity } from ${JSON.stringify(busUrl)};
+    import { getTelegramProcessBirthIdentity } from ${JSON.stringify(processIdentityUrl)};
     const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
     const owner = { processId: process.pid, processBirthId: getTelegramProcessBirthIdentity(process.pid, Date.now()) };
     const ledger = createTelegramWorkspaceAdmissionLedger({ path: process.env.LEDGER_PATH,
@@ -1362,10 +1362,10 @@ test("A crashed process admission is reclaimed only after process-birth death pr
   const temp = createTempPath();
   try {
     const moduleUrl = new URL("../lib/workspace-admission.ts", import.meta.url).href;
-    const busUrl = new URL("../lib/bus.ts", import.meta.url).href;
+    const processIdentityUrl = new URL("../lib/process-identity.ts", import.meta.url).href;
     const source = `
       import { createTelegramWorkspaceAdmissionLedger } from ${JSON.stringify(moduleUrl)};
-      import { getTelegramProcessBirthIdentity } from ${JSON.stringify(busUrl)};
+      import { getTelegramProcessBirthIdentity } from ${JSON.stringify(processIdentityUrl)};
       const owner = { processId: process.pid, processBirthId: getTelegramProcessBirthIdentity(process.pid, Date.now()) };
       const ledger = createTelegramWorkspaceAdmissionLedger({ path: process.env.LEDGER_PATH, profileKey: ${JSON.stringify(profileKey)}, owner });
       const result = ledger.acquireAdmission({ operationId: "crashed-admission", operationKind: "api.sendMessage", scope: { kind: "target", target: ${JSON.stringify(target)} } });

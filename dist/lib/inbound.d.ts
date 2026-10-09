@@ -10,9 +10,13 @@ export interface TelegramInboundHandlerConfig {
     mime?: string | string[];
     type?: string | string[];
     template?: string | TelegramInboundCommandTemplateConfig[];
+    /** Falsy skips this handler so selection continues with the next match. */
+    when?: CommandTemplateObjectConfig["when"];
     args?: string[];
     defaults?: Record<string, unknown>;
     timeout?: number | string;
+    retry?: CommandTemplateObjectConfig["retry"];
+    recover?: CommandTemplateObjectConfig["recover"];
 }
 export interface TelegramInboundHandlerFile {
     path: string;
@@ -38,6 +42,7 @@ export interface TelegramInboundHandlerExecOptions {
     signal?: AbortSignal;
     stdin?: string;
     retry?: number;
+    recover?: () => Promise<void>;
 }
 export interface TelegramInboundHandlerExecResult {
     stdout: string;

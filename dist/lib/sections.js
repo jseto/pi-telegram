@@ -19,7 +19,9 @@ function buildTelegramSectionContext(sectionId, token, chatId, messageId, callba
         open: (view) => deps
             .sendInteractiveMessage(chatId, view.text, view.parseMode ?? "html", view.replyMarkup ?? { inline_keyboard: [] }, deps.target ? { target: deps.target } : undefined)
             .then(() => { }),
-        openRich: (message) => deps.sendRichMessage(chatId, message, deps.target ? { target: deps.target } : undefined).then(() => { }),
+        openRich: (message) => deps
+            .sendRichMessage(chatId, message, deps.target ? { target: deps.target } : undefined)
+            .then(() => { }),
         enqueuePrompt: deps.enqueuePrompt,
         callbackData: (action, payload) => buildTelegramSectionCallbackData(token, action, payload),
         deleteMessage: () => messageId !== undefined
@@ -29,24 +31,9 @@ function buildTelegramSectionContext(sectionId, token, chatId, messageId, callba
 }
 function buildTelegramSectionCallbackContext(sectionId, token, chatId, messageId, action, payload, callbackQueryId, deps, backCallback = "menu:back", backLabel = "⬆️ Back") {
     return {
-        sectionId,
-        chatId,
-        messageId,
+        ...buildTelegramSectionContext(sectionId, token, chatId, messageId, callbackQueryId, deps, backCallback, backLabel),
         action,
         payload,
-        answerCallback: (text) => deps.answerCallbackQuery(callbackQueryId, text),
-        edit: (view) => messageId !== undefined
-            ? deps.editInteractiveMessage(chatId, messageId, view.text, view.parseMode ?? "html", prependBackRow(view.replyMarkup, backCallback, backLabel))
-            : Promise.resolve(),
-        open: (view) => deps
-            .sendInteractiveMessage(chatId, view.text, view.parseMode ?? "html", view.replyMarkup ?? { inline_keyboard: [] }, deps.target ? { target: deps.target } : undefined)
-            .then(() => { }),
-        openRich: (message) => deps.sendRichMessage(chatId, message, deps.target ? { target: deps.target } : undefined).then(() => { }),
-        enqueuePrompt: deps.enqueuePrompt,
-        callbackData: (action, payload) => buildTelegramSectionCallbackData(token, action, payload),
-        deleteMessage: () => messageId !== undefined
-            ? deps.deleteMessage(chatId, messageId)
-            : Promise.resolve(),
     };
 }
 // --- GlobalThis Bridge ---
@@ -242,7 +229,7 @@ export function parseTelegramSectionCallback(data) {
 export async function handleTelegramSectionOpen(registry, token, chatId, messageId, callbackQueryId, deps) {
     const section = registry.getByToken(token);
     if (!section) {
-        await deps.answerCallbackQuery(callbackQueryId, "This section is no longer available.");
+        await deps.answerCallbackQuery(callbackQueryId, "This section is no longer available");
         return true;
     }
     try {
@@ -267,7 +254,7 @@ export async function handleTelegramSectionOpen(registry, token, chatId, message
 export async function handleTelegramSectionCallback(registry, token, action, payload, chatId, messageId, callbackQueryId, deps) {
     const section = registry.getByToken(token);
     if (!section) {
-        await deps.answerCallbackQuery(callbackQueryId, "This section is no longer available.");
+        await deps.answerCallbackQuery(callbackQueryId, "This section is no longer available");
         return true;
     }
     // Try main handleCallback first, then settings handleCallback as fallback.
@@ -303,7 +290,7 @@ export async function handleTelegramSectionCallback(registry, token, action, pay
 export async function handleTelegramSectionSettingsOpen(registry, token, chatId, messageId, callbackQueryId, deps) {
     const section = registry.getByToken(token);
     if (!section || !section.registration.settings) {
-        await deps.answerCallbackQuery(callbackQueryId, "This section is no longer available.");
+        await deps.answerCallbackQuery(callbackQueryId, "This section is no longer available");
         return true;
     }
     try {

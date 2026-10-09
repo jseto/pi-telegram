@@ -105,9 +105,7 @@ function resolveSubmittedTelegramBotToken(value: string): string | undefined {
   return trimmed;
 }
 
-function describeSubmittedTelegramBotToken(
-  value: string,
-): string | undefined {
+function describeSubmittedTelegramBotToken(value: string): string | undefined {
   return value.trim().startsWith("$")
     ? "Telegram bot token environment reference is unavailable in this setup environment."
     : undefined;

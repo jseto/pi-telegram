@@ -29,7 +29,9 @@ import { resolveTelegramServiceJournalStorage, resolveTelegramTempDir } from "..
 
 const tokenSha256 = "a".repeat(64);
 const execFileAsync = promisify(execFile);
-const test = process.platform === "win32" ? nodeTest.skip : nodeTest;
+const test = nodeTest;
+// Creating symbolic links needs elevated rights on Windows, and its privacy comes from directory ACLs, not mode bits.
+const posix = process.platform !== "win32";
 
 async function withStore(run: (input: { path: string; now: (value: number) => void;
   store: ReturnType<typeof createTelegramChannelPostJournalStore> }) => Promise<void>) {
@@ -291,13 +293,15 @@ test("Channel post journal retains unknown outcomes and refuses invalid identity
     assert.throws(() => store.list(), error => isCode(error, "conflict"));
     await writeFile(path, JSON.stringify({ version: 1, profile: "other", tokenSha256, records: [] }));
     assert.throws(() => store.list(), error => isCode(error, "conflict"));
-    await rm(path);
-    await symlink("/etc/passwd", path);
-    assert.throws(() => store.list(), error => isCode(error, "invalid"));
-    await rm(path);
-    await writeFile(path, JSON.stringify({ version: 1, profile: "work", tokenSha256, records: [] }),
-      { mode: 0o644 });
-    assert.throws(() => store.list(), error => isCode(error, "invalid"));
+    if (posix) {
+      await rm(path);
+      await symlink("/etc/passwd", path);
+      assert.throws(() => store.list(), error => isCode(error, "invalid"));
+      await rm(path);
+      await writeFile(path, JSON.stringify({ version: 1, profile: "work", tokenSha256, records: [] }),
+        { mode: 0o644 });
+      assert.throws(() => store.list(), error => isCode(error, "invalid"));
+    }
   });
 });
 
@@ -351,11 +355,13 @@ test("Channel media inspection resolves supported kinds and binds content identi
     await assert.rejects(inspectTelegramChannelPostMedia(join(dir, "clip.gif")),
       error => error instanceof TelegramChannelPostValidationError &&
         /Unsupported channel media type/u.test(error.message));
-    const linkPath = join(dir, "linked.png");
-    await symlink(photoPath, linkPath);
-    await assert.rejects(inspectTelegramChannelPostMedia(linkPath),
-      error => error instanceof TelegramChannelPostValidationError &&
-        /without symbolic links/u.test(error.message));
+    if (posix) {
+      const linkPath = join(dir, "linked.png");
+      await symlink(photoPath, linkPath);
+      await assert.rejects(inspectTelegramChannelPostMedia(linkPath),
+        error => error instanceof TelegramChannelPostValidationError &&
+          /without symbolic links/u.test(error.message));
+    }
     await assert.rejects(inspectTelegramChannelPostMedia(join(dir, "missing.png")),
       error => error instanceof TelegramChannelPostValidationError &&
         /readable regular local file/u.test(error.message));

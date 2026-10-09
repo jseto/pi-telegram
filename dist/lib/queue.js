@@ -4,9 +4,10 @@
  * Owns queue item contracts, lane admission, pure queue mutations, and dispatch planning
  */
 import { createHash } from "node:crypto";
+import { isPiStaleContextError } from "./pi.js";
+import { isTelegramApiCommitUnknownError } from "./telegram-api.js";
 import { isVoiceTurn } from "./voice.js";
 import { isWireRecord as isQueuePayloadRecord } from "./wire.js";
-import { isTelegramApiCommitUnknownError } from "./telegram-api.js";
 export const TELEGRAM_QUEUE_LANE_CONTRACTS = [
     // Control lane intentionally accepts both direct controls and resume prompts.
     // Model-switch continuations need prompt semantics but must run before queued user work.
@@ -33,64 +34,139 @@ export const TELEGRAM_QUEUE_LANE_CONTRACTS = [
 export const TELEGRAM_QUEUE_HANDOFF_PAYLOAD_MAX_BYTES = 8 * 1024 * 1024;
 const TELEGRAM_QUEUE_HANDOFF_MAX_RECEIPTS = 256;
 function parseQueuePayloadReceipt(value, kind) {
-    if (!isQueuePayloadRecord(value) || value.queueKind !== kind ||
-        typeof value.receiptId !== "string" || !value.receiptId ||
-        (value.journalBindingKey !== undefined && (typeof value.journalBindingKey !== "string" || !value.journalBindingKey.trim())) ||
-        !Array.isArray(value.sourceUpdateIds) || value.sourceUpdateIds.length === 0 ||
-        value.sourceUpdateIds.some((id, index) => !Number.isSafeInteger(id) || id < 0 ||
+    if (!isQueuePayloadRecord(value) ||
+        value.queueKind !== kind ||
+        typeof value.receiptId !== "string" ||
+        !value.receiptId ||
+        (value.journalBindingKey !== undefined &&
+            (typeof value.journalBindingKey !== "string" ||
+                !value.journalBindingKey.trim())) ||
+        !Array.isArray(value.sourceUpdateIds) ||
+        value.sourceUpdateIds.length === 0 ||
+        value.sourceUpdateIds.some((id, index) => !Number.isSafeInteger(id) ||
+            id < 0 ||
             (index > 0 && id <= value.sourceUpdateIds[index - 1])))
         return undefined;
-    return { queueKind: kind, receiptId: value.receiptId, sourceUpdateIds: value.sourceUpdateIds,
-        ...(typeof value.journalBindingKey === "string" ? { journalBindingKey: value.journalBindingKey } : {}) };
+    return {
+        queueKind: kind,
+        receiptId: value.receiptId,
+        sourceUpdateIds: value.sourceUpdateIds,
+        ...(typeof value.journalBindingKey === "string"
+            ? { journalBindingKey: value.journalBindingKey }
+            : {}),
+    };
 }
 /** Data decoder shared by authenticated IPC and cold storage; decoding grants no admission. */
 export function parseTelegramQueueHandoffPayload(value) {
-    if (!isQueuePayloadRecord(value) || (value.kind !== "prompt" && value.kind !== "control"))
+    if (!isQueuePayloadRecord(value) ||
+        (value.kind !== "prompt" && value.kind !== "control"))
         return undefined;
-    const target = isQueuePayloadRecord(value.target) && typeof value.target.chatId === "number"
-        ? { chatId: value.target.chatId, ...(typeof value.target.threadId === "number" ? { threadId: value.target.threadId } : {}) } : undefined;
+    const target = isQueuePayloadRecord(value.target) &&
+        typeof value.target.chatId === "number"
+        ? {
+            chatId: value.target.chatId,
+            ...(typeof value.target.threadId === "number"
+                ? { threadId: value.target.threadId }
+                : {}),
+        }
+        : undefined;
     const transportStamp = isQueuePayloadRecord(value.transportStamp) &&
-        typeof value.transportStamp.profile === "string" && typeof value.transportStamp.generation === "string"
-        ? { profile: value.transportStamp.profile, generation: value.transportStamp.generation } : undefined;
-    if (!Number.isSafeInteger(value.chatId) || (value.target !== undefined && !target) ||
-        (value.transportStamp !== undefined && !transportStamp) || !Number.isSafeInteger(value.replyToMessageId) ||
-        (value.guestQueryId !== undefined && typeof value.guestQueryId !== "string") ||
-        (value.guestInlineMessageId !== undefined && typeof value.guestInlineMessageId !== "string") ||
-        !Number.isSafeInteger(value.queueOrder) || (value.queueLane !== "control" && value.queueLane !== "priority" && value.queueLane !== "default") ||
-        !Number.isSafeInteger(value.laneOrder) || typeof value.statusSummary !== "string" || !Array.isArray(value.admissionReceipts))
+        typeof value.transportStamp.profile === "string" &&
+        typeof value.transportStamp.generation === "string"
+        ? {
+            profile: value.transportStamp.profile,
+            generation: value.transportStamp.generation,
+        }
+        : undefined;
+    if (!Number.isSafeInteger(value.chatId) ||
+        (value.target !== undefined && !target) ||
+        (value.transportStamp !== undefined && !transportStamp) ||
+        !Number.isSafeInteger(value.replyToMessageId) ||
+        (value.guestQueryId !== undefined &&
+            typeof value.guestQueryId !== "string") ||
+        (value.guestInlineMessageId !== undefined &&
+            typeof value.guestInlineMessageId !== "string") ||
+        !Number.isSafeInteger(value.queueOrder) ||
+        (value.queueLane !== "control" &&
+            value.queueLane !== "priority" &&
+            value.queueLane !== "default") ||
+        !Number.isSafeInteger(value.laneOrder) ||
+        typeof value.statusSummary !== "string" ||
+        !Array.isArray(value.admissionReceipts))
         return undefined;
-    const admissionReceipts = value.admissionReceipts.map(receipt => parseQueuePayloadReceipt(receipt, value.kind));
-    if (admissionReceipts.length === 0 || admissionReceipts.length > TELEGRAM_QUEUE_HANDOFF_MAX_RECEIPTS ||
-        admissionReceipts.some(receipt => !receipt))
+    const admissionReceipts = value.admissionReceipts.map((receipt) => parseQueuePayloadReceipt(receipt, value.kind));
+    if (admissionReceipts.length === 0 ||
+        admissionReceipts.length > TELEGRAM_QUEUE_HANDOFF_MAX_RECEIPTS ||
+        admissionReceipts.some((receipt) => !receipt))
         return undefined;
-    const base = { chatId: value.chatId, ...(target ? { target } : {}), ...(transportStamp ? { transportStamp } : {}),
+    const base = {
+        chatId: value.chatId,
+        ...(target ? { target } : {}),
+        ...(transportStamp ? { transportStamp } : {}),
         replyToMessageId: value.replyToMessageId,
-        ...(typeof value.guestQueryId === "string" ? { guestQueryId: value.guestQueryId } : {}),
-        ...(typeof value.guestInlineMessageId === "string" ? { guestInlineMessageId: value.guestInlineMessageId } : {}),
-        queueOrder: value.queueOrder, queueLane: value.queueLane,
-        laneOrder: value.laneOrder, statusSummary: value.statusSummary,
-        admissionReceipts: admissionReceipts };
+        ...(typeof value.guestQueryId === "string"
+            ? { guestQueryId: value.guestQueryId }
+            : {}),
+        ...(typeof value.guestInlineMessageId === "string"
+            ? { guestInlineMessageId: value.guestInlineMessageId }
+            : {}),
+        queueOrder: value.queueOrder,
+        queueLane: value.queueLane,
+        laneOrder: value.laneOrder,
+        statusSummary: value.statusSummary,
+        admissionReceipts: admissionReceipts,
+    };
     if (value.kind === "control") {
-        return value.queueLane === "control" && (value.controlType === "status" || value.controlType === "model")
-            ? { kind: "control", controlType: value.controlType, ...base } : undefined;
+        return value.queueLane === "control" &&
+            (value.controlType === "status" || value.controlType === "model")
+            ? { kind: "control", controlType: value.controlType, ...base }
+            : undefined;
     }
-    if (value.queueLane === "control" || !Array.isArray(value.sourceMessageIds) || value.sourceMessageIds.some(id => !Number.isSafeInteger(id)) ||
-        !Array.isArray(value.queuedAttachments) || value.queuedAttachments.some(attachment => !isQueuePayloadRecord(attachment) ||
-        typeof attachment.path !== "string" || typeof attachment.fileName !== "string") ||
-        !Array.isArray(value.content) || value.content.some(content => !isQueuePayloadRecord(content) ||
-        (content.type === "text" ? typeof content.text !== "string" : content.type === "image"
-            ? typeof content.data !== "string" || typeof content.mimeType !== "string" : true)) ||
-        typeof value.historyText !== "string" || (value.priorityEmoji !== undefined && typeof value.priorityEmoji !== "string") ||
-        (value.reactionSuppressionEmoji !== undefined && typeof value.reactionSuppressionEmoji !== "string") ||
-        (value.voiceReplyPreferred !== undefined && typeof value.voiceReplyPreferred !== "boolean") ||
-        (value.voiceReplyRequired !== undefined && typeof value.voiceReplyRequired !== "boolean"))
+    if (value.queueLane === "control" ||
+        !Array.isArray(value.sourceMessageIds) ||
+        value.sourceMessageIds.some((id) => !Number.isSafeInteger(id)) ||
+        !Array.isArray(value.queuedAttachments) ||
+        value.queuedAttachments.some((attachment) => !isQueuePayloadRecord(attachment) ||
+            typeof attachment.path !== "string" ||
+            typeof attachment.fileName !== "string") ||
+        !Array.isArray(value.content) ||
+        value.content.some((content) => !isQueuePayloadRecord(content) ||
+            (content.type === "text"
+                ? typeof content.text !== "string"
+                : content.type === "image"
+                    ? typeof content.data !== "string" ||
+                        typeof content.mimeType !== "string"
+                    : true)) ||
+        typeof value.historyText !== "string" ||
+        (value.priorityEmoji !== undefined &&
+            typeof value.priorityEmoji !== "string") ||
+        (value.reactionSuppressionEmoji !== undefined &&
+            typeof value.reactionSuppressionEmoji !== "string") ||
+        (value.voiceReplyPreferred !== undefined &&
+            typeof value.voiceReplyPreferred !== "boolean") ||
+        (value.voiceReplyRequired !== undefined &&
+            typeof value.voiceReplyRequired !== "boolean"))
         return undefined;
-    return { kind: "prompt", ...base, sourceMessageIds: value.sourceMessageIds,
-        queuedAttachments: value.queuedAttachments, content: value.content, historyText: value.historyText,
-        ...(typeof value.priorityEmoji === "string" ? { priorityEmoji: value.priorityEmoji } : {}),
-        ...(typeof value.reactionSuppressionEmoji === "string" ? { reactionSuppressionEmoji: value.reactionSuppressionEmoji } : {}),
-        ...(typeof value.voiceReplyPreferred === "boolean" ? { voiceReplyPreferred: value.voiceReplyPreferred } : {}),
-        ...(typeof value.voiceReplyRequired === "boolean" ? { voiceReplyRequired: value.voiceReplyRequired } : {}) };
+    return {
+        kind: "prompt",
+        ...base,
+        sourceMessageIds: value.sourceMessageIds,
+        queuedAttachments: value.queuedAttachments,
+        content: value.content,
+        historyText: value.historyText,
+        ...(typeof value.priorityEmoji === "string"
+            ? { priorityEmoji: value.priorityEmoji }
+            : {}),
+        ...(typeof value.reactionSuppressionEmoji === "string"
+            ? { reactionSuppressionEmoji: value.reactionSuppressionEmoji }
+            : {}),
+        ...(typeof value.voiceReplyPreferred === "boolean"
+            ? { voiceReplyPreferred: value.voiceReplyPreferred }
+            : {}),
+        ...(typeof value.voiceReplyRequired === "boolean"
+            ? { voiceReplyRequired: value.voiceReplyRequired }
+            : {}),
+    };
 }
 export function createTelegramQueueAdmissionReceipt(options) {
     if (options.sourceUpdateIds.length === 0)
@@ -120,18 +196,11 @@ export function createTelegramQueueAdmissionReceipt(options) {
         journalBindingKey: scope,
     };
 }
-export function isTelegramQueueItemDurablyAdmitted(item, isReceiptCommitted) {
-    assertTelegramQueueItemAdmissionValid(item);
-    return (item.admissionReceipts ?? []).every(isReceiptCommitted);
-}
 export function getTelegramQueueLaneContract(lane) {
     const contract = TELEGRAM_QUEUE_LANE_CONTRACTS.find((entry) => entry.lane === lane);
     if (!contract)
         throw new Error(`Unknown Telegram queue lane: ${lane}`);
     return contract;
-}
-export function getTelegramQueueItemAdmissionMode(item) {
-    return getTelegramQueueLaneContract(item.queueLane).admissionMode;
 }
 export function isTelegramQueueItemAdmissionValid(item) {
     return getTelegramQueueLaneContract(item.queueLane).allowedKinds.includes(item.kind);
@@ -248,6 +317,33 @@ export function createTelegramActiveTurnStore() {
         getSourceMessageIds: () => activeTurn?.sourceMessageIds,
     };
 }
+/** Current captured targets only; skipped/receipt-held items remain work, never historical census. */
+export function observeTelegramTargetQueueWork(target, activeTurn, items) {
+    let protectedWork = false, unknown = !Number.isSafeInteger(target.chatId) ||
+        !Number.isSafeInteger(target.threadId) ||
+        target.threadId <= 0;
+    const observe = (item) => {
+        if (item.chatId !== target.chatId && item.target?.chatId !== target.chatId)
+            return;
+        const captured = item.target;
+        if (!captured ||
+            captured.chatId !== item.chatId ||
+            !Number.isSafeInteger(captured.threadId) ||
+            !captured.threadId ||
+            captured.threadId < 0) {
+            unknown = true;
+            return;
+        }
+        if (captured.chatId === target.chatId &&
+            captured.threadId === target.threadId)
+            protectedWork = true;
+    };
+    if (activeTurn)
+        observe(activeTurn);
+    for (const item of items)
+        observe(item);
+    return { protected: protectedWork, unknown };
+}
 // --- Queue Mutations ---
 export function partitionTelegramQueueItemsForHistory(items) {
     const historyTurns = [];
@@ -275,10 +371,7 @@ export function areTelegramQueueAdmissionReceiptsEqual(left, right) {
         left.sourceUpdateIds.every((updateId, index) => updateId === right.sourceUpdateIds[index]));
 }
 function getTelegramQueueAdmissionReceiptKey(receipt) {
-    return JSON.stringify([
-        receipt.receiptId,
-        receipt.journalBindingKey ?? null,
-    ]);
+    return JSON.stringify([receipt.receiptId, receipt.journalBindingKey ?? null]);
 }
 function isDuplicateTelegramQueueAdmission(items, item) {
     const incomingReceipts = item.admissionReceipts ?? [];
@@ -326,7 +419,8 @@ export function createTelegramQueueHandoff(input) {
         handoffToken: input.handoffToken,
         payload: createTelegramQueueHandoffPayload(input.item),
     };
-    if (Buffer.byteLength(JSON.stringify(handoff)) > TELEGRAM_QUEUE_HANDOFF_PAYLOAD_MAX_BYTES) {
+    if (Buffer.byteLength(JSON.stringify(handoff)) >
+        TELEGRAM_QUEUE_HANDOFF_PAYLOAD_MAX_BYTES) {
         throw new Error("Telegram queue handoff payload exceeds its byte limit.");
     }
     return handoff;
@@ -339,27 +433,7 @@ export function createTelegramQueueHandoffPayload(item) {
     if (item.admissionReceipts.length > TELEGRAM_QUEUE_HANDOFF_MAX_RECEIPTS) {
         throw new Error("Telegram queue handoff has too many admission receipts.");
     }
-    if (item.kind === "control") {
-        return structuredClone({
-            kind: item.kind,
-            controlType: item.controlType,
-            chatId: item.chatId,
-            ...(item.target ? { target: item.target } : {}),
-            ...(item.transportStamp ? { transportStamp: item.transportStamp } : {}),
-            replyToMessageId: item.replyToMessageId,
-            ...(item.guestQueryId ? { guestQueryId: item.guestQueryId } : {}),
-            ...(item.guestInlineMessageId
-                ? { guestInlineMessageId: item.guestInlineMessageId }
-                : {}),
-            queueOrder: item.queueOrder,
-            queueLane: item.queueLane,
-            laneOrder: item.laneOrder,
-            statusSummary: item.statusSummary,
-            admissionReceipts: item.admissionReceipts,
-        });
-    }
-    return structuredClone({
-        kind: item.kind,
+    const base = {
         chatId: item.chatId,
         ...(item.target ? { target: item.target } : {}),
         ...(item.transportStamp ? { transportStamp: item.transportStamp } : {}),
@@ -373,6 +447,17 @@ export function createTelegramQueueHandoffPayload(item) {
         laneOrder: item.laneOrder,
         statusSummary: item.statusSummary,
         admissionReceipts: item.admissionReceipts,
+    };
+    if (item.kind === "control") {
+        return structuredClone({
+            kind: item.kind,
+            controlType: item.controlType,
+            ...base,
+        });
+    }
+    return structuredClone({
+        kind: item.kind,
+        ...base,
         sourceMessageIds: item.sourceMessageIds,
         queuedAttachments: item.queuedAttachments,
         content: item.content,
@@ -566,9 +651,9 @@ export function removeTelegramQueueItemsByMessageIds(items, messageIds, scope) {
 }
 function removeTelegramQueuedGuestPromptByOrder(items, queueOrder) {
     const index = items.findIndex((item) => {
-        return isPendingTelegramTurn(item) &&
+        return (isPendingTelegramTurn(item) &&
             item.guestQueryId !== undefined &&
-            item.queueOrder === queueOrder;
+            item.queueOrder === queueOrder);
     });
     if (index < 0)
         return { items, removedItems: [], removedCount: 0 };
@@ -582,7 +667,8 @@ function removeTelegramQueuedGuestPromptByOrder(items, queueOrder) {
 export function applyTelegramQueuePromptReactionDisposition(items, messageId, disposition, destinationLaneOrder, scope) {
     let nextItems = items;
     for (const [index, item] of items.entries()) {
-        if (!isPendingTelegramTurn(item) || item.queueLane === "control" ||
+        if (!isPendingTelegramTurn(item) ||
+            item.queueLane === "control" ||
             !isTelegramQueueItemInMessageScope(item, scope) ||
             !item.sourceMessageIds.includes(messageId)) {
             continue;
@@ -594,16 +680,14 @@ export function applyTelegramQueuePromptReactionDisposition(items, messageId, di
             : disposition.kind === "priority" ||
                 disposition.kind === "priority-suppressed";
         const queueLane = isPriority ? "priority" : "default";
-        const laneOrder = item.queueLane === queueLane
-            ? item.laneOrder
-            : destinationLaneOrder;
+        const laneOrder = item.queueLane === queueLane ? item.laneOrder : destinationLaneOrder;
         if (laneOrder === undefined) {
             throw new Error("Telegram destination lane order is unavailable.");
         }
         const priorityEmoji = disposition.kind === "reaction-transition"
             ? disposition.priorityEmoji === undefined
                 ? item.priorityEmoji
-                : disposition.priorityEmoji ?? undefined
+                : (disposition.priorityEmoji ?? undefined)
             : disposition.kind === "priority"
                 ? disposition.emoji
                 : disposition.kind === "priority-suppressed"
@@ -612,7 +696,7 @@ export function applyTelegramQueuePromptReactionDisposition(items, messageId, di
         const reactionSuppressionEmoji = disposition.kind === "reaction-transition"
             ? disposition.suppressionEmoji === undefined
                 ? item.reactionSuppressionEmoji
-                : disposition.suppressionEmoji ?? undefined
+                : (disposition.suppressionEmoji ?? undefined)
             : disposition.kind === "suppressed"
                 ? disposition.emoji
                 : disposition.kind === "priority-suppressed"
@@ -944,12 +1028,17 @@ export function createTelegramAgentEndHook(deps) {
         const assistant = deps.isAssistantAlreadyPublished?.(extractedAssistant)
             ? { stopReason: extractedAssistant.stopReason }
             : extractedAssistant;
-        const hasPublication = !!assistant.text || assistant.stopReason === "error" || !!turn?.queuedAttachments.length;
-        const reservation = turn && !turn.guestQueryId && hasPublication ? deps.reserveActiveTurnDelivery?.() : undefined;
+        const hasPublication = !!assistant.text ||
+            assistant.stopReason === "error" ||
+            !!turn?.queuedAttachments.length;
+        const reservation = turn && !turn.guestQueryId && hasPublication
+            ? deps.reserveActiveTurnDelivery?.()
+            : undefined;
         const scheduleDelivery = reservation?.schedule ?? deps.scheduleActiveTurnDelivery;
         try {
             await deps.loadConfig?.();
-            if (deps.isSessionActive?.(ctx) === false || deps.getActiveTurn() !== turn)
+            if (deps.isSessionActive?.(ctx) === false ||
+                deps.getActiveTurn() !== turn)
                 return;
             await handleTelegramAgentEndRuntime({
                 turn,
@@ -1026,20 +1115,25 @@ export async function handleTelegramAgentEndRuntime(deps) {
     const replyMarkup = outboundReply?.replyMarkup;
     const isDeliveryActive = () => deps.isSessionActive?.() !== false &&
         (!turn || deps.isTurnTransportActive?.(turn) !== false);
-    const preview = turn && !turn.guestQueryId ? deps.preparePreviewDelivery?.(isDeliveryActive) : undefined;
+    const preview = turn && !turn.guestQueryId
+        ? deps.preparePreviewDelivery?.(isDeliveryActive)
+        : undefined;
     const setPreviewPendingText = preview?.setPreviewPendingText ?? deps.setPreviewPendingText;
     const finalizeMarkdownPreview = preview?.finalizeMarkdownPreview ?? deps.finalizeMarkdownPreview;
     const clearPreview = turn
-        ? preview ? () => preview.clearPreview(turn.chatId, { target: turn.target })
-            : deps.preparePreviewClear?.(turn.chatId, { target: turn.target, isDeliveryActive })
-                ?? (() => deps.clearPreview(turn.chatId, { target: turn.target }))
+        ? preview
+            ? () => preview.clearPreview(turn.chatId, { target: turn.target })
+            : (deps.preparePreviewClear?.(turn.chatId, {
+                target: turn.target,
+                isDeliveryActive,
+            }) ?? (() => deps.clearPreview(turn.chatId, { target: turn.target })))
         : undefined;
     const updateStatusIgnoringStaleContext = () => {
         try {
             deps.updateStatus();
         }
         catch (error) {
-            if (!isTelegramStaleContextError(error))
+            if (!isPiStaleContextError(error))
                 throw error;
         }
     };
@@ -1290,7 +1384,9 @@ export async function handleTelegramAgentEndRuntime(deps) {
         }
         if (!isDeliveryActive())
             return;
-        if (outboundReply && deps.sendOutboundReplyArtifacts) {
+        if (outboundReply &&
+            hasOutboundArtifacts &&
+            deps.sendOutboundReplyArtifacts) {
             try {
                 await deps.sendOutboundReplyArtifacts(turn, outboundReply, {
                     replyToPrompt: !finalText,
@@ -1349,7 +1445,11 @@ export async function handleTelegramAgentEndRuntime(deps) {
             deps.dispatchNextQueuedTelegramTurn();
     };
     if (deps.scheduleActiveTurnDelivery &&
-        (endPlan.kind === "text" || endPlan.kind === "attachments-only" || endPlan.shouldSendAbortMessage || endPlan.shouldSendErrorMessage || endPlan.shouldClearPreview)) {
+        (endPlan.kind === "text" ||
+            endPlan.kind === "attachments-only" ||
+            endPlan.shouldSendAbortMessage ||
+            endPlan.shouldSendErrorMessage ||
+            endPlan.shouldClearPreview)) {
         deps.scheduleActiveTurnDelivery(deliverActiveTurn);
         return;
     }
@@ -1371,11 +1471,6 @@ export function createTelegramSessionStateApplier(deps) {
             deps.setPendingModelSwitch(state.pendingTelegramModelSwitch);
         },
     };
-}
-function isTelegramStaleContextError(error) {
-    return (error instanceof Error &&
-        (error.message.includes("stale after session") ||
-            error.message.includes("stale ctx")));
 }
 export function buildTelegramSessionStartState(currentModel) {
     return {
@@ -1413,7 +1508,7 @@ export async function startTelegramSessionRuntime(deps) {
         deps.bindDeferredDispatchContext?.(deps.ctx);
     }
     catch (error) {
-        if (!isTelegramStaleContextError(error))
+        if (!isPiStaleContextError(error))
             throw error;
     }
     deps.updateStatus();
@@ -1545,16 +1640,20 @@ function updateTelegramQueueStatusRuntime(deps) {
         deps.updateStatus(deps.ctx);
     }
     catch (error) {
-        if (!isTelegramStaleContextError(error))
+        if (!isPiStaleContextError(error))
             throw error;
     }
 }
 function commitReorderedTelegramQueueItemsRuntime(items, deps) {
-    const pendingHead = deps.hasPendingDispatch?.() ? deps.getQueuedItems()[0] : undefined;
+    const pendingHead = deps.hasPendingDispatch?.()
+        ? deps.getQueuedItems()[0]
+        : undefined;
     const ordered = [...items].sort(compareTelegramQueueItems);
     if (pendingHead) {
-        const index = ordered.findIndex(item => item.queueOrder === pendingHead.queueOrder && item.kind === pendingHead.kind &&
-            item.chatId === pendingHead.chatId && item.replyToMessageId === pendingHead.replyToMessageId);
+        const index = ordered.findIndex((item) => item.queueOrder === pendingHead.queueOrder &&
+            item.kind === pendingHead.kind &&
+            item.chatId === pendingHead.chatId &&
+            item.replyToMessageId === pendingHead.replyToMessageId);
         if (index > 0)
             ordered.unshift(ordered.splice(index, 1)[0]);
     }
@@ -1610,22 +1709,34 @@ function removeTelegramQueuedGuestPromptByOrderRuntime(queueOrder, deps) {
 }
 export function applyTelegramQueuePromptReactionDispositionRuntime(messageId, disposition, deps, scope) {
     const queuedItems = deps.getQueuedItems();
-    const suppression = disposition.kind === "reaction-transition" ? disposition.suppressionEmoji :
-        disposition.kind === "suppressed" ? disposition.emoji : disposition.kind === "priority-suppressed" ? disposition.suppressionEmoji : undefined;
+    const suppression = disposition.kind === "reaction-transition"
+        ? disposition.suppressionEmoji
+        : disposition.kind === "suppressed"
+            ? disposition.emoji
+            : disposition.kind === "priority-suppressed"
+                ? disposition.suppressionEmoji
+                : undefined;
     // Source-addressed control-lane prompts are explicit continuations. Synthetic model-switch turns have no source IDs.
     // A Pi-owned dispatched head cannot be removed: agent_start must consume that exact item, not its successor.
-    const cancelled = suppression && deps.hasPendingDispatch ? queuedItems.filter((item, index) => isPendingTelegramTurn(item) && item.queueLane === "control" && isTelegramQueueItemInMessageScope(item, scope) &&
-        item.sourceMessageIds.includes(messageId) && !(index === 0 && deps.hasPendingDispatch())) : [];
+    const cancelled = suppression && deps.hasPendingDispatch
+        ? queuedItems.filter((item, index) => isPendingTelegramTurn(item) &&
+            item.queueLane === "control" &&
+            isTelegramQueueItemInMessageScope(item, scope) &&
+            item.sourceMessageIds.includes(messageId) &&
+            !(index === 0 && deps.hasPendingDispatch()))
+        : [];
     if (cancelled.length) {
-        if (cancelled.some(item => (item.admissionReceipts?.length ?? 0) > 0) && !deps.onItemsDiscarded)
+        if (cancelled.some((item) => (item.admissionReceipts?.length ?? 0) > 0) &&
+            !deps.onItemsDiscarded)
             return false;
         deps.onItemsDiscarded?.(cancelled, deps.ctx);
-        deps.setQueuedItems(queuedItems.filter(item => !cancelled.includes(item)));
+        deps.setQueuedItems(queuedItems.filter((item) => !cancelled.includes(item)));
         updateTelegramQueueStatusRuntime(deps);
         return true;
     }
     const changesLane = queuedItems.some((item) => {
-        if (!isPendingTelegramTurn(item) || item.queueLane === "control" ||
+        if (!isPendingTelegramTurn(item) ||
+            item.queueLane === "control" ||
             !isTelegramQueueItemInMessageScope(item, scope) ||
             !item.sourceMessageIds.includes(messageId)) {
             return false;
@@ -1655,21 +1766,26 @@ export function applyTelegramQueuePromptReactionDispositionRuntime(messageId, di
 }
 export async function enqueueTelegramPromptTurnRuntime(messages, deps) {
     deps.assertExecutionCurrent?.();
-    const historyOrders = new Set(planTelegramPromptEnqueue(deps.getQueuedItems(), deps.getFoldQueuedPromptsIntoHistory()).historyTurns.map((turn) => turn.queueOrder));
-    deps.setFoldQueuedPromptsIntoHistory(false);
+    const historyOrders = new Set(deps.preserveQueued
+        ? []
+        : planTelegramPromptEnqueue(deps.getQueuedItems(), deps.getFoldQueuedPromptsIntoHistory()).historyTurns.map((turn) => turn.queueOrder));
+    if (!deps.preserveQueued)
+        deps.setFoldQueuedPromptsIntoHistory(false);
     const buildTurn = await deps.prepareTurn(messages);
     deps.assertExecutionCurrent?.();
     // Preserve the Pi-owned head until agent_start, plus later arrivals and current edits/reactions.
     const pendingDispatch = deps.hasPendingDispatch();
     const historyTurns = [];
     const remainingItems = deps.getQueuedItems().filter((item, index) => {
-        if ((pendingDispatch && index === 0) || !isPendingTelegramTurn(item) ||
+        if ((pendingDispatch && index === 0) ||
+            !isPendingTelegramTurn(item) ||
             !historyOrders.has(item.queueOrder))
             return true;
         historyTurns.push(item);
         return false;
     });
     const turn = buildTurn(historyTurns);
+    deps.assertExecutionCurrent?.();
     deps.setQueuedItems(appendTelegramQueueItem(remainingItems, turn));
     deps.onQueued?.(turn);
     deps.updateStatus();
@@ -1678,12 +1794,16 @@ export async function enqueueTelegramPromptTurnRuntime(messages, deps) {
 }
 export function createTelegramPromptEnqueueController(deps) {
     return {
-        enqueue: (messages, ctx, onQueued) => enqueueTelegramPromptTurnRuntime(messages, {
+        enqueue: (messages, ctx, onQueued, options) => enqueueTelegramPromptTurnRuntime(messages, {
             ...deps,
             prepareTurn: (nextMessages) => deps.prepareTurn(nextMessages, ctx),
             updateStatus: () => deps.updateStatus(ctx),
             dispatchNextQueuedTelegramTurn: () => deps.dispatchNextQueuedTelegramTurn(ctx),
-            assertExecutionCurrent: () => deps.assertExecutionCurrent?.(messages),
+            assertExecutionCurrent: () => {
+                deps.assertExecutionCurrent?.(messages);
+                options?.assertCurrent?.();
+            },
+            preserveQueued: options?.preserveQueued,
             onQueued,
         }),
     };
@@ -1985,8 +2105,7 @@ export function createTelegramQueueDispatchController(deps) {
                     nextDispatchAnnouncementRequested = false;
                 }
             }
-            if (nextItem &&
-                deps.hasPendingInboundQueueMutationForItem?.(nextItem)) {
+            if (nextItem && deps.hasPendingInboundQueueMutationForItem?.(nextItem)) {
                 deps.updateStatus(ctx);
                 return;
             }
@@ -2006,9 +2125,10 @@ export function createTelegramQueueDispatchController(deps) {
                     const queueDrifted = currentItems.length !== dispatchBasisItems.length ||
                         currentItems.some((item, index) => item !== dispatchBasisItems[index]);
                     const dispatchEligibilityDrifted = !deps.canDispatch(ctx) ||
-                        deps.hasPendingInboundQueueMutationForItem?.(dispatchPlan.item) === true ||
-                        (deps.isQueueItemAdmissionReady?.(dispatchPlan.item) === false) ||
-                        (deps.isQueueItemTransportActive?.(dispatchPlan.item) === false);
+                        deps.hasPendingInboundQueueMutationForItem?.(dispatchPlan.item) ===
+                            true ||
+                        deps.isQueueItemAdmissionReady?.(dispatchPlan.item) === false ||
+                        deps.isQueueItemTransportActive?.(dispatchPlan.item) === false;
                     if (queueDrifted || dispatchEligibilityDrifted) {
                         const selectedItemRetained = currentItems.includes(dispatchPlan.item);
                         const selectedTransportActive = deps.isQueueItemTransportActive?.(dispatchPlan.item) !== false;
@@ -2018,7 +2138,9 @@ export function createTelegramQueueDispatchController(deps) {
                             ? dispatchPlan.item
                             : undefined;
                         deps.updateStatus(ctx);
-                        if (nextDispatchAnnouncementRequested && queueDrifted && !dispatchEligibilityDrifted) {
+                        if (nextDispatchAnnouncementRequested &&
+                            queueDrifted &&
+                            !dispatchEligibilityDrifted) {
                             controller.dispatchNext(ctx);
                         }
                         return false;
@@ -2087,11 +2209,14 @@ export function createTelegramQueueDispatchController(deps) {
                 const announcementGeneration = nextDispatchAnnouncementGeneration;
                 const dispatchGeneration = deps.getDispatchGeneration?.();
                 deps.updateStatus(ctx);
-                void deps.sendTextReply(dispatchPlan.item.chatId, dispatchPlan.item.replyToMessageId, "<b>⏩ Dispatching next queued turn.</b>", { target: dispatchPlan.item.target, parseMode: "HTML" }).catch((error) => {
+                void deps
+                    .sendTextReply(dispatchPlan.item.chatId, dispatchPlan.item.replyToMessageId, "<b>⏩ Dispatching next queued turn.</b>", { target: dispatchPlan.item.target, parseMode: "HTML" })
+                    .catch((error) => {
                     deps.recordRuntimeEvent?.("dispatch", error, {
                         phase: "next-announcement",
                     });
-                }).finally(() => {
+                })
+                    .finally(() => {
                     try {
                         deps.reconcileNextDispatchAnnouncementReplyOwnership?.(dispatchPlan.item);
                     }

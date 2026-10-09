@@ -6,6 +6,36 @@
 
 - `Ownership checks`: An unverified ownership observation no longer stops a live transport on the first miss; consecutive misses are recorded with their count and stand down only after the bounded tolerance, so a concurrent shared-state replacement cannot silence polling.
 
+## 0.54.1: Followers go offline when Threaded Mode is turned off
+
+- `Threaded Mode downgrade`: Turning Threaded Mode off in BotFather now takes followers offline instead of looping between `electing` and `disconnected` (and filling the log) against a leader that switched to classic polling; reconnect with `/telegram-connect` after turning it back on. `/telegram-disconnect` on a follower without a live leader now disconnects locally and reports the Thread as kept, and a pending recovery retry no longer re-registers a disconnected follower.
+- `Ownership reads`: A lock-free ownership check that races a concurrent `state.json` replacement is now retried and confirmed through the serialized path before the leader stops polling, so a transient read miss (seen on slow Windows runners) is no longer mistaken for lost ownership. The integration test for a revoked follower provisioning now waits for its asynchronous lease release.
+
+## 0.54.0: No periodic disk writes while idle
+
+- `Journal serialization`: The update journal no longer borrows the `telegram.json` lock. Journal operations serialize on their own `tmp/pi-telegram/runtime/journals.transaction`, so receiving messages and repairing journals never touch the config file or its guard; only config writes and sender admission still take it. Bus protocol moves to v3 so 0.53.x peers, which serialize on the old lock, cannot register alongside 0.54 writers.
+- `Idle status writes`: The persisted runtime status no longer stores poll-cycle timestamps, so an idle connected session stops rewriting `state.json` after every long-poll response.
+- `Leader liveness`: The leader no longer rewrites `state.json` every two seconds. A dead PID is taken over at once; a live but frozen Threaded Mode leader is replaced only after an authenticated `bus.probe` proves it unresponsive, bound to that exact owner. Classic mode never takes over a live PID silently: `/telegram-connect` asks first. An idle connected session now makes no periodic disk writes.
+
+## 0.53.2: Idle runtime without lock churn
+
+- `Idle disk load`: Polling-cursor and status reads of the update journal no longer open config and journal transactions, so a connected idle session stops creating `telegram.json.transaction.staged.*` and `inbox.json.transaction.staged.*` guard folders; only reads that need repair take the serialized path. Unchanged runtime status snapshots are compared before locking and skip their `state.json` transaction.
+
+## 0.53.1: Text replies without false voice errors
+
+- `Voice artifacts`: A reply plan without voice content no longer reaches outbound voice artifact delivery, so plain text replies stop recording "every voice synthesis provider failed" delivery errors; explicit `telegram_voice` markup and genuine synthesis failures keep their existing fallback behavior (#318).
+
+## 0.53.0: Live Thread rebinding, routing tabs and Windows support
+
+- `Live-rebind state`: Atomic same-session Workspace binding/operation publication, fenced recipient application and bounded one-shot cleanup scheduling. Failed/unknown cleanup keeps the new binding without blocking the next attempt; chooser retirement keeps saved inputs. Shared-state retries recheck captured authority before every rename, so a revoked grant cannot overwrite retained state.
+- `Live-input preparation`: Fresh recipients hold groups before append; leaders reuse unsettled originals without copy or reexecution. Saved singleton readiness binds only its genuine warm carrier; cold/replaced/discarded sources cannot mint ACKs. Both roles use exact queue scopes, receipt/readiness publication and native completion observation. Caller/worker authority gates release; failed copies use fenced disposal. Queue acceptance is never removal, replay or another queue grant.
+- `Live-rebind peers`: Both-role local wiring preserves exact donor CAS and detached recipient delivery. Non-ordering Commands work protects held rendering/API and unknown effects after disposal/rebinding; cleanup refuses pending/unknown work. Only the explicitly marked, read-only recipient work observation may outlive source custody; generic observation cannot revive it. Authenticated IPC and both-role cleanup witnesses stay distinct from activation and actual Pi/client acceptance.
+- `Staged live routing`: Prompt and supported command selections share save/apply/release through native owners. Albums preserve grouped receipts and unrelated input across busy work/lost replies. Binding/claim conflicts and journal/profile-key drift refuse without replay or rollback; other bindings/profiles stay exact. Templates and `/continue` retain no-fold admission.
+- `Command authority`: Registry plans retain both-role custody, template identity, exact ACKs, no-fold receipts, donor CAS and independent delivery. Retired facades are removed; inspection is private behind `settle`, and ordinary command/prompt dispatch returns one owned function. Control assembly uses Queue contracts/controller and preserves append → report → dispatch. Target projection preserves field absence. Native abort retires heavy receipt-index records to refusal markers, never fallback.
+- `Handler and menu fixes`: Command-template `when` skips a falsy handler (selection falls through) and guarded steps, including enclosing-node guards; `recover` runs only between failed retries. Thinking-menu buttons refuse during voice replies. Every All-tab input, albums included, gets a 🚦 Routing tab; Cancel shows a notice and removes it right away, even if slow or other tabs wait; a consumed menu-picked command also leaves All. Route menus list 🧵 threads; restart revives a waiting chooser.
+- `UI and coverage`: Toasts are plain text without emoji or a final period, sent as written; menu and routing-tab navigation answers silently; list items use `<code>-</code>`. TUI status keeps acknowledged Thread-name casing. Real Pi SDK fixtures cover queued prompts/buttons across held tools and compaction; damaged-state fixtures cover invalid admission and outbound delivery. Unsupported extension selection preserves originals and bindings. Stale downgrade and Thread-store measurement scripts are removed.
+- `Windows`: Restore, live rebinding, cleanup census and scoped queue ACKs run on Windows through the same strict journal reads, guarded by handle identity where no-follow opens are missing. Process birth is proven from creation ticks, so reused PIDs no longer pin dead owners' work. Workspace and app file replacement retries sharing violations, follower control replies get the 8-second liveness window, and CI runs every suite on Windows.
+
 ## 0.52.2: Polling recovery, safe disconnect and Windows downloads
 
 - `Polling recovery`: Non-conflict poll/admission failures back off from 1 to 30 seconds and keep retrying, allowing recovery after prolonged outages without manual reconnect. Backoff resets only after durable admission succeeds; persistent competing-client conflicts retain their existing terminal stand-down.

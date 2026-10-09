@@ -13,8 +13,6 @@ const TELEGRAM_TABLE_GRAPHEME_SEGMENTER =
 const TELEGRAM_TABLE_EMOJI_GRAPHEME_PATTERN =
   /\p{Extended_Pictographic}|\p{Emoji_Presentation}|\p{Regional_Indicator}/u;
 
-// --- HTML Helpers ---
-
 interface OpenHtmlTag {
   name: string;
   openTag: string;
@@ -333,7 +331,7 @@ function replaceMarkdownLink(
   },
 ): string {
   let result = "";
-  for (let index = 0; index < text.length; ) {
+  for (let index = 0; index < text.length;) {
     const inlineLink = parseMarkdownInlineLinkAt(text, index);
     if (inlineLink) {
       result += options.renderInlineLink(

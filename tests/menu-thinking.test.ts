@@ -122,9 +122,9 @@ test("Thinking callback handles invalid, voice-active, non-reasoning, and unrela
   );
 
   assert.deepEqual(answered, [
-    "Invalid thinking level.",
-    "Thinking controls are disabled during voice replies.",
-    "This model has no reasoning controls.",
+    "Invalid thinking level",
+    "Thinking controls are disabled during voice replies",
+    "This model has no reasoning controls",
   ]);
 });
 

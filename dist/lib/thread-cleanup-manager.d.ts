@@ -64,59 +64,38 @@ export declare function planTelegramInactiveThreadCleanup(input: {
         threadId: number;
     }[];
 }): TelegramThreadCleanupCandidate[];
-export declare function captureTelegramInactiveThreadCleanupEvidence<TBinding extends TelegramThreadCleanupBindingSnapshot>(input: {
+/** Read ports for the bindings and target claims that cleanup evidence is captured from. */
+export interface TelegramInactiveThreadCleanupEvidencePorts<TBinding extends TelegramThreadCleanupBindingSnapshot> {
+    listBindings(): readonly TBinding[];
+    getProtection(binding: TBinding): {
+        liveOwner: TelegramThreadCleanupProtectionState;
+        acceptedWork: TelegramThreadCleanupProtectionState;
+        deliveryAuthority: TelegramThreadCleanupProtectionState;
+    };
+    listReservations(): readonly {
+        target: {
+            chatId: number;
+            threadId: number;
+        };
+    }[];
+    listPendingProvisions(): readonly {
+        target?: {
+            chatId: number;
+            threadId: number;
+        };
+    }[];
+    listPendingCleanups(): readonly {
+        target: {
+            chatId: number;
+            threadId: number;
+        };
+    }[];
+}
+export declare function captureTelegramInactiveThreadCleanupEvidence<TBinding extends TelegramThreadCleanupBindingSnapshot>(input: TelegramInactiveThreadCleanupEvidencePorts<TBinding> & {
     profileName: string;
-    listBindings(): readonly TBinding[];
-    getProtection(binding: TBinding): {
-        liveOwner: TelegramThreadCleanupProtectionState;
-        acceptedWork: TelegramThreadCleanupProtectionState;
-        deliveryAuthority: TelegramThreadCleanupProtectionState;
-    };
-    listReservations(): readonly {
-        target: {
-            chatId: number;
-            threadId: number;
-        };
-    }[];
-    listPendingProvisions(): readonly {
-        target?: {
-            chatId: number;
-            threadId: number;
-        };
-    }[];
-    listPendingCleanups(): readonly {
-        target: {
-            chatId: number;
-            threadId: number;
-        };
-    }[];
 }): Parameters<typeof planTelegramInactiveThreadCleanup>[0];
-export declare function createTelegramInactiveThreadCleanupReviewRuntime<TBinding extends TelegramThreadCleanupBindingSnapshot>(deps: {
+export declare function createTelegramInactiveThreadCleanupReviewRuntime<TBinding extends TelegramThreadCleanupBindingSnapshot>(deps: TelegramInactiveThreadCleanupEvidencePorts<TBinding> & {
     getProfileName(): string;
-    listBindings(): readonly TBinding[];
-    getProtection(binding: TBinding): {
-        liveOwner: TelegramThreadCleanupProtectionState;
-        acceptedWork: TelegramThreadCleanupProtectionState;
-        deliveryAuthority: TelegramThreadCleanupProtectionState;
-    };
-    listReservations(): readonly {
-        target: {
-            chatId: number;
-            threadId: number;
-        };
-    }[];
-    listPendingProvisions(): readonly {
-        target?: {
-            chatId: number;
-            threadId: number;
-        };
-    }[];
-    listPendingCleanups(): readonly {
-        target: {
-            chatId: number;
-            threadId: number;
-        };
-    }[];
     getWorkStore(): TelegramThreadCleanupWorkStore;
     runWorkspaceOperation<T>(input: {
         operationId: string;

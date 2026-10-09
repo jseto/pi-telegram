@@ -74,7 +74,9 @@ export function getLatestTelegramUpdateId(
 export class TelegramPersistentGetUpdatesConflictError extends Error {
   readonly count: number;
   constructor(count: number) {
-    super(`Telegram polling stopped after ${count} consecutive getUpdates conflicts.`);
+    super(
+      `Telegram polling stopped after ${count} consecutive getUpdates conflicts.`,
+    );
     this.name = "TelegramPersistentGetUpdatesConflictError";
     this.count = count;
   }
@@ -134,22 +136,13 @@ export interface TelegramPollingStartState {
 }
 
 export type TelegramPollingWorkPhase =
-  | "long-poll"
-  | "persisting-journal"
-  | "persisting-offset"
-  | "retrying";
+  "long-poll" | "persisting-journal" | "persisting-offset" | "retrying";
 
 export type TelegramPollingPhase =
-  | "stopped"
-  | "starting"
-  | TelegramPollingWorkPhase;
+  "stopped" | "starting" | TelegramPollingWorkPhase;
 
 export type TelegramPollingStopReason =
-  | "not-started"
-  | "requested"
-  | "completed"
-  | "failed"
-  | "persistent-conflict";
+  "not-started" | "requested" | "completed" | "failed" | "persistent-conflict";
 
 export interface TelegramPollingStateSnapshot {
   phase: TelegramPollingPhase;
@@ -162,8 +155,7 @@ export interface TelegramPollingStateSnapshot {
   stopReason?: TelegramPollingStopReason;
 }
 
-export interface TelegramPollingControllerState
-  extends TelegramPollingStateSnapshot {
+export interface TelegramPollingControllerState extends TelegramPollingStateSnapshot {
   pollingPromise?: Promise<void>;
   pollingController?: AbortController;
 }
@@ -185,8 +177,7 @@ function getTelegramPollingStateSnapshot(
     startedAtMs: state.startedAtMs,
     stoppedAtMs: state.stoppedAtMs,
     lastSuccessfulResponseAtMs: state.lastSuccessfulResponseAtMs,
-    lastSuccessfulResponseUpdateCount:
-      state.lastSuccessfulResponseUpdateCount,
+    lastSuccessfulResponseUpdateCount: state.lastSuccessfulResponseUpdateCount,
     stopReason: state.stopReason,
   };
 }
@@ -263,7 +254,8 @@ export function createTelegramPollingAdmissionRuntime<TContext>(deps: {
     async start(ctx) {
       if (!(deps.canStart?.(ctx) ?? true)) return;
       const expectedGeneration = ++generation;
-      const isCurrent = () => expectedGeneration === generation && (deps.canStart?.(ctx) ?? true);
+      const isCurrent = () =>
+        expectedGeneration === generation && (deps.canStart?.(ctx) ?? true);
       if (!isCurrent()) return;
       await deps.prepareStart?.();
       if (!isCurrent()) return;
@@ -333,7 +325,10 @@ export function createTelegramDurablePollingRuntimeAssembly<
         if (batch.length > 0) deps.prepareUpdateBatch(batch);
       } catch (error) {
         try {
-          deps.recordRuntimeEvent?.("polling", error, { phase: "batch-preparation", updateCount: updates.length });
+          deps.recordRuntimeEvent?.("polling", error, {
+            phase: "batch-preparation",
+            updateCount: updates.length,
+          });
         } catch {
           // Already-published input must still reach the worker if diagnostics fail.
         }
@@ -592,8 +587,13 @@ export function startTelegramPollingRuntime<TContext>(
       if (ownsController) deps.setPollingController(undefined);
       if (!ownsPromise && !ownsController) return;
       deps.onPollingStopped?.(
-        controller.signal.aborted ? "requested" : persistentConflict
-          ? "persistent-conflict" : failed ? "failed" : "completed",
+        controller.signal.aborted
+          ? "requested"
+          : persistentConflict
+            ? "persistent-conflict"
+            : failed
+              ? "failed"
+              : "completed",
       );
       // Detach the inner promise before outer teardown calls polling.stop().
       if (persistentConflict && !controller.signal.aborted) {
@@ -603,11 +603,14 @@ export function startTelegramPollingRuntime<TContext>(
           } else {
             deps.stopTypingLoop();
             deps.recordRuntimeEvent?.("polling", persistentConflict, {
-              phase: "persistent-conflict", count: persistentConflict.count,
+              phase: "persistent-conflict",
+              count: persistentConflict.count,
             });
           }
         } catch (error) {
-          deps.recordRuntimeEvent?.("polling", error, { phase: "conflict-stand-down" });
+          deps.recordRuntimeEvent?.("polling", error, {
+            phase: "conflict-stand-down",
+          });
         }
         if (deps.getPollingController() || deps.getPollingPromise()) return;
       }
@@ -731,7 +734,9 @@ export interface TelegramThreadTargetObservationBinding<TContext> {
   set(handler: TelegramThreadTargetObservationHandler<TContext>): void;
 }
 
-export function createTelegramThreadTargetObservationBinding<TContext>(): TelegramThreadTargetObservationBinding<TContext> {
+export function createTelegramThreadTargetObservationBinding<
+  TContext,
+>(): TelegramThreadTargetObservationBinding<TContext> {
   let handler: TelegramThreadTargetObservationHandler<TContext> | undefined;
   return {
     async handle(ctx) {
@@ -760,61 +765,47 @@ export interface TelegramThreadAwarePollingPorts<TContext, TOwner> {
   stopFollowerRegistration: () => void;
 }
 
-export interface TelegramThreadAwarePollingDeps<
-  TContext,
-  TOwner,
-> extends TelegramStartupThreadCapabilityProbeDeps {
-  lifecycle?: TelegramThreadCapabilityLifecycle;
+/** Classic/leader polling and follower registration controls that thread-aware polling switches between. */
+export interface TelegramThreadAwarePollingControls<TContext, TOwner> {
+  startClassicPolling: (ctx: TContext) => MaybePromise<void>;
+  stopClassicPolling: () => Promise<void>;
+  startBusLeaderPolling: (ctx: TContext) => Promise<void>;
+  stopBusLeaderPolling: () => Promise<void>;
+  startLeaderHealth: () => void;
+  stopLeaderHealth: () => void;
+  registerFollowerWithLeader: (
+    ctx: TContext,
+    owner: TOwner,
+  ) => Promise<boolean | undefined>;
+  restoreFollowerWithLeader?: (
+    ctx: TContext,
+    owner: TOwner,
+  ) => Promise<boolean | undefined>;
+  hasRememberedWorkspaceBinding?: (ctx: TContext) => boolean;
+  stopFollowerRegistration: () => void;
   isBusRuntimeEnabled: () => boolean;
   isTopicModeUnavailableError: (error: unknown) => boolean;
+}
+
+export interface TelegramThreadAwarePollingDeps<TContext, TOwner>
+  extends
+    TelegramStartupThreadCapabilityProbeDeps,
+    TelegramThreadAwarePollingControls<TContext, TOwner> {
+  lifecycle?: TelegramThreadCapabilityLifecycle;
   getPollingStartedWithTelegramBus: () => boolean;
   setPollingStartedWithTelegramBus: (started: boolean) => void;
   setForceFreshLeaderThreadOnNextStart: (forceFresh: boolean) => void;
-  startClassicPolling: (ctx: TContext) => MaybePromise<void>;
-  stopClassicPolling: () => Promise<void>;
-  startBusLeaderPolling: (ctx: TContext) => Promise<void>;
-  stopBusLeaderPolling: () => Promise<void>;
-  startLeaderHealth: () => void;
-  stopLeaderHealth: () => void;
-  registerFollowerWithLeader: (
-    ctx: TContext,
-    owner: TOwner,
-  ) => Promise<boolean | undefined>;
-  restoreFollowerWithLeader?: (
-    ctx: TContext,
-    owner: TOwner,
-  ) => Promise<boolean | undefined>;
-  hasRememberedWorkspaceBinding?: (ctx: TContext) => boolean;
-  stopFollowerRegistration: () => void;
 }
 
-export interface TelegramThreadCapabilityOrchestrationDeps<
-  TContext,
-  TOwner,
-> extends TelegramThreadCapabilityReaderDeps {
+export interface TelegramThreadCapabilityOrchestrationDeps<TContext, TOwner>
+  extends
+    TelegramThreadCapabilityReaderDeps,
+    TelegramThreadAwarePollingControls<TContext, TOwner> {
   state: TelegramThreadCapabilityStateRuntime;
   topicTargetStore: TelegramThreadCapabilityStore;
-  isBusRuntimeEnabled: () => boolean;
   ownsLock: (ctx: TContext) => boolean;
   isFollowerRegistered?: () => boolean;
-  startClassicPolling: (ctx: TContext) => MaybePromise<void>;
-  stopClassicPolling: () => Promise<void>;
-  startBusLeaderPolling: (ctx: TContext) => Promise<void>;
-  stopBusLeaderPolling: () => Promise<void>;
-  startLeaderHealth: () => void;
-  stopLeaderHealth: () => void;
-  registerFollowerWithLeader: (
-    ctx: TContext,
-    owner: TOwner,
-  ) => Promise<boolean | undefined>;
-  restoreFollowerWithLeader?: (
-    ctx: TContext,
-    owner: TOwner,
-  ) => Promise<boolean | undefined>;
-  hasRememberedWorkspaceBinding?: (ctx: TContext) => boolean;
   suspendLiveThreadTarget?: () => void;
-  stopFollowerRegistration: () => void;
-  isTopicModeUnavailableError: (error: unknown) => boolean;
   updateStatus: (ctx: TContext) => void;
   recordEvent: (
     category: string,
@@ -864,7 +855,9 @@ export function createTelegramThreadCapabilityOrchestration<TContext, TOwner>(
       const expected = generation;
       return () => expected === generation;
     },
-    invalidate() { generation++; },
+    invalidate() {
+      generation++;
+    },
   };
   const capabilityDeps: TelegramThreadCapabilityRuntimeDeps<TContext> = {
     lifecycle,
@@ -987,6 +980,32 @@ function hasTelegramThreadCapabilityBindings(
   );
 }
 
+/** Falls back to classic polling, recording a failed restore durably; false once the attempt is stale. */
+async function restoreTelegramClassicPolling<TContext>(
+  ctx: TContext,
+  phase: string,
+  deps: TelegramThreadCapabilityRuntimeDeps<TContext>,
+  isCurrent: () => boolean,
+): Promise<boolean> {
+  try {
+    await deps.startClassicPolling(ctx);
+    return isCurrent();
+  } catch (classicError) {
+    if (!isCurrent()) return false;
+    deps.topicTargetStore.setBotState({
+      threadMode: "disabled",
+      updatedAtMs: (deps.getNowMs ?? Date.now)(),
+      lastReconcileAction: `${phase}-classic-restore-failed`,
+    });
+    await deps.topicTargetStore.persist();
+    if (!isCurrent()) return false;
+    deps.recordEvent("bus", classicError, {
+      phase: `${phase}-classic-restore`,
+    });
+    return true;
+  }
+}
+
 export async function applyTelegramThreadCapability<TContext>(
   ctx: TContext,
   threadModeEnabled: boolean,
@@ -1029,22 +1048,8 @@ export async function applyTelegramThreadCapability<TContext>(
       if (!isCurrent()) return;
       deps.setPollingStartedWithTelegramBus(false);
       if (hadLiveThreadTransport) deps.suspendLiveThreadTarget?.();
-      try {
-        await deps.startClassicPolling(ctx);
-        if (!isCurrent()) return;
-      } catch (classicError) {
-        if (!isCurrent()) return;
-        deps.topicTargetStore.setBotState({
-          threadMode: "disabled",
-          updatedAtMs: (deps.getNowMs ?? Date.now)(),
-          lastReconcileAction: `${phase}-classic-restore-failed`,
-        });
-        await deps.topicTargetStore.persist();
-        if (!isCurrent()) return;
-        deps.recordEvent("bus", classicError, {
-          phase: `${phase}-classic-restore`,
-        });
-      }
+      if (!(await restoreTelegramClassicPolling(ctx, phase, deps, isCurrent)))
+        return;
     }
     deps.updateStatus(ctx);
     return;
@@ -1081,22 +1086,8 @@ export async function applyTelegramThreadCapability<TContext>(
         if (!isCurrent()) return;
         deps.setTopicModeUnavailable(true);
       }
-      try {
-        await deps.startClassicPolling(ctx);
-        if (!isCurrent()) return;
-      } catch (classicError) {
-        if (!isCurrent()) return;
-        deps.topicTargetStore.setBotState({
-          threadMode: "disabled",
-          updatedAtMs: (deps.getNowMs ?? Date.now)(),
-          lastReconcileAction: `${phase}-classic-restore-failed`,
-        });
-        await deps.topicTargetStore.persist();
-        if (!isCurrent()) return;
-        deps.recordEvent("bus", classicError, {
-          phase: `${phase}-classic-restore`,
-        });
-      }
+      if (!(await restoreTelegramClassicPolling(ctx, phase, deps, isCurrent)))
+        return;
       deps.updateStatus(ctx);
       if (threadModeUnavailable) return;
       throw error;
@@ -1116,12 +1107,16 @@ export function createTelegramThreadAwarePollingPorts<TContext, TOwner>(
     const expectedGeneration = ++generation;
     deps.lifecycle?.invalidate();
     const isLifecycleCurrent = deps.lifecycle?.capture() ?? (() => true);
-    const isCurrent = () => expectedGeneration === generation && isLifecycleCurrent();
+    const isCurrent = () =>
+      expectedGeneration === generation && isLifecycleCurrent();
     await deps.topicTargetStore.load();
     if (!isCurrent()) return;
     let startupThreadCapability: boolean | undefined;
     try {
-      startupThreadCapability = await probeTelegramStartupThreadCapability(deps, isCurrent);
+      startupThreadCapability = await probeTelegramStartupThreadCapability(
+        deps,
+        isCurrent,
+      );
     } catch (error) {
       if (!isCurrent()) return;
       deps.recordEvent("bus", error, { phase: "startup-thread-mode-probe" });
@@ -1168,7 +1163,8 @@ export function createTelegramThreadAwarePollingPorts<TContext, TOwner>(
     deps.stopLeaderHealth();
     if (deps.getPollingStartedWithTelegramBus()) {
       await deps.stopBusLeaderPolling();
-      if (expectedGeneration === generation) deps.setPollingStartedWithTelegramBus(false);
+      if (expectedGeneration === generation)
+        deps.setPollingStartedWithTelegramBus(false);
       return;
     }
     await deps.stopClassicPolling();
@@ -1193,13 +1189,25 @@ export function createTelegramThreadAwarePollingPorts<TContext, TOwner>(
     owner: TOwner,
   ): Promise<boolean | undefined> => {
     if (!(await refreshFollowerState())) {
-      deps.recordEvent("bus", "Telegram follower auto-connect skipped: Threaded Mode is not enabled.",
-        { phase: "follower-auto-connect-skip", reason: "thread-mode-unavailable" });
+      deps.recordEvent(
+        "bus",
+        "Telegram follower auto-connect skipped: Threaded Mode is not enabled.",
+        {
+          phase: "follower-auto-connect-skip",
+          reason: "thread-mode-unavailable",
+        },
+      );
       return undefined;
     }
     if (!deps.hasRememberedWorkspaceBinding?.(ctx)) {
-      deps.recordEvent("bus", "Telegram follower auto-connect skipped: no binding for this session.",
-        { phase: "follower-auto-connect-skip", reason: "session-binding-unavailable" });
+      deps.recordEvent(
+        "bus",
+        "Telegram follower auto-connect skipped: no binding for this session.",
+        {
+          phase: "follower-auto-connect-skip",
+          reason: "session-binding-unavailable",
+        },
+      );
       return undefined;
     }
     return deps.restoreFollowerWithLeader?.(ctx, owner);
@@ -1270,7 +1278,8 @@ export function createTelegramThreadCapabilityMonitor<TContext>(
     }
     const expectedGeneration = generation;
     const isLifecycleCurrent = deps.lifecycle?.capture() ?? (() => true);
-    const isCurrent = (): boolean => generation === expectedGeneration && isLifecycleCurrent();
+    const isCurrent = (): boolean =>
+      generation === expectedGeneration && isLifecycleCurrent();
     let tracked: Promise<void>;
     tracked = readTelegramThreadCapability(deps)
       .then(async (threadModeEnabled) => {
@@ -1363,7 +1372,11 @@ export function createTelegramThreadCapabilityMonitor<TContext>(
         try {
           check(ctx);
         } catch (error) {
-          try { stop(); } catch { /* Timer shutdown must not escape the callback. */ }
+          try {
+            stop();
+          } catch {
+            /* Timer shutdown must not escape the callback. */
+          }
           try {
             deps.recordEvent("bus", error, { phase: "capability-monitor" });
           } catch {
@@ -1487,13 +1500,10 @@ export async function admitTelegramPollingUpdateBatch<
   return { updateCount: deps.updates.length, latestUpdateId };
 }
 
-export interface TelegramPollLoopDeps<
+/** Bot API, journal and progress ports shared by one poll loop and its restartable runner. */
+export interface TelegramPollLoopTransportPorts<
   TUpdate extends TelegramUpdate,
-  TContext = unknown,
 > extends TelegramRuntimeEventRecorderPort {
-  ctx: TContext;
-  signal: AbortSignal;
-  config: TelegramPollingConfig;
   deleteWebhook: (signal: AbortSignal) => Promise<unknown>;
   getUpdates: (
     body: Record<string, unknown>,
@@ -1508,9 +1518,6 @@ export interface TelegramPollLoopDeps<
   getAcceptedThroughUpdateId?: () => number | undefined;
   getJournalEntryCount: () => number;
   signalUpdateWorker: () => void;
-  onErrorStatus: (message: string) => void;
-  onStatusReset: () => void;
-  sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   onPhaseChange?: (
     phase: TelegramPollingWorkPhase,
     currentUpdateId?: number,
@@ -1518,32 +1525,25 @@ export interface TelegramPollLoopDeps<
   onSuccessfulResponse?: (updateCount: number) => void;
 }
 
+export interface TelegramPollLoopDeps<
+  TUpdate extends TelegramUpdate,
+  TContext = unknown,
+> extends TelegramPollLoopTransportPorts<TUpdate> {
+  ctx: TContext;
+  signal: AbortSignal;
+  config: TelegramPollingConfig;
+  onErrorStatus: (message: string) => void;
+  onStatusReset: () => void;
+  sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
+}
+
 export interface TelegramPollLoopRunnerDeps<
   TUpdate extends TelegramUpdate,
   TContext = unknown,
-> extends TelegramRuntimeEventRecorderPort {
+> extends TelegramPollLoopTransportPorts<TUpdate> {
   getConfig: () => TelegramPollingConfig;
-  deleteWebhook: (signal: AbortSignal) => Promise<unknown>;
-  getUpdates: (
-    body: Record<string, unknown>,
-    signal: AbortSignal,
-  ) => Promise<TUpdate[]>;
-  getUpdatesRequestBudgetMs?: (body: Record<string, unknown>) => number;
-  persistConfig: (config: TelegramPollingConfig) => Promise<void>;
-  appendUpdateBatch: (
-    updates: readonly TUpdate[],
-    acceptedThroughUpdateId?: number,
-  ) => MaybePromise<unknown>;
-  getAcceptedThroughUpdateId?: () => number | undefined;
-  getJournalEntryCount: () => number;
-  signalUpdateWorker: () => void;
   updateStatus: (ctx: TContext, message?: string) => void;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
-  onPhaseChange?: (
-    phase: TelegramPollingWorkPhase,
-    currentUpdateId?: number,
-  ) => void;
-  onSuccessfulResponse?: (updateCount: number) => void;
 }
 
 export function sleepTelegramPollingRetry(
@@ -1641,10 +1641,7 @@ function reportTelegramPollingPhase(
 function reportTelegramPollingResponse<
   TUpdate extends TelegramUpdate,
   TContext,
->(
-  deps: TelegramPollLoopDeps<TUpdate, TContext>,
-  updateCount: number,
-): void {
+>(deps: TelegramPollLoopDeps<TUpdate, TContext>, updateCount: number): void {
   try {
     deps.onSuccessfulResponse?.(updateCount);
   } catch (error) {
@@ -1724,11 +1721,16 @@ export async function runTelegramPollLoop<
   let consecutiveFailures = 0;
   const retryConflict = async () => {
     consecutiveGetUpdatesConflicts += 1;
-    if (consecutiveGetUpdatesConflicts >= TELEGRAM_GET_UPDATES_CONFLICT_STOP_LIMIT) {
-      throw new TelegramPersistentGetUpdatesConflictError(consecutiveGetUpdatesConflicts);
+    if (
+      consecutiveGetUpdatesConflicts >= TELEGRAM_GET_UPDATES_CONFLICT_STOP_LIMIT
+    ) {
+      throw new TelegramPersistentGetUpdatesConflictError(
+        consecutiveGetUpdatesConflicts,
+      );
     }
     await deps.sleep(
-      consecutiveGetUpdatesConflicts < TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_LIMIT
+      consecutiveGetUpdatesConflicts <
+        TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_LIMIT
         ? TELEGRAM_GET_UPDATES_CONFLICT_FAST_RETRY_MS
         : TELEGRAM_GET_UPDATES_CONFLICT_SLOW_RETRY_MS,
       deps.signal,
@@ -1747,9 +1749,7 @@ export async function runTelegramPollLoop<
       "Telegram polling cursor is missing while the durable update journal is non-empty.",
     );
   }
-  if (
-    deps.getAcceptedThroughUpdateId?.() === undefined
-  ) {
+  if (deps.getAcceptedThroughUpdateId?.() === undefined) {
     try {
       const request = buildTelegramInitialSyncRequest();
       reportTelegramPollingPhase(deps, "long-poll");
@@ -1757,11 +1757,7 @@ export async function runTelegramPollLoop<
       reportTelegramPollingResponse(deps, updates.length);
       const lastUpdateId = getLatestTelegramUpdateId(updates);
       if (lastUpdateId !== undefined) {
-        reportTelegramPollingPhase(
-          deps,
-          "persisting-offset",
-          lastUpdateId,
-        );
+        reportTelegramPollingPhase(deps, "persisting-offset", lastUpdateId);
         await deps.appendUpdateBatch([], lastUpdateId);
         deps.recordRuntimeEvent?.(
           "polling",
@@ -1774,12 +1770,13 @@ export async function runTelegramPollLoop<
       reportTelegramPollingPhase(deps, "retrying");
       if (isTelegramGetUpdatesConflictError(error)) {
         await retryConflict();
-      } else deps.recordRuntimeEvent?.("polling", error, {
-        phase: "initial-sync",
-        ...(error instanceof TelegramGetUpdatesTimeoutError
-          ? { timeoutMs: error.timeoutMs }
-          : {}),
-      });
+      } else
+        deps.recordRuntimeEvent?.("polling", error, {
+          phase: "initial-sync",
+          ...(error instanceof TelegramGetUpdatesTimeoutError
+            ? { timeoutMs: error.timeoutMs }
+            : {}),
+        });
     }
   }
   let currentUpdateId: number | undefined;

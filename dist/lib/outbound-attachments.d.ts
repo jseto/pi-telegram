@@ -37,8 +37,8 @@ export interface TelegramOutboundMessagePlan {
     markdown: string;
     replyMarkup?: unknown;
 }
-export interface TelegramOutboundMessageToolRegistrationDeps extends TelegramOutboundAttachmentRuntimeEventRecorderPort {
-    getDefaultChatId: () => number | undefined;
+export interface TelegramOutboundMessageDeliveryPorts {
+    getDefaultChatId?: () => number | undefined;
     getDefaultTarget?: () => TelegramTarget | undefined;
     getActiveTurn?: () => {
         chatId: number;
@@ -62,6 +62,9 @@ export interface TelegramOutboundMessageToolRegistrationDeps extends TelegramOut
         operationId: string;
         replyMarkup?: unknown;
     }) => Promise<number | undefined>;
+}
+export interface TelegramOutboundMessageToolRegistrationDeps extends TelegramOutboundMessageDeliveryPorts, TelegramOutboundAttachmentRuntimeEventRecorderPort {
+    getDefaultChatId: () => number | undefined;
 }
 export interface TelegramQueuedOutboundAttachmentView {
     path: string;
@@ -169,7 +172,7 @@ export declare function deliverTelegramGuestCachedAttachment(options: {
     deleteMessage: (chatId: number, messageId: number) => Promise<void>;
     recordRuntimeEvent?: TelegramOutboundAttachmentRuntimeEventRecorderPort["recordRuntimeEvent"];
 }): Promise<void>;
-export declare function sendTelegramOutboundMessage(options: {
+export declare function sendTelegramOutboundMessage(options: TelegramOutboundMessageDeliveryPorts & {
     text: string;
     media?: string;
     operationId?: string;
@@ -178,30 +181,6 @@ export declare function sendTelegramOutboundMessage(options: {
     threadId?: number;
     agentThread?: string | number;
     target?: TelegramTarget;
-    getDefaultChatId?: () => number | undefined;
-    getDefaultTarget?: () => TelegramTarget | undefined;
-    getActiveTurn?: () => {
-        chatId: number;
-        target?: TelegramTarget;
-    } | undefined;
-    resolveAgentTarget?: (selector: TelegramBusAgentTargetSelector) => Promise<TelegramTarget & {
-        threadId: number;
-    }>;
-    routeAgentMessage?: (message: TelegramBusAgentMessage) => Promise<void>;
-    canSendDirect: () => boolean;
-    planMessage: (markdown: string) => TelegramOutboundMessagePlan;
-    sendMarkdownMessage: (chatId: number, markdown: string, options?: {
-        replyMarkup?: unknown;
-        target?: TelegramTarget;
-    }) => Promise<number | undefined>;
-    sendChannelMarkdownMessage?: (channel: number | string, markdown: string, options: {
-        operationId: string;
-        replyMarkup?: unknown;
-    }) => Promise<number | undefined>;
-    sendChannelMediaMessage?: (channel: number | string, mediaPath: string, markdown: string, options: {
-        operationId: string;
-        replyMarkup?: unknown;
-    }) => Promise<number | undefined>;
 }): Promise<{
     content: Array<{
         type: "text";

@@ -31,6 +31,36 @@ import {
 } from "../lib/outbound.ts";
 import type { TelegramBridgeApiRuntime } from "../lib/telegram-api.ts";
 
+test("Live work publication observation includes reservations, queued/running tails, failure and reset", async () => {
+  const publication = createTelegramActivityPublicationRuntime();
+  assert.equal(publication.hasPending(), false);
+  const reserved = publication.reserve(); assert.equal(publication.hasPending(), true);
+  const entered = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>();
+  const running = reserved.publish(async () => { entered.resolve(); await finish.promise; });
+  const queued = publication.enqueue(async () => {});
+  await entered.promise; assert.equal(publication.hasPending(), true);
+  publication.reset(); assert.equal(publication.hasPending(), true, "Reset cannot declare an already-issued publication settled");
+  await publication.enqueue(async () => {}); assert.equal(publication.hasPending(), true);
+  finish.resolve(); await Promise.all([running, queued]); assert.equal(publication.hasPending(), false);
+  const cancelled = publication.reserve(); cancelled.cancel(); await cancelled.publish(async () => assert.fail("Cancelled"));
+  assert.equal(publication.hasPending(), false);
+  await assert.rejects(publication.enqueue(async () => { throw new Error("Publication failed"); }), /Publication failed/);
+  assert.equal(publication.hasPending(), false);
+});
+
+test("Live work activity fanout observation covers queued handlers before public transport", async () => {
+  const entered = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>();
+  const unregister = registerTelegramActivityHandler({ id: "work-observation", async handle() { entered.resolve(); await finish.promise; } });
+  const dispatcher = createTelegramActivityDispatcher();
+  try {
+    assert.equal(dispatcher.hasPending?.(), false);
+    dispatcher.dispatch(createEvent("agent-end")); assert.equal(dispatcher.hasPending?.(), true);
+    await entered.promise; assert.equal(dispatcher.hasPending?.(), true);
+    dispatcher.dispatch(createEvent("agent-settled", 2)); assert.equal(dispatcher.hasPending?.(), true);
+    finish.resolve(); await waitForActivityDispatch(); assert.equal(dispatcher.hasPending?.(), false);
+  } finally { finish.resolve(); dispatcher.stop(); unregister(); }
+});
+
 test("Activity publication isolates failed tasks and fences queued work across reset", async () => {
   const publication = createTelegramActivityPublicationRuntime();
   const events: string[] = [];
@@ -95,6 +125,22 @@ test("Publication reservations release on cancellation/reset and accept one task
   await publication.enqueue(async () => { events.push("fresh"); });
   assert.deepEqual(events, ["next", "sent", "fresh"]);
 });
+
+for (const mode of ["settled", "unconfirmed", "duplicate", "reset", "reset-unconfirmed"] as const) {
+  test(`Detached publication work observes lifetime without ordering or renewal (${mode})`, async () => {
+    const publication = createTelegramActivityPublicationRuntime(), work = publication.beginWork();
+    assert.equal(publication.hasPending(), true); assert.equal(publication.hasUnconfirmed(), false);
+    let published = false; await publication.enqueue(async () => { published = true; });
+    assert.equal(published, true, "Tracked work cannot block or reorder ordinary publication"); assert.equal(publication.hasPending(), true);
+    if (mode.startsWith("reset")) { publication.reset(); assert.equal(publication.hasPending(), true, "Reset cannot hide still-running old work"); }
+    work.settle(mode.includes("unconfirmed") ? "unconfirmed" : "settled");
+    if (mode === "duplicate") { work.settle("unconfirmed"); work.settle("settled"); }
+    assert.equal(publication.hasPending(), false); assert.equal(publication.hasUnconfirmed(), mode === "unconfirmed");
+    const next = publication.beginWork(); assert.equal(publication.hasPending(), true); next.settle("settled");
+    assert.equal(publication.hasPending(), false); assert.equal(publication.hasUnconfirmed(), mode === "unconfirmed", "Fresh success cannot certify an older unknown effect");
+    publication.reset(); assert.equal(publication.hasUnconfirmed(), false);
+  });
+}
 
 function waitForActivityDispatch(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));

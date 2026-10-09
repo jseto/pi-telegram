@@ -5,10 +5,12 @@
  */
 
 import { execFile } from "node:child_process";
-import { parentPort, workerData } from "node:worker_threads";
 import { pathToFileURL } from "node:url";
+import { parentPort, workerData } from "node:worker_threads";
 
-if (!parentPort) throw new Error("Generative App worker requires a parent port.");
+if (!parentPort) {
+  throw new Error("Generative App worker requires a parent port.");
+}
 
 const controller = new AbortController();
 const runningChildren = new Set();
@@ -25,11 +27,17 @@ function runBoundedProcess(input) {
   }
   const command = input.command?.trim();
   if (!command) throw new Error("Generative App run.command is required.");
-  if (!Array.isArray(input.args ?? []) || (input.args?.length ?? 0) > workerData.runMaxArgs) {
-    throw new Error(`Generative App run.args accepts at most ${workerData.runMaxArgs} strings.`);
+  if (
+    !Array.isArray(input.args ?? []) ||
+    (input.args?.length ?? 0) > workerData.runMaxArgs
+  ) {
+    throw new Error(
+      `Generative App run.args accepts at most ${workerData.runMaxArgs} strings.`,
+    );
   }
   const args = (input.args ?? []).map((argument) => {
-    if (typeof argument !== "string") throw new Error("Generative App run.args must contain strings.");
+    if (typeof argument !== "string")
+      throw new Error("Generative App run.args must contain strings.");
     return argument;
   });
   if (!input.cwd || typeof input.cwd !== "string") {
@@ -82,11 +90,15 @@ function runBoundedProcess(input) {
 try {
   const module = await import(pathToFileURL(workerData.modulePath).href);
   if (typeof module.init !== "function") {
-    throw new Error(`Generative App ${workerData.app} must export named function init.`);
+    throw new Error(
+      `Generative App ${workerData.app} must export named function init.`,
+    );
   }
   const method = module[workerData.method];
   if (typeof method !== "function") {
-    throw new Error(`Generative App ${workerData.app} does not export method ${workerData.method}.`);
+    throw new Error(
+      `Generative App ${workerData.app} does not export method ${workerData.method}.`,
+    );
   }
   const result = await method({
     ...(workerData.argumentPresent ? { argument: workerData.argument } : {}),

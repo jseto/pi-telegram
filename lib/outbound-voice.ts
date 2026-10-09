@@ -13,8 +13,8 @@ import {
   getTelegramTargetThreadParams,
   type TelegramTarget,
 } from "./target.ts";
-import { getTelegramVoiceSynthesisProviders } from "./voice.ts";
 import { isTelegramApiCommitUnknownError } from "./telegram-api.ts";
+import { getTelegramVoiceSynthesisProviders } from "./voice.ts";
 
 export interface TelegramVoiceReplyTurnView {
   chatId: number;
@@ -121,32 +121,38 @@ export function createTelegramVoiceReplySender<THandler = unknown>(
     await sendVoiceChatAction(deps, turn.chatId);
     if (deps.isDeliveryActive?.() === false) return;
     await withTelegramReplyParameters(
-      turn.chatId, options?.replyToPrompt === false ? undefined : turn.replyToMessageId, turn.target,
-      (replyParameters) => deps.sendMultipart(
-        "sendVoice",
-        {
-          chat_id: String(turn.chatId),
-          ...(replyParameters ? { reply_parameters: JSON.stringify(replyParameters) } : {}),
-          ...(turn.target
-            ? Object.fromEntries(
-                Object.entries(getTelegramTargetThreadParams(turn.target)).map(
-                  ([key, value]) => [key, String(value)],
-                ),
-              )
-            : {}),
-          ...(options?.replyMarkup !== undefined && options.replyMarkup !== null
-            ? {
-                reply_markup:
-                  typeof options.replyMarkup === "string"
-                    ? options.replyMarkup
-                    : JSON.stringify(options.replyMarkup),
-              }
-            : {}),
-        },
-        "voice",
-        voiceFilePath,
-        basename(voiceFilePath),
-      ),
+      turn.chatId,
+      options?.replyToPrompt === false ? undefined : turn.replyToMessageId,
+      turn.target,
+      (replyParameters) =>
+        deps.sendMultipart(
+          "sendVoice",
+          {
+            chat_id: String(turn.chatId),
+            ...(replyParameters
+              ? { reply_parameters: JSON.stringify(replyParameters) }
+              : {}),
+            ...(turn.target
+              ? Object.fromEntries(
+                  Object.entries(
+                    getTelegramTargetThreadParams(turn.target),
+                  ).map(([key, value]) => [key, String(value)]),
+                )
+              : {}),
+            ...(options?.replyMarkup !== undefined &&
+            options.replyMarkup !== null
+              ? {
+                  reply_markup:
+                    typeof options.replyMarkup === "string"
+                      ? options.replyMarkup
+                      : JSON.stringify(options.replyMarkup),
+                }
+              : {}),
+          },
+          "voice",
+          voiceFilePath,
+          basename(voiceFilePath),
+        ),
     );
   };
 

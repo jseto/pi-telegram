@@ -3,14 +3,20 @@
  * Zones: telegram, pi agent, orchestration
  * Owns pi-facing tool, command, and lifecycle hook registration for the entrypoint
  */
-import * as Activity from "./activity.ts";
 import * as ActivityVerbosity from "./activity-verbosity.ts";
+import * as Activity from "./activity.ts";
+import * as BusApi from "./bus-api.ts";
+import type { TelegramBusFollowerCommandOwner } from "./bus-follower.ts";
+import type { TelegramBusLiveRebindWorkState } from "./bus.ts";
 import * as ChannelPosts from "./channel-posts.ts";
 import * as Commands from "./commands.ts";
 import * as Config from "./config.ts";
+import * as Delivery from "./delivery.ts";
+import * as GenerativeApps from "./generative-apps.ts";
 import * as Keyboard from "./keyboard.ts";
 import * as Lifecycle from "./lifecycle.ts";
 import * as Locks from "./locks.ts";
+import * as Menu from "./menu.ts";
 import * as Model from "./model.ts";
 import * as OutboundAttachments from "./outbound-attachments.ts";
 import * as OutboundHandlers from "./outbound.ts";
@@ -18,13 +24,28 @@ import * as Pi from "./pi.ts";
 import * as Preview from "./preview.ts";
 import * as Prompts from "./prompts.ts";
 import * as Queue from "./queue.ts";
+import * as Replies from "./replies.ts";
 import * as Routing from "./routing.ts";
 import * as Runtime from "./runtime.ts";
 import * as Setup from "./setup.ts";
 import * as Status from "./status.ts";
-import * as TelegramApi from "./telegram-api.ts";
 import type { TelegramTarget } from "./target.ts";
-import * as GenerativeApps from "./generative-apps.ts";
+import * as TelegramApi from "./telegram-api.ts";
+/** Compose any registered held command over captured recipient effects; no ordinary follower API fallback. */
+export declare function createTelegramFollowerSelectedCommandBinding<TContext, TModel extends Model.MenuModel = Model.MenuModel>(deps: {
+    ctx: TContext;
+    operationId: string;
+    registrationGeneration: string;
+    name: string;
+    target: TelegramTarget & {
+        threadId: number;
+    };
+    recipient: Pick<TelegramBusFollowerCommandOwner<TContext>, "isCurrent" | "assertRecipientCurrent">;
+    command: Pick<ReturnType<typeof Commands.createTelegramCommandHandlerTargetRuntime<Commands.TelegramCommandRuntimeMessage, TContext>>, "prepareHeldCommand" | "canPrepareHeldCommand">;
+    menu?: Omit<Menu.TelegramMenuActionRuntimeDeps<TContext, TModel>, "sendTextReply" | "sendInteractiveMessage" | "editInteractiveMessage">;
+    deliver: Parameters<typeof BusApi.createTelegramSelectedMenuTextApi>[0]["deliver"];
+    recordOwnership: NonNullable<Replies.TelegramRenderedMessageDeliveryRuntimeDeps<Menu.TelegramReplyMarkup>["recordOwnership"]>;
+}): TelegramBusFollowerCommandOwner<TContext> | undefined;
 type ActivePiModel = NonNullable<Pi.ExtensionContext["model"]>;
 type TelegramRuntimeEventRecorder = (category: string, error: unknown, details?: Record<string, unknown>) => void;
 type TelegramBridgeStatusUpdater = Status.TelegramStatusRuntime<Pi.ExtensionContext>["updateStatus"];
@@ -139,6 +160,9 @@ type TelegramAssistantOutputAuthority<TTransportStamp> = ReturnType<Routing.Tele
 export interface TelegramBridgePublicationRuntime {
     enqueue: Activity.TelegramActivityPublicationRuntime["enqueue"];
     reserve: Activity.TelegramActivityPublicationRuntime["reserve"];
+    hasPending: Activity.TelegramActivityPublicationRuntime["hasPending"];
+    beginWork: Activity.TelegramActivityPublicationRuntime["beginWork"];
+    hasUnconfirmed: Activity.TelegramActivityPublicationRuntime["hasUnconfirmed"];
     capture: () => {
         target?: Queue.TelegramQueueTarget;
         isCurrent: () => boolean;
@@ -156,6 +180,21 @@ export declare function createTelegramActivityBindingRuntime<TTransportStamp>(de
     assistantOutput: Omit<Parameters<typeof createTelegramAssistantOutputBindingRuntime<TTransportStamp>>[0], "waitForActivityIdle" | "enqueue">;
     activityVerbosity: Omit<Parameters<typeof ActivityVerbosity.createTelegramActivityVerbosityRuntime<TelegramAssistantOutputAuthority<TTransportStamp>>>[0], "captureAuthority" | "isAuthorityActive" | "recordFailure" | "enqueue">;
 }): TelegramActivityBindingRuntime;
+/** Fresh current work projection; a snapshot is not a cleanup grant or target-application ACK. */
+export declare function createTelegramLiveTargetWorkObserver<TContext>(deps: {
+    queue: Pick<Queue.TelegramQueueStateStore<TContext>, "getQueuedItems">;
+    activeTurn: Pick<Queue.TelegramActiveTurnStore, "get">;
+    lifecycle: Pick<Runtime.TelegramBridgeRuntime["lifecycle"], "hasDispatchPending" | "isCompactionInProgress" | "getActiveToolExecutions">;
+    isIdle(ctx: TContext): boolean;
+    hasPendingMessages(ctx: TContext): boolean;
+    hasPendingControl(): boolean;
+    publication: Pick<TelegramBridgePublicationRuntime, "hasPending" | "hasUnconfirmed">;
+    activity: Pick<Activity.TelegramActivityRuntime, "hasPending">;
+    delivery: Pick<ReturnType<typeof Delivery.createTelegramDeliveryLifecycleHooks>, "hasPendingTarget">;
+    api: Pick<TelegramApi.TelegramApiTargetActivityRuntime, "hasPendingTarget">;
+}): (target: TelegramTarget & {
+    threadId: number;
+}, ctx: TContext) => TelegramBusLiveRebindWorkState;
 interface TelegramCommandsAndToolsBindingDeps {
     pi: Pi.ExtensionAPI;
     agentDir: string;
@@ -165,7 +204,6 @@ interface TelegramCommandsAndToolsBindingDeps {
     activeTurnRuntime: Queue.TelegramActiveTurnStore<Queue.PendingTelegramTurn>;
     lockedPollingRuntime: Locks.TelegramLockedPollingRuntime<Pi.ExtensionContext>;
     stopPolling?: () => Promise<void | string>;
-    recoverPollingStart?: Commands.TelegramBridgeCommandRegistrationDeps["recoverPollingStart"];
     getDisconnectThreadName?: () => string | undefined;
     onTransportChanged?: () => Promise<void> | void;
     getStatusLines: (options?: Status.TelegramBridgeStatusLineOptions) => string[];
@@ -199,7 +237,7 @@ interface TelegramCommandsAndToolsBindingDeps {
     connectionIntent: NonNullable<Commands.TelegramBridgeCommandRegistrationDeps["connectionIntent"]>;
     recordRuntimeEvent: TelegramRuntimeEventRecorder;
 }
-export declare function registerTelegramCommandsAndTools({ pi, agentDir, configStore, persistConfig, setup, activeTurnRuntime, lockedPollingRuntime, stopPolling, recoverPollingStart, getDisconnectThreadName, onTransportChanged, getStatusLines, buttonActionStore, sendMarkdownReply, sendChannelMarkdownMessage, sendChannelMediaMessage, listChannelPosts, mutateChannelPost, callMultipart, getDefaultChatId, getDefaultTarget, resolveAgentTarget, routeAgentMessage, canSendDirect, setGenerativeAppLiveSurfaceRuntime, recordRuntimeEvent, updateStatus, isContextCurrent, getSessionGeneration, connectionIntent, }: TelegramCommandsAndToolsBindingDeps): void;
+export declare function registerTelegramCommandsAndTools({ pi, agentDir, configStore, persistConfig, setup, activeTurnRuntime, lockedPollingRuntime, stopPolling, getDisconnectThreadName, onTransportChanged, getStatusLines, buttonActionStore, sendMarkdownReply, sendChannelMarkdownMessage, sendChannelMediaMessage, listChannelPosts, mutateChannelPost, callMultipart, getDefaultChatId, getDefaultTarget, resolveAgentTarget, routeAgentMessage, canSendDirect, setGenerativeAppLiveSurfaceRuntime, recordRuntimeEvent, updateStatus, isContextCurrent, getSessionGeneration, connectionIntent, }: TelegramCommandsAndToolsBindingDeps): void;
 interface TelegramLifecycleBindingDeps {
     pi: Pi.ExtensionAPI;
     publicationRuntime: TelegramBridgePublicationRuntime;

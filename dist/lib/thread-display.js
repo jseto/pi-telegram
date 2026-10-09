@@ -27,8 +27,7 @@ function distinguishingDirectorySegments(cwd, directories) {
     for (let depth = 1; depth <= parts.length; depth++) {
         const candidate = labelText(parts.slice(-depth).join("/"));
         const collides = directories.some((other) => other !== cwd &&
-            labelText(directorySegments(other).slice(-depth).join("/")).toLowerCase() ===
-                candidate.toLowerCase());
+            labelText(directorySegments(other).slice(-depth).join("/")).toLowerCase() === candidate.toLowerCase());
         if (!collides)
             return parts.slice(-depth);
     }
@@ -50,16 +49,20 @@ function formatDirectoryLabel(cwd, directories, mode) {
     const segments = distinguishingDirectorySegments(cwd, directories);
     if (!segments.length)
         return "/";
-    const formatted = segments.map((segment) => {
+    const formatted = segments
+        .map((segment) => {
         const tokens = tokenizeTelegramDirectorySegment(segment);
         if (!tokens.length)
             return "";
         if (mode === "directory-snake")
             return tokens.map((token) => token.toLowerCase()).join("_");
-        return tokens.map((token) => /\p{L}/u.test(token) && token === token.toUpperCase()
+        return tokens
+            .map((token) => /\p{L}/u.test(token) && token === token.toUpperCase()
             ? token
-            : `${token.slice(0, 1).toUpperCase()}${token.slice(1).toLowerCase()}`).join(" ");
-    }).filter(Boolean);
+            : `${token.slice(0, 1).toUpperCase()}${token.slice(1).toLowerCase()}`)
+            .join(" ");
+    })
+        .filter(Boolean);
     if (!formatted.length)
         return directoryLabel(cwd, directories);
     return formatted.join(mode === "directory-snake" ? "_" : " / ");
@@ -75,9 +78,25 @@ export function resolveTelegramLiveWorkspaceBindingKeys(bindings, leaderTarget, 
     add(leaderTarget);
     for (const follower of followers)
         add(follower.target);
-    return new Set(bindings.filter((binding) => targets.has(`${binding.target.chatId}:${binding.target.threadId}`)).map((binding) => binding.bindingKey));
+    return new Set(bindings
+        .filter((binding) => targets.has(`${binding.target.chatId}:${binding.target.threadId}`))
+        .map((binding) => binding.bindingKey));
 }
 /** Missing or ambiguous metadata yields no label rather than inventing identity. */
+/** Case-insensitive label occurrences; directory modes count only live bindings. */
+function countTelegramDisplayLabels(bindings, labels, mode, liveBindingKeys) {
+    const counts = new Map();
+    for (const binding of bindings) {
+        const label = labels.get(binding.bindingKey);
+        if (!label ||
+            ((mode === "directory-snake" || mode === "directory-title") &&
+                !liveBindingKeys.has(binding.bindingKey)))
+            continue;
+        const key = label.toLowerCase();
+        counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return counts;
+}
 export function resolveTelegramWorkspaceDisplayNames(bindings, mode, liveBindingKeys = new Set()) {
     const labels = new Map();
     const directories = Array.from(new Set(bindings.map((binding) => binding.cwd)));
@@ -111,30 +130,29 @@ export function resolveTelegramWorkspaceDisplayNames(bindings, mode, liveBinding
                 : formatDirectoryLabel(binding.cwd, directories, mode);
             bases.set(binding.bindingKey, base);
             const showSuffix = mode === "directories"
-                ? binding.showSlotSuffix || bindings.filter((candidate) => candidate.cwd === binding.cwd).length > 1
+                ? binding.showSlotSuffix ||
+                    bindings.filter((candidate) => candidate.cwd === binding.cwd)
+                        .length > 1
                 : (liveDirectoryCounts.get(binding.cwd) ?? 0) > 1;
             if (showSuffix && !slot)
                 continue;
-            const suffix = !showSuffix ? "" : mode === "directory-title"
-                ? ` ${slot}`
-                : `_${slot.toLowerCase()}`;
+            const suffix = !showSuffix
+                ? ""
+                : mode === "directory-title"
+                    ? ` ${slot}`
+                    : `_${slot.toLowerCase()}`;
             labels.set(binding.bindingKey, boundedLabel(base, suffix));
         }
     }
     // Long or whitespace-normalized paths can collide even after qualification.
-    if (mode === "directories" || mode === "directory-snake" || mode === "directory-title") {
-        const counts = new Map();
+    if (mode === "directories" ||
+        mode === "directory-snake" ||
+        mode === "directory-title") {
+        const counts = countTelegramDisplayLabels(bindings, labels, mode, liveBindingKeys);
         for (const binding of bindings) {
             const label = labels.get(binding.bindingKey);
-            if (!label || ((mode === "directory-snake" || mode === "directory-title") &&
-                !liveBindingKeys.has(binding.bindingKey)))
-                continue;
-            const key = label.toLowerCase();
-            counts.set(key, (counts.get(key) ?? 0) + 1);
-        }
-        for (const binding of bindings) {
-            const label = labels.get(binding.bindingKey);
-            if (binding.manualThreadName || !label ||
+            if (binding.manualThreadName ||
+                !label ||
                 (counts.get(label.toLowerCase()) ?? 0) < 2)
                 continue;
             if ((mode === "directory-snake" || mode === "directory-title") &&
@@ -146,18 +164,12 @@ export function resolveTelegramWorkspaceDisplayNames(bindings, mode, liveBinding
                 labels.delete(binding.bindingKey);
                 continue;
             }
-            labels.set(binding.bindingKey, boundedLabel(bases.get(binding.bindingKey), mode === "directory-title" ? ` ${binding.slot}` : `_${binding.slot.toLowerCase()}`));
+            labels.set(binding.bindingKey, boundedLabel(bases.get(binding.bindingKey), mode === "directory-title"
+                ? ` ${binding.slot}`
+                : `_${binding.slot.toLowerCase()}`));
         }
     }
-    const counts = new Map();
-    for (const binding of bindings) {
-        const label = labels.get(binding.bindingKey);
-        if (!label || ((mode === "directory-snake" || mode === "directory-title") &&
-            !liveBindingKeys.has(binding.bindingKey)))
-            continue;
-        const key = label.toLowerCase();
-        counts.set(key, (counts.get(key) ?? 0) + 1);
-    }
+    const counts = countTelegramDisplayLabels(bindings, labels, mode, liveBindingKeys);
     for (const [key, label] of labels) {
         if ((counts.get(label.toLowerCase()) ?? 0) > 1)
             labels.delete(key);
@@ -170,7 +182,8 @@ export function resolveTelegramInitialWorkspaceDisplayName(input) {
         ? {
             ...input.binding,
             ...(retained.showSlotSuffix ? { showSlotSuffix: true } : {}),
-            ...(input.preserveRetainedManualName !== false && retained.manualThreadName
+            ...(input.preserveRetainedManualName !== false &&
+                retained.manualThreadName
                 ? { manualThreadName: retained.manualThreadName }
                 : {}),
         }
@@ -182,7 +195,9 @@ export function resolveTelegramInitialWorkspaceDisplayName(input) {
 }
 export async function applyTelegramThreadDisplaySetting(mode, deps) {
     const profile = deps.getProfileKey();
-    const setter = deps.ownsLeader() ? deps.getLeaderSetter() : deps.getFollowerSetter();
+    const setter = deps.ownsLeader()
+        ? deps.getLeaderSetter()
+        : deps.getFollowerSetter();
     if (!setter)
         throw new Error("Thread display settings require a connected compatible instance.");
     await setter(mode);
@@ -196,7 +211,8 @@ export function createTelegramThreadDisplaySettingsRuntime(deps) {
     return {
         isCustom() {
             const target = deps.getTarget();
-            return !!target && typeof deps.getBinding(target)?.manualThreadName === "string";
+            return (!!target &&
+                typeof deps.getBinding(target)?.manualThreadName === "string");
         },
         async setMode(mode) {
             const target = deps.getTarget();
@@ -220,8 +236,10 @@ export function createTelegramThreadDisplayReconciler(deps) {
         const profile = deps.getProfileKey();
         const mode = deps.getMode();
         const assertAuthority = () => {
-            if (epoch === undefined || deps.getLeaderEpoch() !== epoch ||
-                deps.getProfileKey() !== profile || deps.getMode() !== mode) {
+            if (epoch === undefined ||
+                deps.getLeaderEpoch() !== epoch ||
+                deps.getProfileKey() !== profile ||
+                deps.getMode() !== mode) {
                 throw new Error("Telegram Thread display update lost profile, mode, or leader authority.");
             }
         };
@@ -239,7 +257,9 @@ export function createTelegramThreadDisplayReconciler(deps) {
                 throw new Error("Telegram Thread display identity is missing or ambiguous.");
             const assertBinding = (expected) => {
                 assertAuthority();
-                const current = deps.store.listWorkspaceBindings().find((candidate) => candidate.bindingKey === expected.bindingKey);
+                const current = deps.store
+                    .listWorkspaceBindings()
+                    .find((candidate) => candidate.bindingKey === expected.bindingKey);
                 if (!isDeepStrictEqual(current, expected) || !isBindingCurrent()) {
                     throw new Error("Telegram Thread display binding changed.");
                 }

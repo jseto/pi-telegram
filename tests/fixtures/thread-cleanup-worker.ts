@@ -15,7 +15,7 @@ const owner = { processId: process.pid, processBirthId: `${process.pid}:worker` 
 const store = createTelegramThreadCleanupWorkStore({ path: workPath,
   profileName: candidate.profileName, tokenSha256: "a".repeat(64) });
 const ledger = createTelegramWorkspaceAdmissionLedger({ path: ledgerPath,
-  profileKey: candidate.profileName, owner, getProcessLiveness: () => "unknown" });
+  profileKey: candidate.profileName, owner, getProcessLiveness: () => "unverifiable" });
 const permitRuntime = createTelegramThreadCleanupPermitRuntime({ ledger,
   getLeaderEpoch: () => 1, getProfileName: () => "work", getOwner: () => owner, canAdoptFence: () => false,
   async revalidateUnderFence() { return true; } });

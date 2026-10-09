@@ -5,8 +5,8 @@
  */
 import { type TelegramTarget } from "./target.ts";
 import * as ThreadReconciler from "./thread-reconciler.ts";
-import { type TelegramWorkspaceAdmissionLedger } from "./workspace-admission.ts";
 import { type TelegramOwnTopicProvisionResult, type TelegramTopicTargetStore, type TelegramWorkspaceDisplayBinding, type TelegramWorkspaceThreadBinding } from "./threads.ts";
+import { type TelegramWorkspaceAdmissionLedger } from "./workspace-admission.ts";
 export interface TelegramTopicLifecycleSyncUpdate<TMessage = unknown> {
     kind: "created" | "closed" | "reopened";
     target: TelegramTarget & {
@@ -144,7 +144,6 @@ export declare function recoverStaleTelegramTopicApiError<TSyncState extends Tel
 export declare function ensureTelegramLeaderThreadBinding(deps: TelegramLeaderThreadSyncDeps): Promise<TelegramOwnTopicProvisionResult | undefined>;
 export declare const TELEGRAM_SYNC_SLICES: readonly ["bot-identity", "bot-capabilities", "pairing", "allowed-user", "topic-capability", "topic-state", "target-bindings", "reservations", "transport-health"];
 export type TelegramSyncSlice = (typeof TELEGRAM_SYNC_SLICES)[number];
-export type TelegramSyncTrigger = "startup" | "reload" | "topic-lifecycle" | "stale-api-error" | "setup-change" | "pairing-change" | "follower-register" | "follower-prune" | "status-request" | "leader-health-tick" | "ordinary-message" | "ordinary-send";
 export interface TelegramSyncSliceState {
     status: "fresh" | "suspect" | "unknown";
     updatedAtMs?: number;
@@ -174,7 +173,6 @@ export interface TelegramProvisioningActivityRuntime {
     end(): void;
 }
 export declare function createTelegramProvisioningActivityRuntime(): TelegramProvisioningActivityRuntime;
-export declare function shouldReconcileTelegramSync(trigger: TelegramSyncTrigger): boolean;
 export declare function markTelegramSyncSliceSuspect(state: TelegramSyncState, slice: TelegramSyncSlice, input: {
     reason: string;
     nowMs: number;

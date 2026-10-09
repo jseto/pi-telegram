@@ -9,10 +9,12 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readdir,
   readFile,
+  rename,
   rm,
   stat,
   utimes,
@@ -46,10 +48,8 @@ import {
   readTelegramConfig,
   resolveTelegramThreadDisplayMode,
   setTelegramThreadDisplayMode,
-  setGlobalTelegramConfigRuntime,
-  updateTelegramVoiceConfig,
-  writeTelegramConfig,
 } from "../lib/config.ts";
+import { createTelegramJournalSourceSerialization } from "../lib/journal.ts";
 import { createTelegramSettingsMenuRuntime } from "../lib/menu-settings.ts";
 import { createTelegramLockRuntime } from "../lib/locks.ts";
 
@@ -57,6 +57,23 @@ const execFileAsync = promisify(execFile);
 
 function legacyConfig(value: Record<string, unknown>): TelegramConfig {
   return value as TelegramConfig;
+}
+
+/** Seed a config file the way an operator-edited, atomically replaced file appears on disk. */
+async function writeTelegramConfig(
+  agentDir: string,
+  configPath: string,
+  config: TelegramConfig,
+): Promise<void> {
+  await mkdir(agentDir, { recursive: true });
+  const tempConfigPath = `${configPath}.tmp-${process.pid}-${Date.now()}`;
+  await writeFile(tempConfigPath, JSON.stringify(config, null, "\t") + "\n", {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  await chmod(tempConfigPath, 0o600);
+  await rename(tempConfigPath, configPath);
+  await chmod(configPath, 0o600);
 }
 import {
   createTelegramSetupPromptRuntime,
@@ -970,22 +987,6 @@ test("Telegram time injection mode setter persists telegram.json", async () => {
   });
 });
 
-test("Telegram config runtime lets extensions update live voice config", async () => {
-  let voice: TelegramConfig["voice"] | undefined;
-  setGlobalTelegramConfigRuntime({
-    updateVoiceConfig: (nextVoice) => {
-      voice = nextVoice;
-    },
-  });
-  try {
-    assert.equal(updateTelegramVoiceConfig({ replyMode: "mirror" }), true);
-    assert.deepEqual(voice, { replyMode: "mirror" });
-  } finally {
-    setGlobalTelegramConfigRuntime(undefined);
-  }
-  assert.equal(updateTelegramVoiceConfig({ replyMode: "always" }), false);
-});
-
 test("Telegram config store owns load, mutation, and persistence", async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-store-"));
   const configPath = join(agentDir, "telegram.json");
@@ -1191,72 +1192,7 @@ test("Paired-only admission rejects stale or conflicting authority without cache
   }
 });
 
-test("Source serialization is lock-only across config absence, corruption and authority changes", async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), "telegram-source-serialization-"));
-  const configPath = join(dir, "telegram.json");
-  const originalRead = fs.readFileSync;
-  const read = t.mock.method(fs, "readFileSync", (...args: Parameters<typeof fs.readFileSync>) => {
-    assert.notEqual(args[0], configPath, "Serialization must not read config contents");
-    return originalRead(...args);
-  });
-  syncBuiltinESMExports();
-  try {
-    for (const activeProfile of [undefined, "work"]) {
-      const store = createTelegramConfigStore({ agentDir: dir, configPath, initialConfig: {
-        profiles: {
-          default: { botToken: "cached-default", allowedUserId: 42 },
-          work: { botToken: "cached-work", allowedUserId: 43 },
-        },
-      } });
-      assert.equal(store.activateProfile(activeProfile), true);
-      store.update((config) => { config.assistant = { activity: "quiet" }; });
-      const cached = store.getStoredConfig();
-      for (const bytes of [undefined, "{broken", JSON.stringify({ profiles: {
-        default: { botToken: "rotated-default" },
-        work: { botToken: "rotated-work", allowedUserId: 99 },
-      } })]) {
-        if (bytes === undefined) await rm(configPath, { force: true });
-        else await writeFile(configPath, bytes);
-        const result = {};
-        let calls = 0;
-        assert.equal(store.withSourceSerialization((...args) => {
-          calls += 1;
-          assert.deepEqual(args, [], "No config data or lock capability is exposed");
-          assert.equal(fs.existsSync(`${configPath}.transaction`), true);
-          return result;
-        }), result);
-        assert.equal(calls, 1);
-        const failure = new Error("source operation failed");
-        assert.throws(() => store.withSourceSerialization(() => { throw failure; }), (error) => error === failure);
-        assert.equal(fs.existsSync(`${configPath}.transaction`), false);
-        assert.equal(store.withSourceSerialization(() => "retry"), "retry");
-        assert.equal(store.getStoredConfig(), cached);
-        assert.equal(store.getActiveProfileName(), activeProfile);
-        assert.equal(store.getAllowedUserId(), activeProfile ? 43 : 42);
-        assert.equal(store.get().assistant?.activity, "quiet");
-        if (bytes === undefined) assert.equal(fs.existsSync(configPath), false);
-        else assert.equal(await readFile(configPath, "utf8"), bytes);
-        assert.deepEqual(await readdir(dir), bytes === undefined ? [] : ["telegram.json"]);
-      }
-      // Misuse witness: an async continuation is outside this synchronous contract.
-      let lockAfterAwait: boolean | undefined;
-      const unsupported = store.withSourceSerialization(async () => {
-        assert.equal(fs.existsSync(`${configPath}.transaction`), true);
-        await Promise.resolve();
-        lockAfterAwait = fs.existsSync(`${configPath}.transaction`);
-      });
-      assert.equal(fs.existsSync(`${configPath}.transaction`), false);
-      await unsupported;
-      assert.equal(lockAfterAwait, false);
-    }
-  } finally {
-    read.mock.restore();
-    syncBuiltinESMExports();
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("Source serialization contends with real observation, sender admission and owner-fenced grant", async (t) => {
+test("Journal source serialization never blocks pairing observation, sender admission or owner-fenced grant", async (t) => {
   for (const mode of ["observation", "paired", "grant"] as const) {
     await t.test(mode, async () => {
       const dir = await mkdtemp(join(tmpdir(), "telegram-source-contention-"));
@@ -1312,16 +1248,15 @@ test("Source serialization contends with real observation, sender admission and 
       const child = execFileAsync(process.execPath,
         ["--experimental-strip-types", "--input-type=module", "--eval", script], { timeout: 15_000 });
       try {
-        const store = createTelegramConfigStore({ agentDir: dir, configPath });
-        store.withSourceSerialization(() => {
+        // Config authority is a separate outer lock: holding journal serialization never delays it.
+        createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction"))(() => {
           fs.writeFileSync(startPath, "start");
           const deadline = Date.now() + 8000;
-          while (!fs.existsSync(blockedPath)) {
-            if (Date.now() >= deadline) throw new Error("contention barrier timed out");
+          while (!fs.existsSync(enteredPath)) {
+            if (Date.now() >= deadline) throw new Error("admission did not complete while journal serialization was held");
             Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
           }
-          assert.equal(fs.existsSync(enteredPath), false);
-          assert.equal(fs.readFileSync(configPath, "utf8"), original);
+          assert.equal(fs.existsSync(blockedPath), false);
         });
         const result = JSON.parse((await child).stdout);
         assert.deepEqual(result, mode === "paired" ? { admitted: true, value: "entered" } : mode === "grant" ? true : "entered");

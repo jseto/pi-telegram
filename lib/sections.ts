@@ -12,8 +12,6 @@ import type { TelegramInputRichMessage } from "./telegram-api.ts";
 
 const SECTION_REGISTRY_KEY = "__piTelegramSectionRegistry__";
 
-// --- Core Types ---
-
 /** @internal */
 export type TelegramSectionId = string;
 
@@ -74,20 +72,9 @@ export interface TelegramSectionContext {
   deleteMessage(): Promise<void>;
 }
 
-export interface TelegramSectionCallbackContext {
-  sectionId: string;
-  chatId: number;
-  messageId?: number;
+export interface TelegramSectionCallbackContext extends TelegramSectionContext {
   action: string;
   payload: string;
-  answerCallback(text?: string): Promise<void>;
-  edit(view: TelegramSectionView): Promise<void>;
-  open(view: TelegramSectionView): Promise<void>;
-  openRich(message: TelegramInputRichMessage): Promise<void>;
-  enqueuePrompt(prompt: string): Promise<void>;
-  callbackData(action: string, payload?: string): string;
-  /** Delete the message that triggered this callback (dialog cleanup) */
-  deleteMessage(): Promise<void>;
 }
 
 /** @internal */
@@ -211,11 +198,13 @@ function buildTelegramSectionContext(
         )
         .then(() => {}),
     openRich: (message) =>
-      deps.sendRichMessage(
-        chatId,
-        message,
-        deps.target ? { target: deps.target } : undefined,
-      ).then(() => {}),
+      deps
+        .sendRichMessage(
+          chatId,
+          message,
+          deps.target ? { target: deps.target } : undefined,
+        )
+        .then(() => {}),
     enqueuePrompt: deps.enqueuePrompt,
     callbackData: (action, payload) =>
       buildTelegramSectionCallbackData(token, action, payload),
@@ -239,45 +228,18 @@ function buildTelegramSectionCallbackContext(
   backLabel = "⬆️ Back",
 ): TelegramSectionCallbackContext {
   return {
-    sectionId,
-    chatId,
-    messageId,
+    ...buildTelegramSectionContext(
+      sectionId,
+      token,
+      chatId,
+      messageId,
+      callbackQueryId,
+      deps,
+      backCallback,
+      backLabel,
+    ),
     action,
     payload,
-    answerCallback: (text) => deps.answerCallbackQuery(callbackQueryId, text),
-    edit: (view) =>
-      messageId !== undefined
-        ? deps.editInteractiveMessage(
-            chatId,
-            messageId,
-            view.text,
-            view.parseMode ?? "html",
-            prependBackRow(view.replyMarkup, backCallback, backLabel),
-          )
-        : Promise.resolve(),
-    open: (view) =>
-      deps
-        .sendInteractiveMessage(
-          chatId,
-          view.text,
-          view.parseMode ?? "html",
-          view.replyMarkup ?? { inline_keyboard: [] },
-          deps.target ? { target: deps.target } : undefined,
-        )
-        .then(() => {}),
-    openRich: (message) =>
-      deps.sendRichMessage(
-        chatId,
-        message,
-        deps.target ? { target: deps.target } : undefined,
-      ).then(() => {}),
-    enqueuePrompt: deps.enqueuePrompt,
-    callbackData: (action, payload) =>
-      buildTelegramSectionCallbackData(token, action, payload),
-    deleteMessage: () =>
-      messageId !== undefined
-        ? deps.deleteMessage(chatId, messageId)
-        : Promise.resolve(),
   };
 }
 
@@ -528,46 +490,19 @@ export function parseTelegramSectionCallback(
   };
 }
 
-/** @internal */
-export interface TelegramSectionCallbackHandlerDeps {
-  answerCallbackQuery: (id: string, text?: string) => Promise<void>;
-  target?: TelegramSectionTarget;
-  editInteractiveMessage: (
-    chatId: number,
-    messageId: number,
-    text: string,
-    mode: "markdown" | "html" | "plain",
-    replyMarkup: TelegramInlineKeyboardMarkup,
-  ) => Promise<void>;
-  sendInteractiveMessage: (
-    chatId: number,
-    text: string,
-    mode: "markdown" | "html" | "plain",
-    replyMarkup: TelegramInlineKeyboardMarkup,
-    options?: { target?: TelegramSectionTarget },
-  ) => Promise<number | undefined>;
-  sendRichMessage: (
-    chatId: number,
-    message: TelegramInputRichMessage,
-    options?: { target?: TelegramSectionTarget },
-  ) => Promise<number | undefined>;
-  enqueuePrompt: (prompt: string) => Promise<void>;
-  deleteMessage: (chatId: number, messageId: number) => Promise<void>;
-}
-
 export async function handleTelegramSectionOpen(
   registry: TelegramSectionRegistry,
   token: TelegramSectionToken,
   chatId: number,
   messageId: number,
   callbackQueryId: string,
-  deps: TelegramSectionCallbackHandlerDeps,
+  deps: TelegramSectionRuntimeDeps,
 ): Promise<boolean> {
   const section = registry.getByToken(token);
   if (!section) {
     await deps.answerCallbackQuery(
       callbackQueryId,
-      "This section is no longer available.",
+      "This section is no longer available",
     );
     return true;
   }
@@ -618,13 +553,13 @@ export async function handleTelegramSectionCallback(
   chatId: number,
   messageId: number,
   callbackQueryId: string,
-  deps: TelegramSectionCallbackHandlerDeps,
+  deps: TelegramSectionRuntimeDeps,
 ): Promise<boolean> {
   const section = registry.getByToken(token);
   if (!section) {
     await deps.answerCallbackQuery(
       callbackQueryId,
-      "This section is no longer available.",
+      "This section is no longer available",
     );
     return true;
   }
@@ -687,13 +622,13 @@ export async function handleTelegramSectionSettingsOpen(
   chatId: number,
   messageId: number,
   callbackQueryId: string,
-  deps: TelegramSectionCallbackHandlerDeps,
+  deps: TelegramSectionRuntimeDeps,
 ): Promise<boolean> {
   const section = registry.getByToken(token);
   if (!section || !section.registration.settings) {
     await deps.answerCallbackQuery(
       callbackQueryId,
-      "This section is no longer available.",
+      "This section is no longer available",
     );
     return true;
   }

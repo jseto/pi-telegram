@@ -4,6 +4,7 @@
  */
 
 import assert from "node:assert/strict";
+
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -69,15 +70,14 @@ import {
   executeTelegramQueueDispatchPlan,
   formatQueuedTelegramItemsStatus,
   getNextTelegramToolExecutionCount,
-  getTelegramQueueItemAdmissionMode,
   getTelegramQueueLaneContract,
   handleTelegramAgentEndRuntime,
   handleTelegramAgentStartRuntime,
   handleTelegramToolExecutionEndRuntime,
   handleTelegramToolExecutionStartRuntime,
   isTelegramQueueItemAdmissionValid,
-  isTelegramQueueItemDurablyAdmitted,
   partitionTelegramQueueItemsForHistory,
+  observeTelegramTargetQueueWork,
   planNextTelegramQueueAction,
   planTelegramPromptEnqueue,
   removeTelegramQueueItemByReceipt,
@@ -136,6 +136,26 @@ function createQueueTestControlItem<TContext = unknown>(
   };
 }
 
+test("Live target queue work partitions current captured namespaces without resolving fallback targets", () => {
+  const target = { chatId: 7, threadId: 10 };
+  const cases = [
+    { item: { chatId: 7, target }, protected: true, unknown: false },
+    { item: { chatId: 7, target: { chatId: 7, threadId: 42 } }, protected: false, unknown: false },
+    { item: { chatId: 8, target: { chatId: 8, threadId: 10 } }, protected: false, unknown: false },
+    { item: { chatId: 7 }, protected: false, unknown: true },
+    { item: { chatId: 8 }, protected: false, unknown: false },
+    { item: { chatId: 7, target: { chatId: 8, threadId: 10 } }, protected: false, unknown: true },
+    { item: { chatId: 7, target: { chatId: 7, threadId: 0 } }, protected: false, unknown: true },
+  ];
+  for (const { item, ...expected } of cases) {
+    const before = structuredClone(item);
+    assert.deepEqual(observeTelegramTargetQueueWork(target, item, []), expected);
+    assert.deepEqual(observeTelegramTargetQueueWork(target, undefined, [item]), expected);
+    assert.deepEqual(item, before);
+  }
+  assert.deepEqual(observeTelegramTargetQueueWork(target, undefined, []), { protected: false, unknown: false });
+  assert.equal(observeTelegramTargetQueueWork({ ...target, threadId: 0 }, undefined, []).unknown, true);
+});
 test("Queue store owns queued item state helpers", () => {
   const item: PendingTelegramTurn = createQueueTestPromptTurn({
     queueOrder: 3,
@@ -326,7 +346,7 @@ test("Queue lane contracts define admission modes and dispatch order", () => {
   );
   assert.equal(getTelegramQueueLaneContract("priority").dispatchRank, 1);
   assert.equal(
-    getTelegramQueueItemAdmissionMode({ queueLane: "control" }),
+    getTelegramQueueLaneContract("control").admissionMode,
     "control-queue",
   );
   assert.equal(
@@ -3608,6 +3628,45 @@ test("Agent end records event when voice fallback text delivery also fails", asy
   assert.ok(events.some((e) => e.includes("voice-fallback-text")));
 });
 
+test("Agent end skips voice artifact delivery for a text-only reply plan", async () => {
+  const events: string[] = [];
+  const textDeliveries: string[] = [];
+  let artifactDeliveries = 0;
+  await handleTelegramAgentEndRuntime({
+    turn: createQueueTestPromptTurn(),
+    assistant: { text: "Plain text reply" },
+    foldQueuedPromptsIntoHistory: false,
+    resetRuntimeState: () => {},
+    updateStatus: () => {},
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async (_chatId, markdown) => {
+      textDeliveries.push(markdown);
+      return true;
+    },
+    sendMarkdownReply: async (_chatId, _replyToMessageId, markdown) => {
+      textDeliveries.push(markdown);
+    },
+    sendTextReply: async () => {},
+    sendQueuedAttachments: async () => {},
+    planOutboundReply: (markdown) => ({ markdown }),
+    sendOutboundReplyArtifacts: async () => {
+      artifactDeliveries += 1;
+    },
+    recordRuntimeEvent: (category, error, details) => {
+      events.push(
+        `error:${category}:${(error as Error).message}:${details?.phase ?? "none"}`,
+      );
+    },
+    dispatchNextQueuedTelegramTurn: () => {
+      events.push("dispatch");
+    },
+  });
+  assert.equal(artifactDeliveries, 0);
+  assert.deepEqual(textDeliveries, ["Plain text reply"]);
+  assert.deepEqual(events, ["dispatch"]);
+});
+
 test("Agent end does not intercept when rawFinalText is whitespace only", async () => {
   let voiceArtifactsCalled = false;
   const turn: PendingTelegramTurn = {
@@ -4899,6 +4958,36 @@ test("Prompt enqueue controller binds runtime ports to context", async () => {
   ]);
 });
 
+for (const boundary of ["current", "before", "prepared", "built"] as const) {
+  test(`Prompt enqueue per-call authority preserves unrelated physical queue and fold policy (${boundary})`, async () => {
+    const old = createQueueTestPromptTurn({ queueOrder: 1 });
+    const next = createQueueTestPromptTurn({ queueOrder: 2 });
+    let items: TelegramQueueItem[] = [old], fold = true, current = boundary !== "before", admitted = 0, dispatch = 0;
+    const controller = createTelegramPromptEnqueueController<number>({
+      getQueuedItems: () => items, setQueuedItems: value => { items = value; },
+      getFoldQueuedPromptsIntoHistory: () => fold, setFoldQueuedPromptsIntoHistory: value => { fold = value; },
+      hasPendingDispatch: () => false,
+      async prepareTurn() {
+        if (boundary === "prepared") current = false;
+        return history => {
+          assert.deepEqual(history, []);
+          if (boundary === "built") current = false;
+          return next;
+        };
+      }, updateStatus() {}, dispatchNextQueuedTelegramTurn() { dispatch++; },
+    });
+    const enqueue = () => controller.enqueue([2], undefined, () => { admitted++; }, {
+      preserveQueued: true, assertCurrent() { if (!current) throw new Error("Caller authority changed"); },
+    });
+    if (boundary === "current") await enqueue();
+    else await assert.rejects(enqueue, /Caller authority changed/);
+    assert.deepEqual(items, boundary === "current" ? [old, next] : [old]);
+    assert.equal(fold, true);
+    assert.equal(admitted, boundary === "current" ? 1 : 0);
+    assert.equal(dispatch, boundary === "current" ? 1 : 0);
+  });
+}
+
 test("Prompt enqueue never restores a head consumed during asynchronous construction", async () => {
   const prompts = [1, 2, 3, 4].map((id) => createQueueTestPromptTurn({
     replyToMessageId: id,
@@ -6000,8 +6089,7 @@ test("Queue dispatch waits for durable admission without dropping the head item"
       events.push(`items:${items.length}`);
     },
     canDispatch: () => true,
-    isQueueItemAdmissionReady: (item) =>
-      isTelegramQueueItemDurablyAdmitted(item, () => ready),
+    isQueueItemAdmissionReady: () => ready,
     updateStatus: () => events.push("status"),
     sendTextReply: async () => undefined,
     onPromptDispatchStart: () => events.push("start"),

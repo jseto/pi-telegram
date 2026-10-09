@@ -7,21 +7,31 @@
 import { isDeepStrictEqual } from "node:util";
 /** UI copy is allowlisted; raw exception text belongs only in redacted diagnostics. */
 export function formatTelegramConnectionFailure(error) {
-    const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-    const status = error && typeof error === "object" && "status" in error ? error.status : undefined;
-    const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+    const message = error instanceof Error
+        ? error.message
+        : typeof error === "string"
+            ? error
+            : "";
+    const status = error && typeof error === "object" && "status" in error
+        ? error.status
+        : undefined;
+    const code = error && typeof error === "object" && "code" in error
+        ? error.code
+        : undefined;
     if (status === 401)
         return "Telegram token rejected. Run /telegram-setup.";
     if (status === 403)
         return "Telegram access denied. Check /telegram-status --debug.";
-    if ((typeof code === "string" && ["ECONNREFUSED", "ETIMEDOUT", "ENOTFOUND", "ECONNRESET"].includes(code)) ||
+    if ((typeof code === "string" &&
+        ["ECONNREFUSED", "ETIMEDOUT", "ENOTFOUND", "ECONNRESET"].includes(code)) ||
         /network unavailable|fetch failed/i.test(message)) {
         return "Telegram network unavailable. Retry /telegram-connect.";
     }
     if (/Workspace slots?.*(?:unavailable|exhausted)|no free.*slot/i.test(message)) {
         return "No Telegram slot available. Check /telegram-status --debug.";
     }
-    if (code === "incompatible-protocol" || /protocol.*(?:incompatible|mismatch)|incompatible.*protocol/i.test(message)) {
+    if (code === "incompatible-protocol" ||
+        /protocol.*(?:incompatible|mismatch)|incompatible.*protocol/i.test(message)) {
         return "Telegram instances are incompatible. Update them together.";
     }
     if (/unsupported.*(?:journal|version)|(?:journal|version).*unsupported/i.test(message)) {
@@ -61,17 +71,11 @@ function truncateTelegramRuntimeEventText(text, maxLength) {
         return text;
     return `${text.slice(0, maxLength).trimEnd()}… [truncated ${text.length - maxLength} chars]`;
 }
-function redactTelegramRuntimeMessage(message, botToken) {
+function redactTelegramRuntimeText(text, botToken, maxLength) {
     const redacted = botToken
-        ? message.split(botToken).join("<redacted-token>")
-        : message;
-    return truncateTelegramRuntimeEventText(redacted, MAX_TELEGRAM_RUNTIME_EVENT_MESSAGE_LENGTH);
-}
-function redactTelegramRuntimeDetail(message, botToken) {
-    const redacted = botToken
-        ? message.split(botToken).join("<redacted-token>")
-        : message;
-    return truncateTelegramRuntimeEventText(redacted, MAX_TELEGRAM_RUNTIME_EVENT_DETAIL_LENGTH);
+        ? text.split(botToken).join("<redacted-token>")
+        : text;
+    return truncateTelegramRuntimeEventText(redacted, maxLength);
 }
 function normalizeTelegramRuntimeEventDetails(details, botToken) {
     if (!details)
@@ -81,7 +85,7 @@ function normalizeTelegramRuntimeEventDetails(details, botToken) {
         if (value === undefined)
             continue;
         if (typeof value === "string") {
-            normalized[key] = redactTelegramRuntimeDetail(value, botToken);
+            normalized[key] = redactTelegramRuntimeText(value, botToken, MAX_TELEGRAM_RUNTIME_EVENT_DETAIL_LENGTH);
             continue;
         }
         if (typeof value === "number" || typeof value === "boolean") {
@@ -92,7 +96,7 @@ function normalizeTelegramRuntimeEventDetails(details, botToken) {
             normalized[key] = null;
             continue;
         }
-        normalized[key] = redactTelegramRuntimeDetail(String(value), botToken);
+        normalized[key] = redactTelegramRuntimeText(String(value), botToken, MAX_TELEGRAM_RUNTIME_EVENT_DETAIL_LENGTH);
     }
     return Object.keys(normalized).length > 0 ? normalized : undefined;
 }
@@ -108,7 +112,7 @@ export function recordStructuredTelegramRuntimeEvent(events, input, options) {
     events.push({
         at: options.now ?? Date.now(),
         category: input.category,
-        message: redactTelegramRuntimeMessage(getTelegramRuntimeEventMessage(input), options.botToken),
+        message: redactTelegramRuntimeText(getTelegramRuntimeEventMessage(input), options.botToken, MAX_TELEGRAM_RUNTIME_EVENT_MESSAGE_LENGTH),
         ...(details ? { details } : {}),
     });
     while (events.length > options.maxEvents) {
@@ -248,7 +252,9 @@ export function createTelegramBridgeStatusRuntime(deps) {
             const config = deps.getConfig();
             const queuedItems = deps.getQueuedItems();
             const hasPendingDispatch = deps.hasDispatchPending();
-            const waitingItems = hasPendingDispatch ? queuedItems.slice(1) : queuedItems;
+            const waitingItems = hasPendingDispatch
+                ? queuedItems.slice(1)
+                : queuedItems;
             const queuedItemCount = deps.getQueuedItemCount?.(waitingItems) ?? waitingItems.length;
             const hasActiveTurn = deps.hasActiveTurn();
             const hasPendingModelSwitch = deps.hasPendingModelSwitch();
@@ -305,9 +311,7 @@ export function createTelegramBridgeStatusRuntime(deps) {
                 instanceThreadName: deps.getInstanceThreadName?.(),
                 lockState: deps.getRuntimeLockState?.(),
                 pollingActive: deps.isPollingActive(),
-                ...(deps.getPollingState
-                    ? { polling: deps.getPollingState() }
-                    : {}),
+                ...(deps.getPollingState ? { polling: deps.getPollingState() } : {}),
                 ...(deps.getInboundWorkerState
                     ? { inboundWorker: deps.getInboundWorkerState() }
                     : {}),
@@ -377,9 +381,21 @@ function isRuntimeProjection(value) {
     if (!value || typeof value !== "object" || Array.isArray(value))
         return false;
     const record = value;
-    return record.version === 1 && record.source === "snapshot" && Number.isSafeInteger(record.writtenAtMs) && record.writtenAtMs >= 0 &&
-        Object.keys(record).every(key => ["version", "source", "writtenAtMs", "runtime", "liveRoster", "diagnostics"].includes(key)) &&
-        ["runtime", "liveRoster", "diagnostics"].every(key => record[key] !== null && typeof record[key] === "object" && !Array.isArray(record[key]));
+    return (record.version === 1 &&
+        record.source === "snapshot" &&
+        Number.isSafeInteger(record.writtenAtMs) &&
+        record.writtenAtMs >= 0 &&
+        Object.keys(record).every((key) => [
+            "version",
+            "source",
+            "writtenAtMs",
+            "runtime",
+            "liveRoster",
+            "diagnostics",
+        ].includes(key)) &&
+        ["runtime", "liveRoster", "diagnostics"].every((key) => record[key] !== null &&
+            typeof record[key] === "object" &&
+            !Array.isArray(record[key])));
 }
 /** Observational runtime storage only; Workspace, admission, transport, logs and recovery remain with their owners. */
 export function createTelegramRuntimeProjectionStore(options) {
@@ -392,7 +408,11 @@ export function createTelegramRuntimeProjectionStore(options) {
         read() {
             try {
                 const path = getPath(), profile = getProfile(), value = read({ path, profile });
-                return getPath() === path && getProfile() === profile && isRuntimeProjection(value) ? value : undefined;
+                return getPath() === path &&
+                    getProfile() === profile &&
+                    isRuntimeProjection(value)
+                    ? value
+                    : undefined;
             }
             catch {
                 return undefined;
@@ -403,26 +423,51 @@ export function createTelegramRuntimeProjectionStore(options) {
             if (!authority)
                 return false;
             // Freeze wire content at submission, but do not duplicate the event log in persistent runtime state.
-            const semantic = JSON.parse(JSON.stringify({ version: 1, source: "snapshot", runtime: snapshot.runtime,
-                liveRoster: snapshot.liveRoster, diagnostics: snapshot.diagnostics }));
+            const semantic = JSON.parse(JSON.stringify({
+                version: 1,
+                source: "snapshot",
+                runtime: snapshot.runtime,
+                liveRoster: snapshot.liveRoster,
+                diagnostics: snapshot.diagnostics,
+            }));
             if (!isRuntimeProjection({ ...semantic, writtenAtMs: 0 }))
                 throw new Error("Telegram runtime projection is malformed.");
             delete semantic.diagnostics.recentRuntimeEvents;
+            // Poll-cycle timestamps change on every response; live status renders them from memory,
+            // so persisting them would rewrite state.json each poll for no reader.
+            const polling = semantic.runtime.polling;
+            if (polling && typeof polling === "object" && !Array.isArray(polling)) {
+                const volatile = polling;
+                delete volatile.phaseStartedAtMs;
+                delete volatile.lastSuccessfulResponseAtMs;
+                delete volatile.lastSuccessfulResponseUpdateCount;
+            }
             const isCurrent = () => getPath() === path && getProfile() === profile && authority() === true;
+            const isUnchanged = (current) => {
+                if (!isRuntimeProjection(current))
+                    return false;
+                const { writtenAtMs: _writtenAtMs, ...existing } = current;
+                return isDeepStrictEqual(existing, semantic);
+            };
             const publication = publicationQueue.then(() => {
                 if (!isCurrent())
                     return false;
-                return publish({ path, profile }, current => {
-                    if (isRuntimeProjection(current)) {
-                        const { writtenAtMs: _writtenAtMs, ...existing } = current;
-                        if (isDeepStrictEqual(existing, semantic))
-                            return { value: current, changed: false };
-                    }
+                // Observational state needs no transaction when the published projection already matches.
+                try {
+                    if (isUnchanged(read({ path, profile })))
+                        return false;
+                }
+                catch {
+                    // An unreadable envelope stays with the transactional publisher's fail-closed path.
+                }
+                return (publish({ path, profile }, (current) => {
+                    if (isUnchanged(current))
+                        return { value: current, changed: false };
                     const writtenAtMs = getNowMs();
                     if (!Number.isSafeInteger(writtenAtMs) || writtenAtMs < 0)
                         throw new Error("Telegram runtime projection timestamp is invalid.");
                     return { value: { ...semantic, writtenAtMs }, changed: true };
-                }, isCurrent) === true;
+                }, isCurrent) === true);
             });
             publicationQueue = publication.then(() => undefined, () => undefined);
             return publication;
@@ -432,7 +477,8 @@ export function createTelegramRuntimeProjectionStore(options) {
 const TELEGRAM_DIAGNOSTICS_SNAPSHOT_COALESCE_MS = 100;
 export function createTelegramRuntimeDiagnosticsSnapshotScheduler(deps) {
     const setTimer = deps.setTimer ?? setTimeout;
-    const clearTimer = deps.clearTimer ?? ((handle) => clearTimeout(handle));
+    const clearTimer = deps.clearTimer ??
+        ((handle) => clearTimeout(handle));
     let generation = 0;
     let enabled = true;
     let timer;
@@ -503,7 +549,9 @@ export function createTelegramRuntimeDiagnosticsSnapshotScheduler(deps) {
                 return;
             let tracked;
             tracked = Promise.resolve()
-                .then(() => publicationAuthority() ? deps.persistSnapshot(publicationAuthority) : undefined)
+                .then(() => publicationAuthority()
+                ? deps.persistSnapshot(publicationAuthority)
+                : undefined)
                 .catch(recordError)
                 .finally(() => {
                 if (persistPromise !== tracked)
@@ -553,13 +601,7 @@ export function getTelegramStatusBarProcessingStatus(state) {
     return undefined;
 }
 function getTelegramStatusBarLabel(state) {
-    const threadName = state.instanceThreadName?.trim();
-    if (!threadName)
-        return "telegram";
-    const genericLabels = new Set(["telegram", "leader", "follower"]);
-    if (genericLabels.has(threadName.toLowerCase()))
-        return "telegram";
-    return threadName;
+    return state.instanceThreadName?.trim() || "telegram";
 }
 export function buildTelegramStatusBarText(theme, state) {
     const label = theme.fg("accent", getTelegramStatusBarLabel(state));
@@ -568,14 +610,15 @@ export function buildTelegramStatusBarText(theme, state) {
         : "";
     if (!state.hasBotToken)
         return `${label} ${theme.fg("muted", "not configured")}${queued}`;
-    if (state.pollingStopReason === "persistent-conflict" && state.busRole !== "follower")
+    if (state.pollingStopReason === "persistent-conflict" &&
+        state.busRole !== "follower")
         return `${label} ${theme.fg("error", "error")}`;
     if (!state.paired)
         return `${label} ${theme.fg("warning", "awaiting pairing")}${queued}`;
     if (state.busLifecyclePhase === "electing")
         return `${label} ${theme.fg("warning", "electing")}${queued}`;
     if (!state.pollingActive && state.busRole !== "follower")
-        return `${theme.fg("accent", "telegram")} ${theme.fg("dim", "disconnected")}${queued}`;
+        return `${label} ${theme.fg("dim", "disconnected")}${queued}`;
     if (state.error) {
         return `${label} ${theme.fg("error", "error")}${queued}`;
     }
@@ -820,9 +863,7 @@ function buildTelegramPollingDiagnosticLines(polling) {
     return [
         `- phase: ${polling.phase}`,
         ...(polling.phaseStartedAtMs !== undefined
-            ? [
-                `- phase started: ${new Date(polling.phaseStartedAtMs).toISOString()}`,
-            ]
+            ? [`- phase started: ${new Date(polling.phaseStartedAtMs).toISOString()}`]
             : []),
         ...(polling.currentUpdateId !== undefined
             ? [`- current update id: ${polling.currentUpdateId}`]
@@ -889,7 +930,9 @@ function buildTelegramInboundWorkerDiagnosticLines(worker) {
             ? [`- blocked reason: ${worker.blockedReason}`]
             : []),
         ...(worker.blockedInputCustody
-            ? [`- blocked input custody: update=${worker.blockedInputCustody.updateId}, kind=${worker.blockedInputCustody.kind}`]
+            ? [
+                `- blocked input custody: update=${worker.blockedInputCustody.updateId}, kind=${worker.blockedInputCustody.kind}`,
+            ]
             : []),
         ...(worker.lastCompletedUpdateId !== undefined
             ? [
@@ -903,10 +946,18 @@ function buildTelegramInboundWorkerDiagnosticLines(worker) {
             : []),
     ];
 }
+function countTelegramQueueLanes(items) {
+    const counts = {
+        control: 0,
+        priority: 0,
+        default: 0,
+    };
+    for (const item of items)
+        counts[item.queueLane]++;
+    return counts;
+}
 function buildTelegramBridgeCompactStatusLines(state) {
-    const controlQueueCount = state.queuedItems.filter((item) => item.queueLane === "control").length;
-    const priorityQueueCount = state.queuedItems.filter((item) => item.queueLane === "priority").length;
-    const defaultQueueCount = state.queuedItems.filter((item) => item.queueLane === "default").length;
+    const { control: controlQueueCount, priority: priorityQueueCount, default: defaultQueueCount, } = countTelegramQueueLanes(state.queuedItems);
     const queueLine = `- queued turns: ${state.queuedItems.length}${state.queuedItems.length > 0
         ? ` (control=${controlQueueCount}, priority=${priorityQueueCount}, default=${defaultQueueCount})`
         : ""}`;
@@ -966,9 +1017,7 @@ export function buildTelegramBridgeStatusLines(state, options = {}) {
     return buildTelegramBridgeCompactStatusLines(state);
 }
 function buildTelegramBridgeDiagnosticStatusLines(state) {
-    const controlQueueCount = state.queuedItems.filter((item) => item.queueLane === "control").length;
-    const priorityQueueCount = state.queuedItems.filter((item) => item.queueLane === "priority").length;
-    const defaultQueueCount = state.queuedItems.filter((item) => item.queueLane === "default").length;
+    const { control: controlQueueCount, priority: priorityQueueCount, default: defaultQueueCount, } = countTelegramQueueLanes(state.queuedItems);
     return [
         "connection:",
         `- bot: ${formatTelegramBridgeBotStatus(state)}`,
@@ -1023,12 +1072,6 @@ function buildTelegramBridgeDiagnosticStatusLines(state) {
         "",
         ...buildTelegramRuntimeEventLines(state.recentRuntimeEvents),
     ];
-}
-function escapeHtml(text) {
-    return text
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
 }
 function formatTokens(count) {
     if (count < 1000)
@@ -1149,4 +1192,10 @@ function buildStatusHtml(ctx, activeModel, bridgeStatus) {
         lines.push(buildStatusRow(row.label, row.value));
     }
     return lines.join("\n");
+}
+function escapeHtml(text) {
+    return text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
 }

@@ -93,6 +93,15 @@ function isPiRunMode(value: unknown): value is PiRunMode {
   );
 }
 
+/** Pi rejects a context captured before session replacement with a stale-context error; this is not a domain failure. */
+export function isPiStaleContextError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.message.includes("stale after session") ||
+      error.message.includes("stale ctx"))
+  );
+}
+
 export function getExtensionContextMode(ctx: unknown): PiRunMode | undefined {
   const mode =
     typeof ctx === "object" && ctx !== null
@@ -184,10 +193,15 @@ type HostSettingsManager = {
 
 function readEnabledModels(value: unknown): string[] | undefined {
   if (value === undefined) return undefined;
-  if (Array.isArray(value) && value.every((entry) => typeof entry === "string")) {
+  if (
+    Array.isArray(value) &&
+    value.every((entry) => typeof entry === "string")
+  ) {
     return [...value];
   }
-  throw new TypeError("Host settings enabledModels must be a string array or undefined.");
+  throw new TypeError(
+    "Host settings enabledModels must be a string array or undefined.",
+  );
 }
 
 export function normalizeSettingsManager(manager: unknown): PiSettingsManager {
@@ -198,18 +212,20 @@ export function normalizeSettingsManager(manager: unknown): PiSettingsManager {
   if (typeof host.flush !== "function") {
     throw new TypeError("Host settings manager must provide flush().");
   }
-  const read = typeof host.getEnabledModels === "function"
-    ? () => host.getEnabledModels!.call(host)
-    : typeof host.get === "function"
-      ? () => host.get!.call(host, "enabledModels")
-      : undefined;
-  const write = typeof host.setEnabledModels === "function"
-    ? (patterns: string[] | undefined) =>
-        host.setEnabledModels!.call(host, patterns)
-    : typeof host.set === "function"
+  const read =
+    typeof host.getEnabledModels === "function"
+      ? () => host.getEnabledModels!.call(host)
+      : typeof host.get === "function"
+        ? () => host.get!.call(host, "enabledModels")
+        : undefined;
+  const write =
+    typeof host.setEnabledModels === "function"
       ? (patterns: string[] | undefined) =>
-          host.set!.call(host, "enabledModels", patterns ?? [])
-      : undefined;
+          host.setEnabledModels!.call(host, patterns)
+      : typeof host.set === "function"
+        ? (patterns: string[] | undefined) =>
+            host.set!.call(host, "enabledModels", patterns ?? [])
+        : undefined;
   if (!read || !write) {
     throw new TypeError(
       "Host settings manager must provide enabled-model read and write capabilities.",
@@ -264,8 +280,12 @@ export function getExtensionContextCwd(ctx: ExtensionContext): string {
 }
 
 export function getExtensionContextSessionId(ctx: ExtensionContext): string;
-export function getExtensionContextSessionId(ctx: ExtensionContext | undefined): string | undefined;
-export function getExtensionContextSessionId(ctx: ExtensionContext | undefined): string | undefined {
+export function getExtensionContextSessionId(
+  ctx: ExtensionContext | undefined,
+): string | undefined;
+export function getExtensionContextSessionId(
+  ctx: ExtensionContext | undefined,
+): string | undefined {
   // Minimal hosts and stale contexts may omit a session manager; absence is not an invented ID.
   return ctx?.sessionManager?.getSessionId?.();
 }

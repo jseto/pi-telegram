@@ -4,19 +4,15 @@
  * Owns pure contracts for deciding when local Telegram mirror state should be refreshed without querying Telegram on every action
  */
 
-import { getTelegramApiErrorRequestTarget, isTelegramStaleTargetHttpError } from "./telegram-api.ts";
 import { getTelegramTargetKey, type TelegramTarget } from "./target.ts";
+import {
+  getTelegramApiErrorRequestTarget,
+  isTelegramStaleTargetHttpError,
+} from "./telegram-api.ts";
 import * as ThreadReconciler from "./thread-reconciler.ts";
-import { TelegramWorkspaceSlotUnavailableError } from "./workspace-slots.ts";
-import { normalizeTelegramWorkspacePath } from "./workspace-identity.ts";
 import {
-  createTelegramWorkspaceAdmissionOperationId,
-  runWithTelegramWorkspaceAdmissionsAsync,
-  type TelegramWorkspaceAdmissionLedger,
-} from "./workspace-admission.ts";
-import {
-  createTelegramCleanupTargetProtection,
   commitTelegramWorkspaceProvisionBinding,
+  createTelegramCleanupTargetProtection,
   getTelegramTargetFromApiBody,
   getTelegramThreadOwnerKey,
   isSameTelegramProcessInstance,
@@ -27,6 +23,13 @@ import {
   type TelegramWorkspaceDisplayBinding,
   type TelegramWorkspaceThreadBinding,
 } from "./threads.ts";
+import {
+  createTelegramWorkspaceAdmissionOperationId,
+  runWithTelegramWorkspaceAdmissionsAsync,
+  type TelegramWorkspaceAdmissionLedger,
+} from "./workspace-admission.ts";
+import { normalizeTelegramWorkspacePath } from "./workspace-identity.ts";
+import { TelegramWorkspaceSlotUnavailableError } from "./workspace-slots.ts";
 
 export interface TelegramTopicLifecycleSyncUpdate<TMessage = unknown> {
   kind: "created" | "closed" | "reopened";
@@ -180,9 +183,11 @@ export interface TelegramManualThreadDisconnectDeps<TSyncState> {
   getNowMs?: () => number;
 }
 
-function markTelegramConfigSyncChange<
-  TSyncState extends TelegramSyncState,
->(state: TSyncState, action: string, options?: { nowMs?: number }): TSyncState {
+function markTelegramConfigSyncChange<TSyncState extends TelegramSyncState>(
+  state: TSyncState,
+  action: string,
+  options?: { nowMs?: number },
+): TSyncState {
   const nowMs = options?.nowMs ?? Date.now();
   let nextState = markTelegramSyncSliceFresh(state, "pairing", {
     nowMs,
@@ -201,8 +206,10 @@ function markTelegramConfigSyncChange<
 
 export function createTelegramPreservedLeaderQuitHandler(deps: {
   instanceId: string;
-  topicTargetStore: Pick<TelegramTopicTargetStore,
-    "load" | "list" | "listPendingCleanups" | "detachTargetOwner">;
+  topicTargetStore: Pick<
+    TelegramTopicTargetStore,
+    "load" | "list" | "listPendingCleanups" | "detachTargetOwner"
+  >;
   getCurrentLeaderEpoch: () => number | string | undefined;
   getProfileName: () => string | undefined;
   isPollingSuspended: () => boolean;
@@ -213,29 +220,60 @@ export function createTelegramPreservedLeaderQuitHandler(deps: {
     const epoch = deps.getCurrentLeaderEpoch();
     const profile = deps.getProfileName();
     if (epoch === undefined || !isSessionCurrent()) return undefined;
-    const isCurrent = () => isSessionCurrent() && deps.getCurrentLeaderEpoch() === epoch &&
-      deps.getProfileName() === profile && deps.isPollingSuspended();
+    const isCurrent = () =>
+      isSessionCurrent() &&
+      deps.getCurrentLeaderEpoch() === epoch &&
+      deps.getProfileName() === profile &&
+      deps.isPollingSuspended();
     return async () => {
-      if (!isCurrent() || await deps.resolveAutomaticThreadCleanupEnabled() !== false) return;
+      if (
+        !isCurrent() ||
+        (await deps.resolveAutomaticThreadCleanupEnabled()) !== false
+      )
+        return;
       if (!isCurrent()) return;
-      await deps.runWorkspaceOperation({
-        operationId: createTelegramWorkspaceAdmissionOperationId(),
-        operationKind: "workspace.preserve-leader-quit",
-        scopes: [{ kind: "profile" }],
-      }, async () => {
-        if (!isCurrent()) return;
-        await deps.topicTargetStore.load();
-        if (!isCurrent()) return;
-        const records = deps.topicTargetStore.list().filter((record) =>
-          record.instanceId === deps.instanceId && (record.status === "active" || record.status === "starting"));
-        if (records.length !== 1) return;
-        const record = records[0]!;
-        if (deps.topicTargetStore.listPendingCleanups().some((intent) =>
-          intent.target.chatId === record.target.chatId && intent.target.threadId === record.target.threadId)) return;
-        if (!await deps.topicTargetStore.detachTargetOwner(record, isCurrent) && isCurrent()) {
-          throw new Error("Telegram preserved leader detachment was not committed.");
-        }
-      });
+      await deps.runWorkspaceOperation(
+        {
+          operationId: createTelegramWorkspaceAdmissionOperationId(),
+          operationKind: "workspace.preserve-leader-quit",
+          scopes: [{ kind: "profile" }],
+        },
+        async () => {
+          if (!isCurrent()) return;
+          await deps.topicTargetStore.load();
+          if (!isCurrent()) return;
+          const records = deps.topicTargetStore
+            .list()
+            .filter(
+              (record) =>
+                record.instanceId === deps.instanceId &&
+                (record.status === "active" || record.status === "starting"),
+            );
+          if (records.length !== 1) return;
+          const record = records[0]!;
+          if (
+            deps.topicTargetStore
+              .listPendingCleanups()
+              .some(
+                (intent) =>
+                  intent.target.chatId === record.target.chatId &&
+                  intent.target.threadId === record.target.threadId,
+              )
+          )
+            return;
+          if (
+            !(await deps.topicTargetStore.detachTargetOwner(
+              record,
+              isCurrent,
+            )) &&
+            isCurrent()
+          ) {
+            throw new Error(
+              "Telegram preserved leader detachment was not committed.",
+            );
+          }
+        },
+      );
     };
   };
 }
@@ -271,7 +309,10 @@ export function createTelegramThreadDisconnectAssembly<
 >(
   deps: Omit<TelegramManualThreadDisconnectDeps<TSyncState>, "stopPolling"> & {
     stopPolling: () => Promise<string>;
-    captureStopPolling?: () => { isCurrent: () => boolean; stop: () => Promise<string> };
+    captureStopPolling?: () => {
+      isCurrent: () => boolean;
+      stop: () => Promise<string>;
+    };
     suspendPolling: () => Promise<void>;
   },
 ): TelegramThreadDisconnectAssembly {
@@ -294,26 +335,31 @@ export function createTelegramThreadDisconnectAssembly<
       } catch (error) {
         // Never retry a stop whose teardown/release outcome may already have committed.
         if (stopAttempted) {
-          deps.recordRuntimeEvent("connection", error, { phase: "disconnect-stop" });
+          deps.recordRuntimeEvent("connection", error, {
+            phase: "disconnect-stop",
+          });
           throw error;
         }
-        deps.recordRuntimeEvent("connection", error, { phase: "disconnect-cleanup" });
+        deps.recordRuntimeEvent("connection", error, {
+          phase: "disconnect-cleanup",
+        });
         let stopped: string;
         try {
           stopped = await stop();
         } catch (stopError) {
-          deps.recordRuntimeEvent("connection", stopError, { phase: "disconnect-stop" });
+          deps.recordRuntimeEvent("connection", stopError, {
+            phase: "disconnect-stop",
+          });
           throw stopError;
         }
         const separator = /[.!?]$/u.test(stopped) ? " " : ". ";
         return `${stopped}${separator}Thread cleanup was not confirmed. Check /telegram-status --debug.`;
       }
     },
-    cleanupForSessionRestart:
-      createTelegramSessionRestartThreadCleanupHandler({
-        ...deps,
-        suspendPolling: deps.suspendPolling,
-      }),
+    cleanupForSessionRestart: createTelegramSessionRestartThreadCleanupHandler({
+      ...deps,
+      suspendPolling: deps.suspendPolling,
+    }),
   };
 }
 
@@ -321,12 +367,16 @@ export function createTelegramManualThreadDisconnectHandler<
   TSyncState extends TelegramSyncState,
 >(deps: TelegramManualThreadDisconnectDeps<TSyncState>): () => Promise<string> {
   const assertCurrent = () => {
-    if (deps.isDisconnectCurrent?.() === false) throw new Error("Telegram disconnect was superseded by a new connection.");
+    if (deps.isDisconnectCurrent?.() === false)
+      throw new Error(
+        "Telegram disconnect was superseded by a new connection.",
+      );
   };
   const operation = async (): Promise<string> => {
     assertCurrent();
     const currentRecord = deps.getCurrentThreadRecord();
     let cleanupPending = false;
+    let followerThreadKept = false;
     if (currentRecord?.target.threadId) {
       const isManualFollower = currentRecord.owner?.kind === "manual-follower";
       const leaderEpoch = deps.getCurrentLeaderEpoch?.();
@@ -337,11 +387,8 @@ export function createTelegramManualThreadDisconnectHandler<
         if (deps.disconnectFollowerThread) {
           const disconnected = await deps.disconnectFollowerThread();
           assertCurrent();
-          if (!disconnected) {
-            throw new Error(
-              "Telegram follower thread deletion requires a live leader registration.",
-            );
-          }
+          // Without a live leader the Thread cannot be deleted; still stop locally and never claim deletion.
+          followerThreadKept = !disconnected;
         }
       } else {
         const target = currentRecord.target as TelegramTarget & {
@@ -359,9 +406,18 @@ export function createTelegramManualThreadDisconnectHandler<
           target,
           requestedAtMs: (deps.getNowMs ?? Date.now)(),
         };
-        const departingRecord = deps.topicTargetStore.list().find((record) => record.instanceId === currentRecord.instanceId &&
-          record.target.chatId === target.chatId && record.target.threadId === target.threadId);
-        const isCleanupTargetProtected = createTelegramCleanupTargetProtection(deps.topicTargetStore, departingRecord);
+        const departingRecord = deps.topicTargetStore
+          .list()
+          .find(
+            (record) =>
+              record.instanceId === currentRecord.instanceId &&
+              record.target.chatId === target.chatId &&
+              record.target.threadId === target.threadId,
+          );
+        const isCleanupTargetProtected = createTelegramCleanupTargetProtection(
+          deps.topicTargetStore,
+          departingRecord,
+        );
         deps.topicTargetStore.upsertPendingCleanup(intent);
         await deps.topicTargetStore.persist();
         assertCurrent();
@@ -400,7 +456,11 @@ export function createTelegramManualThreadDisconnectHandler<
           },
         );
         assertCurrent();
-        if (cleanupPlan.actions.some((action) => isCleanupTargetProtected(action.target, action))) {
+        if (
+          cleanupPlan.actions.some((action) =>
+            isCleanupTargetProtected(action.target, action),
+          )
+        ) {
           return "Thread disconnect superseded by a new binding.";
         }
         cleanupPending = Boolean(cleanup.incompleteActions?.length);
@@ -421,18 +481,22 @@ export function createTelegramManualThreadDisconnectHandler<
     }
     assertCurrent();
     const stopped = await deps.stopPolling();
+    if (followerThreadKept)
+      return "Telegram bridge disconnected. Thread kept: no live leader could delete it.";
     return cleanupPending
       ? `${stopped} Telegram thread cleanup remains pending for the next leader.`
       : stopped;
   };
-  return () => deps.runWorkspaceOperation(
-    {
-      operationId: createTelegramWorkspaceAdmissionOperationId(),
-      operationKind: deps.workspaceOperationKind ?? "workspace.disconnect-thread",
-      scopes: [{ kind: "profile" }],
-    },
-    operation,
-  );
+  return () =>
+    deps.runWorkspaceOperation(
+      {
+        operationId: createTelegramWorkspaceAdmissionOperationId(),
+        operationKind:
+          deps.workspaceOperationKind ?? "workspace.disconnect-thread",
+        scopes: [{ kind: "profile" }],
+      },
+      operation,
+    );
 }
 
 export function createTelegramLeaderHealthRuntime<
@@ -539,7 +603,8 @@ export interface TelegramStaleTopicApiErrorRecoveryDeps<TSyncState> {
   topicTargetStore: Pick<
     TelegramTopicTargetStore,
     "load" | "markStaleByTarget" | "persist"
-  > & Partial<Pick<TelegramTopicTargetStore, "invalidateTarget">>;
+  > &
+    Partial<Pick<TelegramTopicTargetStore, "invalidateTarget">>;
   getSyncState: () => TSyncState;
   setSyncState: (state: TSyncState) => void;
   recordEvent: (
@@ -550,16 +615,23 @@ export interface TelegramStaleTopicApiErrorRecoveryDeps<TSyncState> {
   getNowMs?: () => number;
   isCurrent?: () => boolean;
   isAuthorityCurrent?: () => boolean;
-  getWorkspaceAdmission?: () => Pick<
-    TelegramWorkspaceAdmissionLedger,
-    "acquireAdmission" | "releaseAdmission"
-  > | undefined;
+  getWorkspaceAdmission?: () =>
+    | Pick<
+        TelegramWorkspaceAdmissionLedger,
+        "acquireAdmission" | "releaseAdmission"
+      >
+    | undefined;
 }
 
-export function captureTelegramStaleTargetRequestRecovery<TSyncState extends TelegramSyncState>(
+export function captureTelegramStaleTargetRequestRecovery<
+  TSyncState extends TelegramSyncState,
+>(
   body: Record<string, unknown>,
   deps: TelegramStaleTopicApiErrorRecoveryDeps<TSyncState> & {
-    topicTargetStore: Pick<TelegramTopicTargetStore, "load" | "list" | "markStaleByTarget" | "persist" | "invalidateTarget">;
+    topicTargetStore: Pick<
+      TelegramTopicTargetStore,
+      "load" | "list" | "markStaleByTarget" | "persist" | "invalidateTarget"
+    >;
     getCurrentLeaderEpoch: () => number | string | undefined;
     getSessionGeneration: () => number;
     getProfileName: () => string | undefined;
@@ -570,25 +642,44 @@ export function captureTelegramStaleTargetRequestRecovery<TSyncState extends Tel
   const epoch = deps.getCurrentLeaderEpoch();
   if (!target || epoch === undefined) return undefined;
   const key = getTelegramTargetKey(target);
-  const record = deps.topicTargetStore.list().find((candidate) => getTelegramTargetKey(candidate.target) === key);
+  const record = deps.topicTargetStore
+    .list()
+    .find((candidate) => getTelegramTargetKey(candidate.target) === key);
   if (!record) return undefined;
   const generation = deps.getSessionGeneration();
   const profile = deps.getProfileName();
-  const isAuthorityCurrent = (): boolean => deps.getCurrentLeaderEpoch() === epoch &&
-    deps.getSessionGeneration() === generation && deps.getProfileName() === profile;
+  const isAuthorityCurrent = (): boolean =>
+    deps.getCurrentLeaderEpoch() === epoch &&
+    deps.getSessionGeneration() === generation &&
+    deps.getProfileName() === profile;
   const isCurrent = (): boolean => {
-    const current = deps.topicTargetStore.list().find((candidate) => getTelegramTargetKey(candidate.target) === key);
-    return isAuthorityCurrent() &&
-      current?.instanceId === record.instanceId && current?.profileKey === record.profileKey &&
-      current?.updatedAtMs === record.updatedAtMs && current?.createdAtMs === record.createdAtMs;
+    const current = deps.topicTargetStore
+      .list()
+      .find((candidate) => getTelegramTargetKey(candidate.target) === key);
+    return (
+      isAuthorityCurrent() &&
+      current?.instanceId === record.instanceId &&
+      current?.profileKey === record.profileKey &&
+      current?.updatedAtMs === record.updatedAtMs &&
+      current?.createdAtMs === record.createdAtMs
+    );
   };
   return async (error) => {
     const requestTarget = getTelegramApiErrorRequestTarget(error);
-    if (!isTelegramStaleTargetHttpError(error) || !requestTarget ||
-      getTelegramTargetKey(requestTarget) !== key || !isCurrent()) return;
-    if (await recoverStaleTelegramTopicApiError(
-      { chat_id: target.chatId, message_thread_id: target.threadId }, error, { ...deps, isCurrent, isAuthorityCurrent },
-    )) {
+    if (
+      !isTelegramStaleTargetHttpError(error) ||
+      !requestTarget ||
+      getTelegramTargetKey(requestTarget) !== key ||
+      !isCurrent()
+    )
+      return;
+    if (
+      await recoverStaleTelegramTopicApiError(
+        { chat_id: target.chatId, message_thread_id: target.threadId },
+        error,
+        { ...deps, isCurrent, isAuthorityCurrent },
+      )
+    ) {
       deps.onRecovered();
     }
   };
@@ -631,17 +722,19 @@ export async function recoverStaleTelegramTopicApiError<
     !target ||
     !isTelegramTopicTargetStaleError(error) ||
     deps.isCurrent?.() === false
-  ) return false;
+  )
+    return false;
   const recover = async (): Promise<boolean> => {
     if (deps.isCurrent) {
       if (
         !deps.topicTargetStore.invalidateTarget ||
-        !await deps.topicTargetStore.invalidateTarget(
+        !(await deps.topicTargetStore.invalidateTarget(
           target,
           deps.isCurrent,
           String(error),
-        )
-      ) return false;
+        ))
+      )
+        return false;
       if (deps.isAuthorityCurrent?.() === false) return false;
     } else {
       await deps.topicTargetStore.load();
@@ -651,7 +744,8 @@ export async function recoverStaleTelegramTopicApiError<
           "deleted",
           String(error),
         )
-      ) return false;
+      )
+        return false;
       await deps.topicTargetStore.persist();
     }
     const nowMs = (deps.getNowMs ?? Date.now)();
@@ -740,7 +834,12 @@ export async function ensureTelegramLeaderThreadBinding(
         normalizedLeaderCwd,
         deps.instanceId,
         legacyLeaderRecord?.instanceId,
-        { sessionId: deps.sessionId, onCapacityUnavailable() { capacityUnavailable = true; } },
+        {
+          sessionId: deps.sessionId,
+          onCapacityUnavailable() {
+            capacityUnavailable = true;
+          },
+        },
       )
     : undefined;
   if (deps.cwd && !workspaceIdentity) {
@@ -770,270 +869,290 @@ export async function ensureTelegramLeaderThreadBinding(
     assertLeaderEpoch("before-workspace-persist");
     await deps.topicTargetStore.persist();
     assertLeaderEpoch("after-workspace-persist");
-    const { target: _target, slot: _slot, threadName: _threadName, displayTitle: _displayTitle, ...rest } = result;
+    const {
+      target: _target,
+      slot: _slot,
+      threadName: _threadName,
+      displayTitle: _displayTitle,
+      ...rest
+    } = result;
     return {
       ...rest,
       target: { ...committed.target },
       slot: committed.slot ?? result.slot,
       ...(committed.threadName ? { threadName: committed.threadName } : {}),
-      ...(committed.displayTitle ? { displayTitle: committed.displayTitle } : {}),
+      ...(committed.displayTitle
+        ? { displayTitle: committed.displayTitle }
+        : {}),
     };
   };
   try {
-  const unavailableTargetKeys = new Set([
-    ...deps.topicTargetStore
-      .listSyncObservations()
-      .filter((observation) => observation.syncStatus === "deleted")
-      .map((observation) => getTelegramTargetKey(observation.target)),
-    ...deps.topicTargetStore
-      .listPendingCleanups()
-      .map((intent) => getTelegramTargetKey(intent.target)),
-  ]);
-  let invalidatedUnavailableTarget = false;
-  for (const record of deps.topicTargetStore.list()) {
-    if (
-      record.instanceId !== deps.instanceId ||
-      !unavailableTargetKeys.has(getTelegramTargetKey(record.target))
-    ) {
-      continue;
-    }
-    invalidatedUnavailableTarget =
-      deps.topicTargetStore.markStaleByTarget(record.target) ||
-      invalidatedUnavailableTarget;
-  }
-  if (invalidatedUnavailableTarget) {
-    assertLeaderEpoch("before-unavailable-persist");
-    await deps.topicTargetStore.persist();
-    assertLeaderEpoch("after-unavailable-persist");
-  }
-  const persistedWorkspaceBinding = workspaceIdentity
-    ? deps.topicTargetStore.getWorkspaceBinding(
-        workspaceIdentity.cwd,
-        workspaceIdentity.instanceSlot,
-        workspaceIdentity.sessionId,
-      )
-    : undefined;
-  const legacyWorkspaceBinding =
-    workspaceIdentity?.instanceSlot === "a" &&
-    deps.sessionId === undefined &&
-    !persistedWorkspaceBinding &&
-    typeof legacyLeaderRecord?.target.threadId === "number"
-      ? {
-          ...workspaceIdentity,
-          target: { ...legacyLeaderRecord.target },
-          ...(legacyLeaderRecord.threadName
-            ? { threadName: legacyLeaderRecord.threadName }
-            : {}),
-          ...(legacyLeaderRecord.slot ? { slot: legacyLeaderRecord.slot } : {}),
-          updatedAtMs: legacyLeaderRecord.updatedAtMs,
-        }
-      : undefined;
-  const recoverableWorkspaceBinding =
-    persistedWorkspaceBinding ?? legacyWorkspaceBinding;
-  const recoverableTargetKey = recoverableWorkspaceBinding
-    ? getTelegramTargetKey(recoverableWorkspaceBinding.target)
-    : undefined;
-  const recoverableRecord = recoverableWorkspaceBinding
-    ? deps.topicTargetStore
-        .list()
-        .find(
-          (record) =>
-            getTelegramTargetKey(record.target) === recoverableTargetKey,
-        )
-    : undefined;
-  const sameProcessWorkspaceBinding =
-    !!recoverableRecord &&
-    (recoverableRecord.instanceId === deps.instanceId ||
-      isSameTelegramProcessInstance(
-        recoverableRecord.instanceId,
-        deps.instanceId,
-      ));
-  if (
-    recoverableWorkspaceBinding &&
-    !unavailableTargetKeys.has(recoverableTargetKey ?? "") &&
-    (!deps.forceFreshUnnamed || recoverableWorkspaceBinding.threadName) &&
-    (sameProcessWorkspaceBinding || deps.probeWorkspaceBinding)
-  ) {
-    let workspaceTargetVisible = sameProcessWorkspaceBinding;
-    if (!workspaceTargetVisible && deps.probeWorkspaceBinding) {
-      assertLeaderEpoch("before-workspace-probe");
-      try {
-        await deps.probeWorkspaceBinding(recoverableWorkspaceBinding);
-        assertLeaderEpoch("after-workspace-probe");
-        workspaceTargetVisible = true;
-      } catch (error) {
-        if (!isTelegramTopicTargetStaleError(error)) throw error;
-        deps.topicTargetStore.markStaleByTarget(
-          recoverableWorkspaceBinding.target,
-          "deleted",
-          error instanceof Error ? error.message : String(error),
-        );
-        await deps.topicTargetStore.persist();
-        deps.recordEvent("bus", error, {
-          phase: "leader-workspace-target-stale",
-          chatId: recoverableWorkspaceBinding.target.chatId,
-          threadId: recoverableWorkspaceBinding.target.threadId,
-          instanceId: deps.instanceId,
-        });
+    const unavailableTargetKeys = new Set([
+      ...deps.topicTargetStore
+        .listSyncObservations()
+        .filter((observation) => observation.syncStatus === "deleted")
+        .map((observation) => getTelegramTargetKey(observation.target)),
+      ...deps.topicTargetStore
+        .listPendingCleanups()
+        .map((intent) => getTelegramTargetKey(intent.target)),
+    ]);
+    let invalidatedUnavailableTarget = false;
+    for (const record of deps.topicTargetStore.list()) {
+      if (
+        record.instanceId !== deps.instanceId ||
+        !unavailableTargetKeys.has(getTelegramTargetKey(record.target))
+      ) {
+        continue;
       }
+      invalidatedUnavailableTarget =
+        deps.topicTargetStore.markStaleByTarget(record.target) ||
+        invalidatedUnavailableTarget;
     }
-    if (workspaceTargetVisible) {
-      const nowMs = deps.getNowMs?.() ?? Date.now();
-      const slot = workspaceIdentity?.slot;
-      if (!slot) {
-        throw new Error("Telegram Thread slot authority is unavailable.");
-      }
-      const recovered = await commitWorkspaceBinding({
-        target: { ...recoverableWorkspaceBinding.target },
-        slot,
-        ...(recoverableWorkspaceBinding.threadName
-          ? { threadName: recoverableWorkspaceBinding.threadName }
-          : {}),
-        reused: true,
-      });
-      deps.topicTargetStore.upsert({
-        profileKey: leaderProfileKey,
-        owner: leaderOwner,
-        target: { ...recovered.target },
-        status: "active",
-        createdAtMs: recoverableRecord?.createdAtMs ?? nowMs,
-        updatedAtMs: nowMs,
-        ...(recovered.threadName ? { threadName: recovered.threadName } : {}),
-        instanceId: deps.instanceId,
-        slot: recovered.slot,
-        syncStatus: "open",
-        lastSyncObservedAtMs: nowMs,
-        lastReconcileAction: "leader-workspace-binding-recovered",
-      });
-      assertLeaderEpoch("before-recovered-record-persist");
+    if (invalidatedUnavailableTarget) {
+      assertLeaderEpoch("before-unavailable-persist");
       await deps.topicTargetStore.persist();
-      assertLeaderEpoch("after-recovered-record-persist");
+      assertLeaderEpoch("after-unavailable-persist");
+    }
+    const persistedWorkspaceBinding = workspaceIdentity
+      ? deps.topicTargetStore.getWorkspaceBinding(
+          workspaceIdentity.cwd,
+          workspaceIdentity.instanceSlot,
+          workspaceIdentity.sessionId,
+        )
+      : undefined;
+    const legacyWorkspaceBinding =
+      workspaceIdentity?.instanceSlot === "a" &&
+      deps.sessionId === undefined &&
+      !persistedWorkspaceBinding &&
+      typeof legacyLeaderRecord?.target.threadId === "number"
+        ? {
+            ...workspaceIdentity,
+            target: { ...legacyLeaderRecord.target },
+            ...(legacyLeaderRecord.threadName
+              ? { threadName: legacyLeaderRecord.threadName }
+              : {}),
+            ...(legacyLeaderRecord.slot
+              ? { slot: legacyLeaderRecord.slot }
+              : {}),
+            updatedAtMs: legacyLeaderRecord.updatedAtMs,
+          }
+        : undefined;
+    const recoverableWorkspaceBinding =
+      persistedWorkspaceBinding ?? legacyWorkspaceBinding;
+    const recoverableTargetKey = recoverableWorkspaceBinding
+      ? getTelegramTargetKey(recoverableWorkspaceBinding.target)
+      : undefined;
+    const recoverableRecord = recoverableWorkspaceBinding
+      ? deps.topicTargetStore
+          .list()
+          .find(
+            (record) =>
+              getTelegramTargetKey(record.target) === recoverableTargetKey,
+          )
+      : undefined;
+    const sameProcessWorkspaceBinding =
+      !!recoverableRecord &&
+      (recoverableRecord.instanceId === deps.instanceId ||
+        isSameTelegramProcessInstance(
+          recoverableRecord.instanceId,
+          deps.instanceId,
+        ));
+    if (
+      recoverableWorkspaceBinding &&
+      !unavailableTargetKeys.has(recoverableTargetKey ?? "") &&
+      (!deps.forceFreshUnnamed || recoverableWorkspaceBinding.threadName) &&
+      (sameProcessWorkspaceBinding || deps.probeWorkspaceBinding)
+    ) {
+      let workspaceTargetVisible = sameProcessWorkspaceBinding;
+      if (!workspaceTargetVisible && deps.probeWorkspaceBinding) {
+        assertLeaderEpoch("before-workspace-probe");
+        try {
+          await deps.probeWorkspaceBinding(recoverableWorkspaceBinding);
+          assertLeaderEpoch("after-workspace-probe");
+          workspaceTargetVisible = true;
+        } catch (error) {
+          if (!isTelegramTopicTargetStaleError(error)) throw error;
+          deps.topicTargetStore.markStaleByTarget(
+            recoverableWorkspaceBinding.target,
+            "deleted",
+            error instanceof Error ? error.message : String(error),
+          );
+          await deps.topicTargetStore.persist();
+          deps.recordEvent("bus", error, {
+            phase: "leader-workspace-target-stale",
+            chatId: recoverableWorkspaceBinding.target.chatId,
+            threadId: recoverableWorkspaceBinding.target.threadId,
+            instanceId: deps.instanceId,
+          });
+        }
+      }
+      if (workspaceTargetVisible) {
+        const nowMs = deps.getNowMs?.() ?? Date.now();
+        const slot = workspaceIdentity?.slot;
+        if (!slot) {
+          throw new Error("Telegram Thread slot authority is unavailable.");
+        }
+        const recovered = await commitWorkspaceBinding({
+          target: { ...recoverableWorkspaceBinding.target },
+          slot,
+          ...(recoverableWorkspaceBinding.threadName
+            ? { threadName: recoverableWorkspaceBinding.threadName }
+            : {}),
+          reused: true,
+        });
+        deps.topicTargetStore.upsert({
+          profileKey: leaderProfileKey,
+          owner: leaderOwner,
+          target: { ...recovered.target },
+          status: "active",
+          createdAtMs: recoverableRecord?.createdAtMs ?? nowMs,
+          updatedAtMs: nowMs,
+          ...(recovered.threadName ? { threadName: recovered.threadName } : {}),
+          instanceId: deps.instanceId,
+          slot: recovered.slot,
+          syncStatus: "open",
+          lastSyncObservedAtMs: nowMs,
+          lastReconcileAction: "leader-workspace-binding-recovered",
+        });
+        assertLeaderEpoch("before-recovered-record-persist");
+        await deps.topicTargetStore.persist();
+        assertLeaderEpoch("after-recovered-record-persist");
+        deps.recordEvent(
+          "telegram",
+          "Leader thread preserved after Workspace recovery",
+          {
+            phase: "leader-thread-reused",
+            instanceId: deps.instanceId,
+            chatId: recovered.target.chatId,
+            threadId: recovered.target.threadId,
+            slot: recovered.slot,
+          },
+        );
+        return recovered;
+      }
+    }
+    const priorTargets = deps.topicTargetStore.list().filter((record) => {
+      return (
+        record.instanceId === deps.instanceId &&
+        (record.status === "active" || record.status === "starting")
+      );
+    });
+    // Legacy callers without session identity may reuse the active instance target.
+    // Session-aware callers must resolve their exact Workspace binding instead.
+    if (
+      deps.sessionId === undefined &&
+      !deps.forceFreshUnnamed &&
+      priorTargets.length > 0
+    ) {
+      const record = priorTargets[0];
       deps.recordEvent(
         "telegram",
-        "Leader thread preserved after Workspace recovery",
+        "Leader thread preserved after session lifecycle change",
         {
           phase: "leader-thread-reused",
           instanceId: deps.instanceId,
-          chatId: recovered.target.chatId,
-          threadId: recovered.target.threadId,
-          slot: recovered.slot,
+          chatId: record.target.chatId,
+          threadId: record.target.threadId,
+          slot: record.slot,
         },
       );
-      return recovered;
-    }
-  }
-  const priorTargets = deps.topicTargetStore.list().filter((record) => {
-    return (
-      record.instanceId === deps.instanceId &&
-      (record.status === "active" || record.status === "starting")
-    );
-  });
-  // Legacy callers without session identity may reuse the active instance target.
-  // Session-aware callers must resolve their exact Workspace binding instead.
-  if (deps.sessionId === undefined && !deps.forceFreshUnnamed && priorTargets.length > 0) {
-    const record = priorTargets[0];
-    deps.recordEvent(
-      "telegram",
-      "Leader thread preserved after session lifecycle change",
-      {
-        phase: "leader-thread-reused",
-        instanceId: deps.instanceId,
-        chatId: record.target.chatId,
-        threadId: record.target.threadId,
+      assertLeaderEpoch("before-reuse");
+      if (!record.slot) {
+        throw new Error("Telegram Thread slot authority is unavailable.");
+      }
+      return await commitWorkspaceBinding({
+        target: record.target,
         slot: record.slot,
-      },
-    );
-    assertLeaderEpoch("before-reuse");
-    if (!record.slot) {
-      throw new Error("Telegram Thread slot authority is unavailable.");
-    }
-    return await commitWorkspaceBinding({
-      target: record.target,
-      slot: record.slot,
-      ...(record.threadName ? { threadName: record.threadName } : {}),
-      reused: true,
-    });
-  }
-  let forcedUnnamedStale = false;
-  if (deps.forceFreshUnnamed) {
-    for (const record of priorTargets) {
-      const isLeaderOwned =
-        record.owner?.kind === "leader" ||
-        (!record.owner &&
-          (record.profileKey.startsWith("cwd:") ||
-            record.profileKey.startsWith("leader:")));
-      if (!isLeaderOwned) continue;
-      if (record.threadName) continue;
-      forcedUnnamedStale =
-        deps.topicTargetStore.markStaleByTarget(record.target) ||
-        forcedUnnamedStale;
-      deps.recordEvent("telegram", "Unnamed leader thread binding refreshed", {
-        phase: "leader-thread-force-fresh-unnamed",
-        instanceId: deps.instanceId,
-        chatId: record.target.chatId,
-        threadId: record.target.threadId,
-        slot: record.slot,
+        ...(record.threadName ? { threadName: record.threadName } : {}),
+        reused: true,
       });
     }
-    if (forcedUnnamedStale) await deps.topicTargetStore.persist();
-  }
-  assertLeaderEpoch("before-provision");
-  const ownTarget = await provisionOwnBusTopic({
-    getAllowedUserId: deps.getAllowedUserId,
-    instanceId: deps.instanceId,
-    cwd: normalizedLeaderCwd,
-    telegramProfile: deps.telegramProfile,
-    getCurrentLeaderEpoch: deps.getCurrentLeaderEpoch,
-    getThreadReconciliationMachineState:
-      deps.getThreadReconciliationMachineState,
-    recordThreadReconciliationPlan: deps.recordThreadReconciliationPlan,
-    store: deps.topicTargetStore,
-    callApi: deps.callApi,
-    getNowMs: deps.getNowMs,
-    getRandom: deps.getRandom,
-    requestedThreadName:
-      recoverableWorkspaceBinding?.threadName ?? deps.requestedThreadName,
-    workspaceBindingKey: workspaceIdentity?.bindingKey,
-    preferredSlot: workspaceIdentity?.slot,
-    resolveInitialWorkspaceDisplayTitle:
-      deps.resolveInitialWorkspaceDisplayTitle,
-    recordEvent: deps.recordEvent,
-  });
-  assertLeaderEpoch("after-provision");
-  if (!ownTarget) return undefined;
-  const replacementPlan = ThreadReconciler.planThreadReconciliation({
-    nowMs: Date.now(),
-    currentLeaderEpoch: deps.getCurrentLeaderEpoch?.(),
-    previousState: deps.getThreadReconciliationMachineState?.(),
-    records: priorTargets,
-    pendingProvisions: deps.topicTargetStore.listPendingProvisions(),
-    replacedBindings: [
-      {
-        instanceId: deps.instanceId,
-        replacementTarget: ownTarget.target,
-      },
-    ],
-  });
-  deps.recordThreadReconciliationPlan?.(replacementPlan);
-  await ThreadReconciler.applyThreadReconciliationPlan(replacementPlan, {
-    isCleanupTargetProtected: createTelegramCleanupTargetProtection(deps.topicTargetStore),
-    callApi: deps.callApi,
-    markStaleByTarget: (target, syncStatus, lastSyncError) =>
-      deps.topicTargetStore.markStaleByTarget(
-        target,
-        syncStatus,
-        lastSyncError,
+    let forcedUnnamedStale = false;
+    if (deps.forceFreshUnnamed) {
+      for (const record of priorTargets) {
+        const isLeaderOwned =
+          record.owner?.kind === "leader" ||
+          (!record.owner &&
+            (record.profileKey.startsWith("cwd:") ||
+              record.profileKey.startsWith("leader:")));
+        if (!isLeaderOwned) continue;
+        if (record.threadName) continue;
+        forcedUnnamedStale =
+          deps.topicTargetStore.markStaleByTarget(record.target) ||
+          forcedUnnamedStale;
+        deps.recordEvent(
+          "telegram",
+          "Unnamed leader thread binding refreshed",
+          {
+            phase: "leader-thread-force-fresh-unnamed",
+            instanceId: deps.instanceId,
+            chatId: record.target.chatId,
+            threadId: record.target.threadId,
+            slot: record.slot,
+          },
+        );
+      }
+      if (forcedUnnamedStale) await deps.topicTargetStore.persist();
+    }
+    assertLeaderEpoch("before-provision");
+    const ownTarget = await provisionOwnBusTopic({
+      getAllowedUserId: deps.getAllowedUserId,
+      instanceId: deps.instanceId,
+      cwd: normalizedLeaderCwd,
+      telegramProfile: deps.telegramProfile,
+      getCurrentLeaderEpoch: deps.getCurrentLeaderEpoch,
+      getThreadReconciliationMachineState:
+        deps.getThreadReconciliationMachineState,
+      recordThreadReconciliationPlan: deps.recordThreadReconciliationPlan,
+      store: deps.topicTargetStore,
+      callApi: deps.callApi,
+      getNowMs: deps.getNowMs,
+      getRandom: deps.getRandom,
+      requestedThreadName:
+        recoverableWorkspaceBinding?.threadName ?? deps.requestedThreadName,
+      workspaceBindingKey: workspaceIdentity?.bindingKey,
+      preferredSlot: workspaceIdentity?.slot,
+      resolveInitialWorkspaceDisplayTitle:
+        deps.resolveInitialWorkspaceDisplayTitle,
+      recordEvent: deps.recordEvent,
+    });
+    assertLeaderEpoch("after-provision");
+    if (!ownTarget) return undefined;
+    const replacementPlan = ThreadReconciler.planThreadReconciliation({
+      nowMs: Date.now(),
+      currentLeaderEpoch: deps.getCurrentLeaderEpoch?.(),
+      previousState: deps.getThreadReconciliationMachineState?.(),
+      records: priorTargets,
+      pendingProvisions: deps.topicTargetStore.listPendingProvisions(),
+      replacedBindings: [
+        {
+          instanceId: deps.instanceId,
+          replacementTarget: ownTarget.target,
+        },
+      ],
+    });
+    deps.recordThreadReconciliationPlan?.(replacementPlan);
+    await ThreadReconciler.applyThreadReconciliationPlan(replacementPlan, {
+      isCleanupTargetProtected: createTelegramCleanupTargetProtection(
+        deps.topicTargetStore,
       ),
-    persist: () => deps.topicTargetStore.persist(),
-    removePendingProvisionById: (id) =>
-      deps.topicTargetStore.removePendingProvision(id),
-    getCurrentLeaderEpoch: deps.getCurrentLeaderEpoch,
-    recordRuntimeEvent: deps.recordEvent,
-  });
-  assertLeaderEpoch("before-final-persist");
-  await deps.topicTargetStore.persist();
-  assertLeaderEpoch("after-final-persist");
-  return await commitWorkspaceBinding(ownTarget);
+      callApi: deps.callApi,
+      markStaleByTarget: (target, syncStatus, lastSyncError) =>
+        deps.topicTargetStore.markStaleByTarget(
+          target,
+          syncStatus,
+          lastSyncError,
+        ),
+      persist: () => deps.topicTargetStore.persist(),
+      removePendingProvisionById: (id) =>
+        deps.topicTargetStore.removePendingProvision(id),
+      getCurrentLeaderEpoch: deps.getCurrentLeaderEpoch,
+      recordRuntimeEvent: deps.recordEvent,
+    });
+    assertLeaderEpoch("before-final-persist");
+    await deps.topicTargetStore.persist();
+    assertLeaderEpoch("after-final-persist");
+    return await commitWorkspaceBinding(ownTarget);
   } finally {
     deps.topicTargetStore.releaseWorkspaceClaim(deps.instanceId);
   }
@@ -1054,20 +1173,6 @@ export const TELEGRAM_SYNC_SLICES = [
 ] as const;
 
 export type TelegramSyncSlice = (typeof TELEGRAM_SYNC_SLICES)[number];
-
-export type TelegramSyncTrigger =
-  | "startup"
-  | "reload"
-  | "topic-lifecycle"
-  | "stale-api-error"
-  | "setup-change"
-  | "pairing-change"
-  | "follower-register"
-  | "follower-prune"
-  | "status-request"
-  | "leader-health-tick"
-  | "ordinary-message"
-  | "ordinary-send";
 
 export interface TelegramSyncSliceState {
   status: "fresh" | "suspect" | "unknown";
@@ -1144,25 +1249,6 @@ export function createTelegramProvisioningActivityRuntime(): TelegramProvisionin
   };
 }
 
-const RECONCILE_TRIGGERS = new Set<TelegramSyncTrigger>([
-  "startup",
-  "reload",
-  "topic-lifecycle",
-  "stale-api-error",
-  "setup-change",
-  "pairing-change",
-  "follower-register",
-  "follower-prune",
-  "status-request",
-  "leader-health-tick",
-]);
-
-export function shouldReconcileTelegramSync(
-  trigger: TelegramSyncTrigger,
-): boolean {
-  return RECONCILE_TRIGGERS.has(trigger);
-}
-
 export function markTelegramSyncSliceSuspect(
   state: TelegramSyncState,
   slice: TelegramSyncSlice,
@@ -1231,14 +1317,15 @@ export function createTelegramObservedTopicLifecycleSyncHandler<
       }) as TSyncState,
     );
   };
-  return (lifecycle) => deps.runWorkspaceOperation(
-    {
-      operationId: createTelegramWorkspaceAdmissionOperationId(),
-      operationKind: "workspace.sync-topic-lifecycle",
-      scopes: [{ kind: "profile" }],
-    },
-    () => operation(lifecycle),
-  );
+  return (lifecycle) =>
+    deps.runWorkspaceOperation(
+      {
+        operationId: createTelegramWorkspaceAdmissionOperationId(),
+        operationKind: "workspace.sync-topic-lifecycle",
+        scopes: [{ kind: "profile" }],
+      },
+      () => operation(lifecycle),
+    );
 }
 
 export function createTelegramTopicLifecycleSyncHandler<TMessage = unknown>(

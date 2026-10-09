@@ -14,10 +14,38 @@ export interface TelegramThreadNameDialogCandidate {
     phase: "input";
     expiresAtMs: number;
 }
+export interface TelegramThreadNameDialogLifetime {
+    /** Independent recipient effect authority; never the input handle's deadline or ownership. */
+    readonly assertAuthority?: () => void;
+    isCurrent(): boolean;
+    publish(dialogMessageId: number, assertPublicationCurrent?: () => void): TelegramThreadNameDialogCandidate | undefined;
+    select(action: TelegramThreadNameDialogAction): {
+        kind: "reset" | "cancel" | "expired";
+    };
+    consumeName(text: string): {
+        kind: "name";
+        name: string;
+    } | {
+        kind: "none" | "empty";
+    };
+    reopen(): TelegramThreadNameDialogCandidate | undefined;
+    finish(): void;
+}
 export declare function createTelegramThreadNameDialogRuntime(options?: {
     ttlMs?: number;
     nowMs?: () => number;
 }): {
+    prepare(input: {
+        scope: string;
+        target: TelegramTarget;
+        isCurrent?: () => boolean;
+        assertAuthority?: () => void;
+    }): TelegramThreadNameDialogLifetime | undefined;
+    capture(input: {
+        scope: string;
+        target: TelegramTarget;
+        dialogMessageId: number;
+    }): TelegramThreadNameDialogLifetime | undefined;
     open(input: {
         scope: string;
         target: TelegramTarget;
@@ -49,14 +77,6 @@ export interface TelegramThreadTitleInput {
     profileKey: string;
     threadName?: string;
 }
-export interface TelegramThreadNameInput {
-    seed: string;
-    cwd?: string;
-    role?: "leader" | "follower";
-    peers?: readonly string[];
-    slot?: string;
-}
-export declare function createTelegramThreadName(input: TelegramThreadNameInput): string;
 export declare function normalizeTelegramTopicTargetThreadName(threadName: string): string;
 export declare function getTelegramTopicIdentityName(threadName: string): string;
 export declare function chooseTelegramThreadName(input: {

@@ -5,12 +5,11 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, } from "node:fs";
-import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
-import { resolveAgentDir, resolveTelegramConfigPath, TELEGRAM_DEFAULT_PROFILE_NAME, } from "./paths.js";
-export { TELEGRAM_DEFAULT_PROFILE_NAME } from "./paths.js";
-import { isWireRecord as isPlainConfigRecord } from "./wire.js";
 import { withTelegramFileTransaction } from "./locks.js";
-const CONFIG_RUNTIME_KEY = "__piTelegramConfigRuntime__";
+import { resolveAgentDir, resolveTelegramConfigPath, TELEGRAM_DEFAULT_PROFILE_NAME, } from "./paths.js";
+import { isPiStaleContextError } from "./pi.js";
+import { isWireRecord as isPlainConfigRecord } from "./wire.js";
+export { TELEGRAM_DEFAULT_PROFILE_NAME } from "./paths.js";
 const CONFIG_REPLACE_RETRY_ATTEMPTS = 5;
 const CONFIG_REPLACE_RETRY_DELAY_MS = 25;
 function isRetryableConfigReplaceError(error) {
@@ -81,7 +80,10 @@ export function getTelegramBotTokenDiagnostic(value, env = process.env) {
     return `Telegram bot token environment variable ${reference.variable} is not set.`;
 }
 const TELEGRAM_THREAD_DISPLAY_MODES = [
-    "letters", "names", "directory-snake", "directory-title",
+    "letters",
+    "names",
+    "directory-snake",
+    "directory-title",
 ];
 export function resolveTelegramThreadDisplayMode(config) {
     return TELEGRAM_THREAD_DISPLAY_MODES.includes(config.threadDisplayMode)
@@ -124,20 +126,6 @@ export function createTelegramConfigBotIdGetter(store) {
 export function createTelegramActiveProfileKeyGetter(store) {
     return () => store.getActiveProfileName() ?? TELEGRAM_DEFAULT_PROFILE_NAME;
 }
-export function setGlobalTelegramConfigRuntime(runtime) {
-    const globals = globalThis;
-    if (runtime)
-        globals[CONFIG_RUNTIME_KEY] = runtime;
-    else
-        delete globals[CONFIG_RUNTIME_KEY];
-}
-export function updateTelegramVoiceConfig(voice) {
-    const runtime = globalThis[CONFIG_RUNTIME_KEY];
-    if (!runtime || typeof runtime.updateVoiceConfig !== "function")
-        return false;
-    runtime.updateVoiceConfig(voice);
-    return true;
-}
 function isEmptyTelegramConfig(config) {
     return Object.keys(config).length === 0;
 }
@@ -150,19 +138,6 @@ async function loadLatestTelegramConfig(configStore) {
         isEmptyTelegramConfig(configStore.get())) {
         configStore.set(before);
     }
-}
-export function bindGlobalTelegramConfigRuntime(configStore) {
-    setGlobalTelegramConfigRuntime({
-        updateVoiceConfig(voice) {
-            const current = configStore.get();
-            const next = {
-                ...current,
-                voice: { ...(current.voice ?? {}), ...voice },
-            };
-            configStore.set(next);
-            void configStore.persist(next);
-        },
-    });
 }
 function getInvalidTelegramConfigRecoveryPath(configPath) {
     return `${configPath}.invalid-${process.pid}-${Date.now()}`;
@@ -200,17 +175,6 @@ export async function readTelegramConfig(configPath, options = {}) {
             }
         });
     }
-}
-export async function writeTelegramConfig(agentDir, configPath, config) {
-    await mkdir(agentDir, { recursive: true });
-    const tempConfigPath = `${configPath}.tmp-${process.pid}-${Date.now()}`;
-    await writeFile(tempConfigPath, JSON.stringify(config, null, "\t") + "\n", {
-        encoding: "utf8",
-        mode: 0o600,
-    });
-    await chmod(tempConfigPath, 0o600);
-    await rename(tempConfigPath, configPath);
-    await chmod(configPath, 0o600);
 }
 function cloneTelegramConfig(value) {
     return structuredClone(value);
@@ -275,10 +239,13 @@ export function getTelegramProfileFields(config) {
     const token = config.botToken?.trim();
     if (!token)
         return undefined;
+    return { botToken: token, ...pickTelegramRootProfileFields(config) };
+}
+/** Root-level profile fields other than the token, including the retired legacy cursor. */
+function pickTelegramRootProfileFields(config) {
     const legacyCursor = config
         .lastUpdateId;
     return {
-        botToken: token,
         ...(config.botUsername !== undefined
             ? { botUsername: config.botUsername }
             : {}),
@@ -332,23 +299,7 @@ export function normalizeTelegramDefaultProfileConfig(config) {
     }
     const legacyProfile = {
         ...(legacyToken ? { botToken: legacyToken } : {}),
-        ...(config.botUsername !== undefined
-            ? { botUsername: config.botUsername }
-            : {}),
-        ...(config.botId !== undefined ? { botId: config.botId } : {}),
-        ...(config.allowedUserId !== undefined
-            ? { allowedUserId: config.allowedUserId }
-            : {}),
-        ...(config.threadDisplayMode !== undefined
-            ? { threadDisplayMode: config.threadDisplayMode }
-            : {}),
-        ...(config
-            .lastUpdateId !== undefined
-            ? {
-                lastUpdateId: config
-                    .lastUpdateId,
-            }
-            : {}),
+        ...pickTelegramRootProfileFields(config),
     };
     if (!canonicalProfile && !legacyToken) {
         throw new Error("Legacy Telegram default profile has no bot token");
@@ -421,7 +372,8 @@ export function createTelegramConfigStore(options = {}) {
         config = nextConfig;
     };
     const withPersistedPairingProfile = (profileName, tokenSha256, observe) => {
-        if ((profileName !== TELEGRAM_DEFAULT_PROFILE_NAME && !isValidTelegramProfileName(profileName)) ||
+        if ((profileName !== TELEGRAM_DEFAULT_PROFILE_NAME &&
+            !isValidTelegramProfileName(profileName)) ||
             !/^[a-f0-9]{64}$/u.test(tokenSha256)) {
             throw new Error("Invalid Telegram pairing admission identity.");
         }
@@ -431,10 +383,13 @@ export function createTelegramConfigStore(options = {}) {
             const resolvedToken = typeof profile?.botToken === "string"
                 ? resolveTelegramBotToken(profile.botToken, env)
                 : undefined;
-            if (!profile || !resolvedToken ||
-                createHash("sha256").update(resolvedToken).digest("hex") !== tokenSha256 ||
+            if (!profile ||
+                !resolvedToken ||
+                createHash("sha256").update(resolvedToken).digest("hex") !==
+                    tokenSha256 ||
                 (profile.allowedUserId !== undefined &&
-                    (!Number.isSafeInteger(profile.allowedUserId) || profile.allowedUserId <= 0))) {
+                    (!Number.isSafeInteger(profile.allowedUserId) ||
+                        profile.allowedUserId <= 0))) {
                 throw new Error("Telegram pairing admission authority is unavailable or changed.");
             }
             return observe(latest, profile);
@@ -494,7 +449,6 @@ export function createTelegramConfigStore(options = {}) {
             nextConfig.allowedUserId = userId;
             setEffectiveConfig(nextConfig);
         },
-        withSourceSerialization: (operation) => withTelegramFileTransaction(`${configPath}.transaction`, operation),
         withPairingAdmission: (profileName, tokenSha256, publish) => withPersistedPairingProfile(profileName, tokenSha256, (_latest, profile) => publish(profile.allowedUserId === undefined)),
         withPairedUserAdmission: (profileName, tokenSha256, userId, publish, assertExecutionCurrent) => {
             if (!Number.isSafeInteger(userId) || userId <= 0)
@@ -506,9 +460,11 @@ export function createTelegramConfigStore(options = {}) {
                 assertExecutionCurrent?.();
                 const current = getEffectiveConfig();
                 const previousOwner = persistedConfig.profiles?.[profileName]?.allowedUserId;
-                if ((activeProfileName ?? TELEGRAM_DEFAULT_PROFILE_NAME) !== profileName ||
+                if ((activeProfileName ?? TELEGRAM_DEFAULT_PROFILE_NAME) !==
+                    profileName ||
                     current.botToken !== profile.botToken ||
-                    (current.allowedUserId !== undefined && current.allowedUserId !== userId) ||
+                    (current.allowedUserId !== undefined &&
+                        current.allowedUserId !== userId) ||
                     (current.allowedUserId === undefined && previousOwner !== undefined)) {
                     throw new Error("Telegram paired admission lost local profile authority.");
                 }
@@ -524,7 +480,8 @@ export function createTelegramConfigStore(options = {}) {
             const previousOwner = getEffectiveConfig().allowedUserId;
             const assertCurrent = () => {
                 assertExecutionCurrent?.();
-                if (activeProfileName !== profileName || getEffectiveConfig().botToken !== botToken ||
+                if (activeProfileName !== profileName ||
+                    getEffectiveConfig().botToken !== botToken ||
                     getEffectiveConfig().allowedUserId !== previousOwner) {
                     throw new Error("Telegram pairing lost its originating profile authority.");
                 }
@@ -544,8 +501,13 @@ export function createTelegramConfigStore(options = {}) {
                         assertCurrent();
                         if (profile.allowedUserId !== undefined)
                             return latest;
-                        const next = { ...latest, profiles: { ...latest.profiles,
-                                [profileKey]: { ...profile, allowedUserId: userId } } };
+                        const next = {
+                            ...latest,
+                            profiles: {
+                                ...latest.profiles,
+                                [profileKey]: { ...profile, allowedUserId: userId },
+                            },
+                        };
                         writeTelegramConfigInTransaction(agentDir, configPath, next);
                         return next;
                     });
@@ -851,11 +813,6 @@ export function getTelegramAuthorizationState(userId, allowedUserId) {
     }
     return { kind: "deny" };
 }
-function isTelegramStaleContextError(error) {
-    return (error instanceof Error &&
-        (error.message.includes("stale after session") ||
-            error.message.includes("stale ctx")));
-}
 export async function pairTelegramUserIfNeeded(userId, deps) {
     const authorization = getTelegramAuthorizationState(userId, deps.allowedUserId);
     if (authorization.kind !== "pair")
@@ -869,7 +826,7 @@ export async function pairTelegramUserIfNeeded(userId, deps) {
         deps.updateStatus(deps.ctx);
     }
     catch (error) {
-        if (!isTelegramStaleContextError(error))
+        if (!isPiStaleContextError(error))
             throw error;
     }
     return true;

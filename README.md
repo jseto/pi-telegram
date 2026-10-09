@@ -255,6 +255,8 @@ In Threaded Mode, open Settings → **🧵 Thread display** to choose `letters` 
 | Classic DM | One running Pi instance and its active session controlled from one private bot chat | One polling owner, one queue/runtime surface |
 | Threaded Mode | Several visible Pi sessions sharing one bot | One leader owns transport; each private-chat Thread retains one session-qualified Workspace binding |
 
+**Live rebinding (0.53.0):** Restore uses one same-session save/apply/release channel for prompts and supported commands/templates, with separately fenced best-effort old-Thread cleanup. Existing work and exact source/receipt custody remain protected; legacy Restore readers/receivers retain continuity with older instances. Windows runs the same paths, and CI covers it. See [Multi-Instance Bus](./docs/multi-instance-bus.md#live-rebind-channel).
+
 ## Environment Configuration
 
 Most controls live in Pi commands or the Telegram menu. Environment variables remain for bootstrap and transport boundaries:
@@ -288,7 +290,7 @@ Stable public entrypoints are documented in [Public API](./docs/public-api.md), 
 
 ## Safety Boundaries
 
-Durable inbound admission is a **process-crash recovery** guarantee. Atomic private-file replacement preserves acknowledged journal authority and its journal-owned `acceptedThroughUpdateId` polling cursor across ordinary process exit, crash, kill, and replacement, but the extension does not flush files or parent directories for host/kernel/filesystem/device/power-loss durability. `telegram.json` contains configuration only. Keep `~/.pi/agent` on appropriately managed storage and backups if that stronger operational guarantee is required. Before downgrading below `0.37.0`, run `node scripts/check-downgrade.mjs`; any retained cursor-schema journal blocks downgrade because an older runtime could repoll admitted updates. See [Durable Admission And Recovery](./docs/architecture.md#durable-admission-and-recovery).
+Durable inbound admission is a **process-crash recovery** guarantee. Atomic private-file replacement preserves acknowledged journal authority and its journal-owned `acceptedThroughUpdateId` polling cursor across ordinary process exit, crash, kill, and replacement, but the extension does not flush files or parent directories for host/kernel/filesystem/device/power-loss durability. `telegram.json` contains configuration only. Keep `~/.pi/agent` on appropriately managed storage and backups if that stronger operational guarantee is required. Downgrading below `0.37.0` is unsafe: an older runtime cannot recover the journal's polling cursor and could repoll admitted updates. See [Durable Admission And Recovery](./docs/architecture.md#durable-admission-and-recovery).
 
 Runtime files use `tmp/pi-telegram` with only `state.json` and `logs.jsonl` at its root; pre-0.52.0 `tmp/telegram` is left untouched and never migrated. The transport section of `state.json` names a polling journal hosted in a session folder; successor leaders continue it rather than moving its cursor. Follower journals are session-owned. Unbound session families are disposable under the approved sweep policy; in-process `/new` adopts eligible pending input, while cold startup does not. See [Session-Owned Journal Storage](./docs/multi-instance-bus.md#session-owned-journal-storage) for compatibility fallbacks, loss boundaries and pending acceptance.
 

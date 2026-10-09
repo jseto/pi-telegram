@@ -8,8 +8,8 @@ import { basename, extname } from "node:path";
 import { assertTelegramInlineKeyboardCallbackData } from "./keyboard.js";
 import { withTelegramReplyParameters } from "./replies.js";
 import { getTelegramTargetThreadParams, } from "./target.js";
-import { getTelegramVoiceSynthesisProviders } from "./voice.js";
 import { isTelegramApiCommitUnknownError } from "./telegram-api.js";
+import { getTelegramVoiceSynthesisProviders } from "./voice.js";
 async function ensureTelegramVoiceFileFormat(filePath) {
     const ext = extname(filePath).toLowerCase();
     if (ext === ".opus" || ext === ".ogg")
@@ -38,11 +38,14 @@ export function createTelegramVoiceReplySender(deps, ports = {}) {
             return;
         await withTelegramReplyParameters(turn.chatId, options?.replyToPrompt === false ? undefined : turn.replyToMessageId, turn.target, (replyParameters) => deps.sendMultipart("sendVoice", {
             chat_id: String(turn.chatId),
-            ...(replyParameters ? { reply_parameters: JSON.stringify(replyParameters) } : {}),
+            ...(replyParameters
+                ? { reply_parameters: JSON.stringify(replyParameters) }
+                : {}),
             ...(turn.target
                 ? Object.fromEntries(Object.entries(getTelegramTargetThreadParams(turn.target)).map(([key, value]) => [key, String(value)]))
                 : {}),
-            ...(options?.replyMarkup !== undefined && options.replyMarkup !== null
+            ...(options?.replyMarkup !== undefined &&
+                options.replyMarkup !== null
                 ? {
                     reply_markup: typeof options.replyMarkup === "string"
                         ? options.replyMarkup

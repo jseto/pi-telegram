@@ -86,8 +86,7 @@ export interface TelegramModelContextAvailabilityRuntime {
   reconcile: () => void;
 }
 
-export interface TelegramModelContextAvailabilityBinding
-  extends TelegramModelContextAvailabilityRuntime {
+export interface TelegramModelContextAvailabilityBinding extends TelegramModelContextAvailabilityRuntime {
   bind: (runtime: TelegramModelContextAvailabilityRuntime) => void;
 }
 
@@ -110,8 +109,7 @@ export function createTelegramModelContextAvailabilityRuntime(deps: {
   canReconcile?: () => boolean;
   memory?: TelegramModelContextAvailabilityMemory;
 }): TelegramModelContextAvailabilityRuntime {
-  const memory =
-    deps.memory ?? getTelegramModelContextAvailabilityMemory();
+  const memory = deps.memory ?? getTelegramModelContextAvailabilityMemory();
   return {
     reconcile() {
       if (deps.canReconcile && !deps.canReconcile()) return;
@@ -188,13 +186,8 @@ export function buildTelegramBridgeSystemPrompt(options: {
     : "";
   return {
     systemPrompt: Array.isArray(basePrompt)
-      ? [
-          ...basePrompt,
-          options.localSystemPromptSuffix + telegramSuffix,
-        ]
-      : basePrompt +
-        options.localSystemPromptSuffix +
-        telegramSuffix,
+      ? [...basePrompt, options.localSystemPromptSuffix + telegramSuffix]
+      : basePrompt + options.localSystemPromptSuffix + telegramSuffix,
   };
 }
 
