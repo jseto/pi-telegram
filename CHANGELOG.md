@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.53.2: Idle runtime without lock churn
+
+- `Idle disk load`: Polling-cursor and status reads of the update journal no longer open config and journal transactions, so a connected idle session stops creating `telegram.json.transaction.staged.*` and `inbox.json.transaction.staged.*` guard folders; only reads that need repair take the serialized path. Unchanged runtime status snapshots are compared before locking and skip their `state.json` transaction.
+
 ## 0.53.1: Text replies without false voice errors
 
 - `Voice artifacts`: A reply plan without voice content no longer reaches outbound voice artifact delivery, so plain text replies stop recording "every voice synthesis provider failed" delivery errors; explicit `telegram_voice` markup and genuine synthesis failures keep their existing fallback behavior (#318).
