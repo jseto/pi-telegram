@@ -3117,7 +3117,7 @@ test("Bus leader rejects incompatible protocol before follower provisioning", as
       instanceId: "future",
       registrationGeneration: "future:1",
       protocol: {
-        protocolVersion: 3,
+        protocolVersion: protocolIdentity.protocolVersion + 1,
         runtimeBuild: "future",
         capabilities: [],
       },
@@ -3128,6 +3128,12 @@ test("Bus leader rejects incompatible protocol before follower provisioning", as
     mismatched.kind === "bus.ack" ? mismatched.ok : true,
     false,
   );
+  assert.equal(registry.list().length, 0);
+  assert.equal(provisions, 0);
+
+  const probe = await handleEnvelope({ kind: "bus.probe", requestId: "probe:1" });
+  assert.deepEqual(probe, { kind: "bus.ack", requestId: "probe:1", ok: true, protocol: protocolIdentity },
+    "A liveness probe is answered without registration");
   assert.equal(registry.list().length, 0);
   assert.equal(provisions, 0);
 
@@ -5500,8 +5506,17 @@ test("Leader startup defers display contraction until the follower roster settle
         }));
       } finally {
         if (!stopped) await runtime.stopPolling();
-        // A detached state write can land after stop; let rm retry ENOTEMPTY rather than fail teardown.
-        rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
+        // A detached state write can land after stop. rmSync's own retries block the event loop, so that write
+        // could never finish between them; yield (setTimeout is mocked here) and retry instead.
+        for (let attempt = 0; ; attempt += 1) {
+          try {
+            rmSync(dir, { recursive: true, force: true });
+            break;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOTEMPTY" || attempt >= 100) throw error;
+            await new Promise((resolve) => setImmediate(resolve));
+          }
+        }
       }
     });
   }

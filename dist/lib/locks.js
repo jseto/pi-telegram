@@ -959,6 +959,10 @@ function hasSameLockOwner(current, expected) {
         current.leaderEpoch === expected.leaderEpoch &&
         current.runtimeGeneration === expected.runtimeGeneration);
 }
+/** Exact owner identity (pid, cwd, instance, leader epoch, runtime generation); absent entries never match. */
+export function isSameTelegramLockOwner(current, expected) {
+    return hasSameLockOwner(current, expected);
+}
 function canSupersedeSameProcessOwner(current, pid, ctx, instanceId, runtimeGeneration) {
     if (current.pid !== pid ||
         (current.cwd !== undefined && current.cwd !== ctx.cwd) ||
@@ -973,9 +977,7 @@ function createLockEntry(pid, ctx, options) {
     if (options.journalPath)
         lock.journalPath = options.journalPath;
     if (options.instanceId) {
-        const nowMs = options.getNowMs?.();
         lock.instanceId = options.instanceId;
-        lock.heartbeatMs = nowMs;
         lock.leaderEpoch = options.mintLeaderEpoch?.() ?? randomUUID();
         lock.runtimeGeneration = options.runtimeGeneration;
     }
@@ -1144,7 +1146,11 @@ export function createTelegramLockRuntime(options = {}) {
                     changed: false,
                 };
             const current = parseTelegramLockEntry(locks[effectiveKey]);
-            const state = getLockState(current, pid, isAlive, stateOptions());
+            const observedState = getLockState(current, pid, isAlive, stateOptions());
+            const state = observedState.kind === "active-elsewhere" &&
+                hasSameLockOwner(current, acquireOptions.unresponsiveOwner)
+                ? { kind: "stale", lock: observedState.lock }
+                : observedState;
             const expectedOwned = adoptCompatibleOwnedLock(effectiveKey, current, ctx);
             if (state.kind === "active-here" &&
                 hasSameLockOwner(current, expectedOwned) &&
@@ -1191,7 +1197,6 @@ export function createTelegramLockRuntime(options = {}) {
                 instanceId: options.instanceId,
                 busSocketPath: options.busSocketPath,
                 busSecret: options.busSecret,
-                getNowMs,
                 mintLeaderEpoch: options.mintLeaderEpoch,
                 runtimeGeneration,
             });
@@ -1299,9 +1304,36 @@ export function createTelegramLockRuntime(options = {}) {
                 };
             }, { ...publication, isCurrent });
         },
-        refresh: (ctx) => !deliveryRevoked &&
-            transactOwners((locks) => {
-                const effectiveKey = resolveEffectiveKey();
+        refresh: (ctx) => {
+            if (deliveryRevoked)
+                return false;
+            // Owner fields only, never a timestamp: liveness is proven over the bus, so an exact owner needs no write.
+            const refreshedEntry = (lock) => {
+                const busSecret = options.busSecret ?? lock.busSecret;
+                return {
+                    pid: lock.pid,
+                    ...(lock.cwd ? { cwd: lock.cwd } : {}),
+                    instanceId: options.instanceId,
+                    leaderEpoch: lock.leaderEpoch ?? options.mintLeaderEpoch?.() ?? randomUUID(),
+                    runtimeGeneration: lock.runtimeGeneration ?? runtimeGeneration,
+                    ...(options.busSocketPath
+                        ? { busSocketPath: options.busSocketPath }
+                        : {}),
+                    ...(busSecret !== undefined ? { busSecret } : {}),
+                    ...(lock.journalPath ? { journalPath: lock.journalPath } : {}),
+                };
+            };
+            // Parsed entries carry explicit `undefined` fields; compare only the published ones.
+            const isCurrentEntry = (lock) => lock.leaderEpoch !== undefined &&
+                isDeepStrictEqual(Object.fromEntries(Object.entries(lock).filter(([, value]) => value !== undefined)), refreshedEntry(lock));
+            const effectiveKey = resolveEffectiveKey();
+            const observed = readLock();
+            if (observed &&
+                hasSameLockOwner(observed, adoptCompatibleOwnedLock(effectiveKey, observed, ctx)) &&
+                (!options.instanceId || isCurrentEntry(observed))) {
+                return true;
+            }
+            return transactOwners((locks) => {
                 const lock = parseTelegramLockEntry(locks[effectiveKey]);
                 const expectedOwner = adoptCompatibleOwnedLock(effectiveKey, lock, ctx);
                 if (!lock || !hasSameLockOwner(lock, expectedOwner)) {
@@ -1313,24 +1345,15 @@ export function createTelegramLockRuntime(options = {}) {
                 }
                 if (!options.instanceId)
                     return { result: true, changed: false };
-                const refreshedLock = {
-                    pid: lock.pid,
-                    ...(lock.cwd ? { cwd: lock.cwd } : {}),
-                    instanceId: options.instanceId,
-                    heartbeatMs: getNowMs(),
-                    leaderEpoch: lock.leaderEpoch ?? options.mintLeaderEpoch?.() ?? randomUUID(),
-                    runtimeGeneration: lock.runtimeGeneration ?? runtimeGeneration,
-                    ...(options.busSocketPath
-                        ? { busSocketPath: options.busSocketPath }
-                        : {}),
-                    busSecret: options.busSecret ?? lock.busSecret,
-                    ...(lock.journalPath ? { journalPath: lock.journalPath } : {}),
-                };
+                if (isCurrentEntry(lock))
+                    return { result: true, changed: false };
+                const refreshedLock = refreshedEntry(lock);
                 locks[effectiveKey] = refreshedLock;
                 ownedLockKey = effectiveKey;
                 ownedLock = refreshedLock;
                 return { result: true, changed: true };
-            }),
+            });
+        },
     };
 }
 export function createTelegramLockOwnershipGuard(lock) {
@@ -1551,6 +1574,9 @@ export function createTelegramLockedPollingRuntime(deps) {
                 expectedOwner: options.election?.expectedOwner ??
                     (options.force ? takeoverCandidate : undefined),
                 election: options.election !== undefined,
+                unresponsiveOwner: options.election?.unresponsive
+                    ? options.election.expectedOwner
+                    : undefined,
             });
             if (!acquired.ok && !options.election) {
                 const currentState = deps.lock.getState();
@@ -1593,22 +1619,33 @@ export function createTelegramLockedPollingRuntime(deps) {
                         });
                     }
                     if (failureMessage) {
-                        const owner = formatTelegramLockEntry(acquired.lock);
-                        return {
-                            ok: false,
-                            canTakeover: false,
-                            owner,
-                            message: `Telegram bridge is active in another Pi instance (${owner}); follower registration failed: ${formatTelegramFollowerRegistrationFailure(failureMessage)}.`,
-                        };
+                        const unresponsiveOwner = acquired.lock;
+                        if (deps.proveOwnerUnresponsive &&
+                            (await deps.proveOwnerUnresponsive(unresponsiveOwner))) {
+                            if (!isCurrent())
+                                return cancelled;
+                            acquired = deps.lock.acquire(ctx, { unresponsiveOwner });
+                        }
+                        if (!acquired.ok) {
+                            const owner = formatTelegramLockEntry(acquired.lock);
+                            return {
+                                ok: false,
+                                canTakeover: false,
+                                owner,
+                                message: `Telegram bridge is active in another Pi instance (${owner}); follower registration failed: ${formatTelegramFollowerRegistrationFailure(failureMessage)}.`,
+                            };
+                        }
                     }
                 }
-                const owner = formatTelegramLockEntry(acquired.lock);
-                return {
-                    ok: false,
-                    canTakeover: true,
-                    owner,
-                    message: `Telegram bridge is active in another Pi instance (${owner}).`,
-                };
+                if (!acquired.ok) {
+                    const owner = formatTelegramLockEntry(acquired.lock);
+                    return {
+                        ok: false,
+                        canTakeover: true,
+                        owner,
+                        message: `Telegram bridge is active in another Pi instance (${owner}).`,
+                    };
+                }
             }
             takeoverCandidate = undefined;
             if (!(await runOwnedPollingStart(ctx, options, isCurrent))) {

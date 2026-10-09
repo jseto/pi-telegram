@@ -289,12 +289,6 @@ export interface TelegramConfigStore {
     assertExecutionCurrent?: () => void,
     commitIfOwned?: (commit: () => void) => boolean,
   ) => Promise<boolean>;
-  /** Lock-only serialization for trusted synchronous source operations, not authorization.
-   * Does not read/adopt config. Acquire required Workspace admission first; never
-   * acquire owners or nest config admission here. Do not pass async callbacks:
-   * returned promises are not protected after their synchronous prefix.
-   */
-  withSourceSerialization: <T>(operation: () => T) => T;
   /** Trusted synchronous publication only; caller acquires Workspace admission before this config transaction. */
   withPairingAdmission: <T>(
     profileName: string,
@@ -779,8 +773,6 @@ export function createTelegramConfigStore(
       nextConfig.allowedUserId = userId;
       setEffectiveConfig(nextConfig);
     },
-    withSourceSerialization: (operation) =>
-      withTelegramFileTransaction(`${configPath}.transaction`, operation),
     withPairingAdmission: (profileName, tokenSha256, publish) =>
       withPersistedPairingProfile(
         profileName,

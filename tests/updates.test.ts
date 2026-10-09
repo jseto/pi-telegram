@@ -12,7 +12,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { TelegramBusForeignUpdateSettlement } from "../lib/bus.ts";
-import { createTelegramConfigStore } from "../lib/config.ts";
 import {
   abandonTelegramDeferredUpdate,
   acquireTelegramUpdateRouting,
@@ -88,7 +87,7 @@ import {
   createTelegramQueueHandoffStagingRuntime,
   createTelegramQueueStore,
 } from "../lib/queue.ts";
-import {
+import { createTelegramJournalSourceSerialization,
   createTelegramUpdateJournalBindingKey,
   createTelegramUpdateJournalRuntimeBindingResolver,
   createTelegramUpdateJournalEntryDigest,
@@ -7402,9 +7401,9 @@ for (const scenario of ["immediate", "mixed", "late", "lost-ack", "no-result", "
   test(`Scoped worker completion requires a retained journal ACK before notification (${scenario})`,
     async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-scoped-worker-ack-"));
-    const config = createTelegramConfigStore({ agentDir: dir });
+    const journalSerialization = createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction"));
     const resolve = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture",
-      getBotId: () => undefined, getJournalPath: () => join(dir, "inbox.json"), withSourceSerialization: config.withSourceSerialization });
+      getBotId: () => undefined, getJournalPath: () => join(dir, "inbox.json"), withSourceSerialization: journalSerialization });
     const binding = resolve()!, journal = binding.journal;
     journal.appendBatch((scenario === "mixed" ? [1, 2] : [1]).map(update_id => ({ update_id,
       message: { message_id: update_id, chat: { id: 7, type: "private" }, text: "fixture" } })));
@@ -7483,10 +7482,10 @@ for (const scenario of ["immediate", "mixed", "late", "lost-ack", "no-result", "
 
 test("Ordinary queue receipts publish where strict journal source access is unavailable", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-queued-nonstrict-binding-"));
-  const config = createTelegramConfigStore({ agentDir: dir });
+  const journalSerialization = createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction"));
   // Windows has no no-follow handles; readiness must still come from the ordinary journal instead of refusing every prompt.
   const resolve = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture",
-    getBotId: () => undefined, getJournalPath: () => join(dir, "inbox.json"), withSourceSerialization: config.withSourceSerialization,
+    getBotId: () => undefined, getJournalPath: () => join(dir, "inbox.json"), withSourceSerialization: journalSerialization,
     strictSourceAccess: false });
   const binding = resolve()!, journal = binding.journal;
   journal.appendBatch([{ update_id: 1, message: { message_id: 1, chat: { id: 7, type: "private" }, text: "original" } }]);
@@ -7514,10 +7513,11 @@ test("Ordinary queue receipts publish where strict journal source access is unav
 for (const scenario of ["exact", "foreign-binding", "read-only", "completed-after", "corrupt-after"] as const) {
   test(`Production journal binding composes strict queued observation with publication readiness (${scenario})`, async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-queued-native-binding-"));
-    const path = join(dir, "inbox.json"), config = createTelegramConfigStore({ agentDir: dir });
+    const path = join(dir, "inbox.json");
+    const journalSerialization = createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction"));
     let writesAllowed = true;
     const resolve = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture",
-      getBotId: () => undefined, getJournalPath: () => path, withSourceSerialization: config.withSourceSerialization,
+      getBotId: () => undefined, getJournalPath: () => path, withSourceSerialization: journalSerialization,
       withWriterAdmission(operation) { if (!writesAllowed) throw new Error("Read-only observation must not borrow writer authority"); return operation(); } });
     const binding = resolve()!, journal = binding.journal;
     journal.appendBatch([{ update_id: 1, message: { message_id: 1, chat: { id: 7, type: "private" }, text: "original" } }]);
@@ -7567,7 +7567,7 @@ for (const scenario of ["normal", "transport-lost", "ordinary", "grouped", "batc
     const identity = { instanceId: "queue-terminal", processId: process.pid, processBirthId: `${process.pid}:fixture`, sessionGeneration: 1 };
     const resolve = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture",
       getBotId: () => undefined, getJournalPath: () => join(dir, "inbox.json"), getQueueRuntimeIdentity: () => identity,
-      withSourceSerialization: createTelegramConfigStore({ agentDir: dir }).withSourceSerialization });
+      withSourceSerialization: createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction")) });
     const binding = resolve()!, journal = binding.journal;
     const ids = scenario === "grouped" || scenario === "batch" || scenario === "batch-reordered" || scenario === "scope-subset" || scenario === "duplicate-scope" ? [1, 2] : [1];
     journal.appendBatch(ids.map(update_id => ({ update_id, message: { message_id: update_id, chat: { id: 7, type: "private" }, text: "accepted fixture" } })));
@@ -7683,7 +7683,7 @@ for (const scenario of ["ready", "group", "control", "batch", "mixed", "mixed-lo
     const identity = { instanceId: "prepared", processId: process.pid, processBirthId: `${process.pid}:prepared`, sessionGeneration: 1 };
     const resolve = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture", getBotId: () => undefined,
       getJournalPath: () => join(dir, "inbox.json"), getQueueRuntimeIdentity: () => identity,
-      withSourceSerialization: createTelegramConfigStore({ agentDir: dir }).withSourceSerialization });
+      withSourceSerialization: createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction")) });
     const binding = resolve()!, journal = binding.journal, grouped = scenario === "group" || scenario === "subset", mixed = scenario.startsWith("mixed"), batch = scenario === "batch" || mixed;
     const ids = scenario === "mixed-batch-lost" ? [1, 2, 3] : grouped || batch ? [1, 2] : [1], ordinaryId = ids.at(-1)!,
       queueKind = scenario === "control" || scenario === "mixed-control" ? "control" as const : "prompt" as const;
@@ -7782,7 +7782,7 @@ for (const scenario of ["positive", "batch", "before-write", "after-write", "par
     const identity = { instanceId: "ordinary", processId: process.pid, processBirthId: `${process.pid}:ordinary`, sessionGeneration: 1 };
     const resolve = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture", getBotId: () => undefined,
       getJournalPath: () => join(dir, "inbox.json"), getQueueRuntimeIdentity: () => identity,
-      withSourceSerialization: createTelegramConfigStore({ agentDir: dir }).withSourceSerialization });
+      withSourceSerialization: createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction")) });
     const binding = resolve()!, journal = binding.journal, ids = scenario === "positive" ? [1] : [1, 2];
     journal.appendBatch(ids.map(update_id => ({ update_id, message: { message_id: update_id, chat: { id: 7, type: "private" }, text: "ordinary queued input" } })));
     const receipts = ids.map(id => ({ queueKind: "prompt" as const, receiptId: `ordinary-${id}`, sourceUpdateIds: [id], journalBindingKey: binding.recoveryKey }));
@@ -7843,7 +7843,7 @@ for (const scenario of ["positive", "lost", "before-write", "no-result", "readba
     const identity = { instanceId: "partial", processId: process.pid, processBirthId: `${process.pid}:partial`, sessionGeneration: 1 };
     const resolve = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture", getBotId: () => undefined,
       getJournalPath: () => join(dir, "inbox.json"), getQueueRuntimeIdentity: () => identity,
-      withSourceSerialization: createTelegramConfigStore({ agentDir: dir }).withSourceSerialization });
+      withSourceSerialization: createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction")) });
     const binding = resolve()!, journal = binding.journal;
     const mixed = scenario === "mixed" || scenario === "sticky-missing-witness";
     const ids = scenario === "batch" ? [1, 2, 3, 4] : mixed ? [1, 2, 3] : [1, 2];
@@ -8021,7 +8021,7 @@ for (const scenario of ["complete", "duplicate", "queued", "queued-complete", "q
     const dir = await mkdtemp(join(tmpdir(), "pi-completion-publisher-"));
     const resolve = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture",
       getBotId: () => undefined, getJournalPath: () => join(dir, "inbox.json"),
-      withSourceSerialization: createTelegramConfigStore({ agentDir: dir }).withSourceSerialization });
+      withSourceSerialization: createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction")) });
     const binding = resolve()!, journal = binding.journal;
     journal.appendBatch([{ update_id: 1, message: { message_id: 1, chat: { id: 7, type: "private" }, text: "fixture" } }]);
     const digest = createTelegramUpdateJournalEntryDigest(journal.read().entries[0]!);
@@ -8930,7 +8930,7 @@ for (const scenario of ["handoff", "discard", "unscoped", "unobserved", "lost-ac
     const identity = { instanceId: "held-queue", processId: process.pid, processBirthId: `${process.pid}:held-queue`, sessionGeneration: 1 };
     const resolve = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture", getBotId: () => undefined,
       getJournalPath: () => join(dir, "inbox.json"), getQueueRuntimeIdentity: () => identity,
-      withSourceSerialization: createTelegramConfigStore({ agentDir: dir }).withSourceSerialization });
+      withSourceSerialization: createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction")) });
     const binding = resolve()!, journal = binding.journal;
     let current = true, liveBinding = binding.recoveryKey, handlers = 0, disposals = 0, probing = false, reads = 0;
     let carrier: unknown, prepared: Updates.TelegramDeferredQueueAdmissionPreparation | undefined;

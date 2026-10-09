@@ -876,10 +876,10 @@ for (const source of ["fresh", "adopted"] as const) {
     { concurrency: false, timeout: 5_000 }, async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-telegram-completed-delivery-"));
     const recipientBindingKey = "manual:recipient", sessionId = "session-b", updateId = 44;
-    const config = Config.createTelegramConfigStore({ agentDir: dir });
+    const journalSerialization = Journal.createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction"));
     const bindingRuntime = Journal.createTelegramUpdateJournalBindingRuntime({
       base: { getProfileName: () => "work", getBotToken: () => "fixture:completed-delivery", getBotId: () => 7,
-        withSourceSerialization: config.withSourceSerialization },
+        withSourceSerialization: journalSerialization },
       getRuntimeDir: () => Paths.resolveTelegramTempDir(dir),
       getLeaderJournalPath: () => Paths.resolveTelegramSessionPollingJournalPath(sessionId, dir, "work"),
       getFollowerJournalPath: (key, profile, id) => Paths.resolveTelegramSessionJournalPath(id!, key, dir, profile),
@@ -4818,6 +4818,7 @@ strictFileTest(`Prepared donor receipt projection gates real dispatch (${outcome
   try {
     await writeFile(configPath, JSON.stringify({ profiles: { work: { botToken, allowedUserId: 7 } } }));
     const config = Config.createTelegramConfigStore({ agentDir: dir, configPath });
+    const journalSerialization = Journal.createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction"));
     await config.load(); config.activateProfile("work");
     const botIdentity = Journal.createTelegramUpdateJournalBotIdentity({ botToken });
     const ledger = WorkspaceAdmission.createTelegramWorkspaceAdmissionLedger({
@@ -4828,7 +4829,7 @@ strictFileTest(`Prepared donor receipt projection gates real dispatch (${outcome
       queueRuntimeIdentity: owner, workspaceAdmission: ledger,
       sourceAccess: { directory: dir, limits: {
         maxFiles: 1000, maxBytes: 10_000_000, maxEntries: 100, maxWork: 100_000 } },
-      withSourceSerialization: config.withSourceSerialization,
+      withSourceSerialization: journalSerialization,
       withPairingAdmission: publish => config.withPairingAdmission("work", botIdentity.tokenSha256, publish),
       getInputContext: () => ({ owner, recipientBindingKey: "workspace:donor" }),
     };
@@ -4996,6 +4997,7 @@ strictFileTest(`Control reconciliation uses native serial handoff custody (${out
   try {
     await writeFile(configPath, JSON.stringify({ profiles: { work: { botToken, allowedUserId: 7 } } }));
     const config = Config.createTelegramConfigStore({ agentDir: dir, configPath });
+    const journalSerialization = Journal.createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction"));
     await config.load(); config.activateProfile("work");
     const botIdentity = Journal.createTelegramUpdateJournalBotIdentity({ botToken });
     const ledger = WorkspaceAdmission.createTelegramWorkspaceAdmissionLedger({ path: join(dir, "admission.json"),
@@ -5004,7 +5006,7 @@ strictFileTest(`Control reconciliation uses native serial handoff custody (${out
       path: join(dir, "inbox.work.json"), profileName: "work", botIdentity, queueRuntimeIdentity: donorOwner,
       workspaceAdmission: ledger, sourceAccess: { directory: dir, limits: {
         maxFiles: 1000, maxBytes: 10_000_000, maxEntries: 100, maxWork: 100_000 } },
-      withSourceSerialization: config.withSourceSerialization,
+      withSourceSerialization: journalSerialization,
       withPairingAdmission: publish => config.withPairingAdmission("work", botIdentity.tokenSha256, publish),
       getInputContext: () => ({ owner: donorOwner, recipientBindingKey: "workspace:donor" }),
     };
@@ -5129,6 +5131,7 @@ strictFileTest(`Deferred media enqueue keeps custody behind its execution fence 
     await writeFile(configPath, JSON.stringify({ profiles: { work: { botToken, allowedUserId: 7 } } }));
     await writeFile(join(dir, "fixture.txt"), "fixture attachment");
     const config = Config.createTelegramConfigStore({ agentDir: dir, configPath });
+    const journalSerialization = Journal.createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction"));
     await config.load(); config.activateProfile("work");
     const botIdentity = Journal.createTelegramUpdateJournalBotIdentity({ botToken });
     const ledger = WorkspaceAdmission.createTelegramWorkspaceAdmissionLedger({ path: join(dir, "admission.json"),
@@ -5137,7 +5140,7 @@ strictFileTest(`Deferred media enqueue keeps custody behind its execution fence 
       path: join(dir, "inbox.work.json"), profileName: "work", botIdentity, queueRuntimeIdentity: owner,
       workspaceAdmission: ledger, sourceAccess: { directory: dir, limits: {
         maxFiles: 1000, maxBytes: 10_000_000, maxEntries: 100, maxWork: 100_000 } },
-      withSourceSerialization: config.withSourceSerialization,
+      withSourceSerialization: journalSerialization,
       withPairingAdmission: publish => config.withPairingAdmission("work", botIdentity.tokenSha256, publish),
       getInputContext: () => ({ owner, recipientBindingKey: "workspace:deferred" }),
     };
@@ -5244,7 +5247,7 @@ strictFileTest(`Telegram new gateway composes follower suspension, session regis
   const ctx = { cwd: "/fixture", sessionManager: { getSessionId: () => sessionId }, ui: { notify() {} } } as unknown as ExtensionContext;
   const registrationState = BusFollower.createTelegramBusFollowerRegistrationState();
   const registry = Bus.createTelegramBusFollowerRegistry();
-  const config = Config.createTelegramConfigStore({ agentDir: dir });
+  const journalSerialization = Journal.createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction"));
   const recipientKey = "manual:same-process";
   const protocol = Bus.createTelegramBusProtocolIdentity({ runtimeBuild: "fixture-new",
     capabilities: [Bus.TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION] });
@@ -5256,7 +5259,7 @@ strictFileTest(`Telegram new gateway composes follower suspension, session regis
   const adoptions: (Journal.TelegramSessionPendingAdoptionResult | undefined)[] = [];
   const journals = Journal.createTelegramUpdateJournalBindingRuntime({
     base: { getProfileName: () => "work", getBotToken: () => "123:fixture-new-custody", getBotId: () => 7,
-      withSourceSerialization: config.withSourceSerialization },
+      withSourceSerialization: journalSerialization },
     getLeaderJournalPath: () => join(dir, "tmp", "pi-telegram", "inbox.work.json"),
     getFollowerJournalPath: (key, profileName, sid) => Paths.resolveTelegramSessionJournalPath(sid!, key, dir, profileName),
     getActiveFollowerBindingKey: () => recipientKey,
@@ -5597,6 +5600,7 @@ for (const scenario of ["business-same-chat", "business-other-chat", "business-d
     try {
       await writeFile(configPath, JSON.stringify({ profiles: { work: { botToken, allowedUserId: 7 } } }));
       const config = Config.createTelegramConfigStore({ agentDir: dir, configPath });
+      const journalSerialization = Journal.createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction"));
       await config.load(); config.activateProfile("work");
       const botIdentity = Journal.createTelegramUpdateJournalBotIdentity({ botToken });
       const ledger = WorkspaceAdmission.createTelegramWorkspaceAdmissionLedger({
@@ -5607,7 +5611,7 @@ for (const scenario of ["business-same-chat", "business-other-chat", "business-d
         queueRuntimeIdentity: owner, workspaceAdmission: ledger,
         sourceAccess: { directory: dir, limits: {
           maxFiles: 1000, maxBytes: 10_000_000, maxEntries: 100, maxWork: 100_000 } },
-        withSourceSerialization: config.withSourceSerialization,
+        withSourceSerialization: journalSerialization,
         withPairingAdmission: publish => config.withPairingAdmission("work", botIdentity.tokenSha256, publish),
         getInputContext: () => ({ owner, recipientBindingKey: "workspace:pending" }),
       };

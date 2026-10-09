@@ -3371,6 +3371,14 @@ export function createTelegramBusLeaderEnvelopeHandler(
       return createUnauthorizedBusAck(envelope.requestId);
     }
     switch (envelope.kind) {
+      case "bus.probe":
+        // Liveness only: no registry, routing, journal or Bot API effect.
+        return {
+          kind: "bus.ack" as const,
+          requestId: envelope.requestId,
+          ok: true,
+          protocol: deps.protocolIdentity,
+        };
       case "follower.register":
       case "follower.restoreWorkspace": {
         const compatibility = getTelegramBusProtocolCompatibility({

@@ -1971,6 +1971,44 @@ test("Bus follower heartbeat recovery never promotes over a live leader lease", 
   );
 });
 
+for (const proven of [false, true]) test(`Bus follower heartbeat recovery promotes over a live-PID leader only with bus proof (${proven ? "proven" : "unproven"})`, async () => {
+  const elections: unknown[] = [];
+  const proofs: unknown[] = [];
+  const registrationState = createTelegramBusFollowerRegistrationState();
+  registrationState.setRegistered(true, { chatId: 42, threadId: 10 });
+  const liveLeader = {
+    kind: "active-elsewhere" as const,
+    lock: { pid: 99, instanceId: "leader-a", leaderEpoch: "epoch-a" },
+  };
+  const handler = createTelegramBusFollowerHeartbeatRecoveryHandler({
+    registrationState,
+    getRegistrationRuntime: () => ({
+      registerWithLeader: async () => false,
+      setContext: () => undefined,
+      stop: () => undefined,
+    }),
+    getLeaderState: () => liveLeader,
+    setLifecyclePhase: () => undefined,
+    updateStatus: () => undefined,
+    promoteToLeader: async (_ctx, _binding, election) => {
+      elections.push(election);
+      return true;
+    },
+    proveLeaderUnresponsive: async (owner) => {
+      proofs.push(owner);
+      return proven;
+    },
+    sleep: async () => undefined,
+    promotionGraceMs: 0,
+    recordRuntimeEvent: () => undefined,
+  });
+
+  await handler(new Error("heartbeat failed"), "ctx");
+
+  assert.deepEqual(proofs, [liveLeader.lock]);
+  assert.deepEqual(elections, proven ? [{ expectedOwner: liveLeader.lock, unresponsive: true }] : []);
+});
+
 test("Bus follower heartbeat recovery retries until a live lease becomes stale", async () => {
   let stateReadCount = 0;
   let scheduledRetry: (() => void) | undefined;

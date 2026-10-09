@@ -10,8 +10,10 @@ import {
   mkdtempSync,
   rmSync,
   statSync,
+  linkSync,
   unlinkSync,
 } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -56,6 +58,8 @@ import {
   markTelegramBusAggregateDelivery,
   markTelegramBusCrossTargetDelivery,
   parseTelegramBusEnvelope,
+  probeTelegramBusLeader,
+  proveTelegramBusLeaderUnresponsive,
   rejectTelegramBusRequest,
   resolveTelegramBusSocketPath,
   stripTelegramBusApiMetadata,
@@ -1654,6 +1658,70 @@ test("Bus transport probe reports reachable and unreachable endpoints", async ()
     await server.stop();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("Leader probe classifies responsive, silent, refused and missing endpoints", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-leader-probe-"));
+  const probe = (name: string, timeoutMs = 200) =>
+    probeTelegramBusLeader({ socketPath: join(dir, name), secret: "secret", timeoutMs });
+  const leader = createTelegramBusLocalServer({
+    socketPath: join(dir, "leader.sock"),
+    handleEnvelope: (envelope) => ({ kind: "bus.ack", requestId: envelope.requestId, ok: envelope.kind === "bus.probe" }),
+  });
+  // An older leader answers the unknown kind with a parse-failure ack, which still proves its event loop runs.
+  const accepted: import("node:net").Socket[] = [];
+  const older = createServer((socket) => {
+    accepted.push(socket);
+    socket.once("data", () => socket.end('{"kind":"bus.ack","requestId":"invalid","ok":false}\n'));
+  });
+  const silent = createServer((socket) => { accepted.push(socket); });
+  const listen = (server: ReturnType<typeof createServer>, name: string) =>
+    new Promise<void>((resolve) => server.listen(join(dir, name), resolve));
+  try {
+    await leader.start();
+    await listen(older, "older.sock");
+    await listen(silent, "silent.sock");
+    // A dead leader leaves its socket inode behind: keep a hard link while the listener closes.
+    const departed = createServer(() => undefined);
+    await listen(departed, "departed.sock");
+    linkSync(join(dir, "departed.sock"), join(dir, "refused.sock"));
+    await new Promise((resolve) => departed.close(resolve));
+    assert.equal(await probe("leader.sock"), "responsive");
+    assert.equal(await probe("older.sock"), "responsive");
+    assert.equal(await probe("silent.sock"), "silent");
+    assert.equal(await probe("refused.sock"), "unreachable");
+    assert.equal(await probe("missing.sock"), "unknown", "A live classic leader has no endpoint at all");
+  } finally {
+    await leader.stop();
+    for (const socket of accepted) socket.destroy();
+    await new Promise((resolve) => older.close(resolve));
+    await new Promise((resolve) => silent.close(resolve));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Leader unresponsiveness proof needs a silent window or a confirmed unreachable endpoint for one owner", async () => {
+  const run = async (results: string[], sameOwner = () => true) => {
+    const observed = [...results];
+    const sleeps: number[] = [];
+    const proven = await proveTelegramBusLeaderUnresponsive({
+      probe: async () => observed.shift() as never,
+      isSameOwner: sameOwner,
+      sleep: async (ms) => { sleeps.push(ms); },
+      windowMs: 8000,
+    });
+    return { proven, sleeps, probes: results.length - observed.length };
+  };
+  assert.deepEqual(await run(["silent"]), { proven: true, sleeps: [], probes: 1 });
+  assert.deepEqual(await run(["responsive"]), { proven: false, sleeps: [], probes: 1 });
+  assert.deepEqual(await run(["unknown"]), { proven: false, sleeps: [], probes: 1 });
+  assert.deepEqual(await run(["unreachable", "responsive"]), { proven: false, sleeps: [8000], probes: 2 },
+    "A just-started leader binds its endpoint within the confirmation window");
+  assert.deepEqual(await run(["unreachable", "unreachable"]), { proven: true, sleeps: [8000], probes: 2 });
+  assert.deepEqual(await run(["unreachable", "silent"]), { proven: true, sleeps: [8000], probes: 2 });
+  assert.deepEqual(await run(["silent"], () => false), { proven: false, sleeps: [], probes: 1 });
+  assert.deepEqual(await run(["unreachable", "unreachable"], () => false), { proven: false, sleeps: [8000], probes: 1 },
+    "An owner change during the window voids the proof before probing again");
 });
 
 test("Bus local server roundtrips through a bounded long-path fallback", { skip: process.platform === "win32" }, async () => {

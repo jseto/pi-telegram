@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+## 0.54.0: No periodic disk writes while idle
+
+- `Journal serialization`: The update journal no longer borrows the `telegram.json` lock. Journal operations serialize on their own `tmp/pi-telegram/runtime/journals.transaction`, so receiving messages and repairing journals never touch the config file or its guard; only config writes and sender admission still take it. Bus protocol moves to v3 so 0.53.x peers, which serialize on the old lock, cannot register alongside 0.54 writers.
+- `Idle status writes`: The persisted runtime status no longer stores poll-cycle timestamps, so an idle connected session stops rewriting `state.json` after every long-poll response.
+- `Leader liveness`: The leader no longer rewrites `state.json` every two seconds. A dead PID is taken over at once; a live but frozen Threaded Mode leader is replaced only after an authenticated `bus.probe` proves it unresponsive, bound to that exact owner. Classic mode never takes over a live PID silently: `/telegram-connect` asks first. An idle connected session now makes no periodic disk writes.
+
 ## 0.53.2: Idle runtime without lock churn
 
 - `Idle disk load`: Polling-cursor and status reads of the update journal no longer open config and journal transactions, so a connected idle session stops creating `telegram.json.transaction.staged.*` and `inbox.json.transaction.staged.*` guard folders; only reads that need repair take the serialized path. Unchanged runtime status snapshots are compared before locking and skip their `state.json` transaction.

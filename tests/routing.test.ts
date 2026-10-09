@@ -27,7 +27,6 @@ import * as Activity from "../lib/activity.ts";
 import * as Delivery from "../lib/delivery.ts";
 import { createTelegramBusAwareApiRuntime } from "../lib/bus-api.ts";
 import * as Journal from "../lib/journal.ts";
-import { createTelegramConfigStore } from "../lib/config.ts";
 import * as Media from "../lib/media.ts";
 import * as Menu from "../lib/menu.ts";
 import { createTelegramQueueMenuRuntime } from "../lib/menu-queue.ts";
@@ -1001,7 +1000,7 @@ for (const fault of ["normal", "busy", "clock", "clock-busy", "apply-before", "a
       const sourceBinding = queueCommand ? Journal.createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => "default",
         getBotToken: () => "admitted-live-leader", getBotId: () => undefined, getJournalPath: () => journalPath,
         getQueueRuntimeIdentity: () => ({ instanceId: "old", processId: process.pid, processBirthId: `${process.pid}:live-chooser`, sessionGeneration: 1 }),
-        withSourceSerialization: createTelegramConfigStore({ agentDir: dirname(f.path) }).withSourceSerialization })() : undefined;
+        withSourceSerialization: Journal.createTelegramJournalSourceSerialization(() => join(dirname(f.path), "journals.transaction")) })() : undefined;
       const journal = sourceBinding?.journal ?? Journal.createTelegramUpdateJournalStore({ path: journalPath, profileName: "default", botIdentity });
       const key = Journal.createTelegramUpdateJournalBindingKey({ path: journalPath, profileName: "default", botIdentity });
       const ledger = createTelegramWorkspaceAdmissionLedger({ path: `${f.path}.admission`, profileKey: "profile-a:bot-a",
@@ -2119,7 +2118,7 @@ for (const fault of ["current", "idle", "all-source", "media-source", "slash-pay
       const identity = { instanceId: "old", processId: process.pid, processBirthId: `${process.pid}:generated`, sessionGeneration: 1 };
       const resolve = Journal.createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => "default", getBotToken: () => "123:generated",
         getBotId: () => undefined, getJournalPath: () => path,
-        withSourceSerialization: createTelegramConfigStore({ agentDir: dirname(path) }).withSourceSerialization });
+        withSourceSerialization: Journal.createTelegramJournalSourceSerialization(() => join(dirname(path), "journals.transaction")) });
       const binding = resolve()!, journal = binding.journal, key = binding.recoveryKey;
       const ledger = createTelegramWorkspaceAdmissionLedger({ path: `${f.path}.admission`, profileKey: "profile-a:bot-a",
         owner: { processId: process.pid, processBirthId: `${process.pid}:generated` }, getProcessLiveness: () => "alive" });
@@ -7521,7 +7520,7 @@ function createAllCommandFixture(scenario: AllCommandScenario,
   const bindingKey = Journal.createTelegramUpdateJournalBindingKey(options);
   const resolve = Journal.createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined,
     getBotToken: () => "fixture:all", getBotId: () => undefined, getJournalPath: () => options.path,
-    withSourceSerialization: createTelegramConfigStore({ agentDir: dirname(path) }).withSourceSerialization });
+    withSourceSerialization: Journal.createTelegramJournalSourceSerialization(() => join(dirname(path), "journals.transaction")) });
   const journal = resolve()!.journal;
   if (expiryClock) journal.routingInputs = Journal.createTelegramUpdateJournalStore(options).routingInputs;
   const queuedCommand = scenario.startsWith("restore-queue-") || scenario.startsWith("restore-sibling-from-prompt") ||
@@ -8071,7 +8070,7 @@ for (const mode of ["new-world", "last-cancel"] as const) for (const fault of ["
         await writeFile(fault === "historical-command" ? historical : shared, JSON.stringify({ version: 1, revision: 1,
           profile: "default", botIdentity, entries: [{ updateId: 300, update, admittedAtMs: 1, state: "pending" }] }));
       }
-      const config = createTelegramConfigStore({ agentDir });
+      const journalSerialization = Journal.createTelegramJournalSourceSerialization(() => join(agentDir, "journals.transaction"));
       const ownerBearing = ["queued-group", "shared-offered-group", "shared-control"].includes(fault);
       let ownerJournal: Journal.TelegramUpdateJournalStore | undefined;
       let ownerOriginals: Journal.TelegramUpdateJournalEntry[] | undefined;
@@ -8087,7 +8086,7 @@ for (const mode of ["new-world", "last-cancel"] as const) for (const fault of ["
         const receipt = { queueKind: entry.queueKind!, receiptId: entry.queueReceiptId!, sourceUpdateIds, queueOwner: entry.queueOwner! };
         const ownerReader = Journal.createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => "default",
           getBotToken: () => "fixture:all", getBotId: () => undefined, getJournalPath: () => fault === "queued-group" ? historical : shared,
-          withSourceSerialization: config.withSourceSerialization })()!;
+          withSourceSerialization: journalSerialization })()!;
         assert.equal(ownerReader.journal.inspectQueuedReceipt!(receipt)?.sources.length, sourceUpdateIds.length);
         if (fault === "shared-offered-group") {
           ownerJournal.offerQueuedHandoff({ ...receipt, expectedOwner: receipt.queueOwner,
@@ -8109,7 +8108,7 @@ for (const mode of ["new-world", "last-cancel"] as const) for (const fault of ["
         inspections++;
         assert.ok(required.includes(key(pollingPath)), "Routing supplies the current source reference");
         if (mode === "new-world") assert.ok(required.includes(key(historical)), "Forgotten membership keeps its captured predecessor reference");
-        return config.withSourceSerialization(() => Journal.isTelegramThreadCleanupJournalNamespaceClear({
+        return journalSerialization(() => Journal.isTelegramThreadCleanupJournalNamespaceClear({
           directory, profile: "default", botIdentity, pollingPath, requiredJournalBindingKeys: required,
           ...(target.threadId !== undefined && ownInputs ? { cleanup: { target: { chatId: target.chatId, threadId: target.threadId }, ownInputs } } : {}),
           limits: { maxDirectoryEntries: 10_000, maxFiles: 4096, maxBytes: 64 * 1024 * 1024, maxEntries: 10_000, maxWork: 100_000 },
@@ -11141,11 +11140,11 @@ for (const scenario of ["completion", "partial", "missing", "foreign", "unreadab
   ...(sourceKind === "queued" ? ["admission-only", "no-admission", "multi-receipt"] as const : [])] as const) {
   test(`Cold Restore scoped ACK continuation never replays source or recipient effects (${role}, ${scenario}, ${sourceKind})`, async () => {
     await fixture(async ({ store, threads, request, path, auth }) => {
-      const config = createTelegramConfigStore({ agentDir: dirname(path) });
+      const journalSerialization = Journal.createTelegramJournalSourceSerialization(() => join(dirname(path), "journals.transaction"));
       const queueIdentity = { instanceId: "old", processId: process.pid, processBirthId: `${process.pid}:queued-recovery`, sessionGeneration: 1 };
       const resolve = Journal.createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture",
         getBotId: () => undefined, getJournalPath: () => `${path}.source`, getQueueRuntimeIdentity: () => queueIdentity,
-        withSourceSerialization: config.withSourceSerialization });
+        withSourceSerialization: journalSerialization });
       const source = resolve()!, journal = source.journal;
       const scopedRequest = { ...request, source: { ...request.source, journalBindingKey: source.recoveryKey } };
       journal.appendBatch([100, 101].map(update_id => ({ update_id, message: { message_id: update_id,
@@ -11401,7 +11400,7 @@ for (const role of ["leader", "follower"] as const) {
           getBotToken: () => "fixture:restore", getBotId: () => 7, getJournalPath: () => journalOptions.path,
           getQueueRuntimeIdentity: queuedTerminalCases.includes(delivery)
             ? () => ({ instanceId: "leader-a", processId: process.pid, processBirthId: `${process.pid}:restore-controls` }) : undefined,
-          withSourceSerialization: createTelegramConfigStore({ agentDir: dirname(path) }).withSourceSerialization });
+          withSourceSerialization: Journal.createTelegramJournalSourceSerialization(() => join(dirname(path), "journals.transaction")) });
         const journal = resolveJournal()!.journal;
         const journalBindingKey = Journal.createTelegramUpdateJournalBindingKey(journalOptions);
         const store = threadStore.workspaceRestore({ profileName: "default", tokenSha256: "a".repeat(64) });
@@ -11450,10 +11449,10 @@ for (const role of ["leader", "follower"] as const) {
           source.removeCompleted([99]);
           return source;
         }) : [];
-        const protectionConfig = createTelegramConfigStore({ agentDir: dirname(path) });
+        const protectionSerialization = Journal.createTelegramJournalSourceSerialization(() => join(dirname(path), "journals.transaction"));
         const sessionBindings = Journal.createTelegramUpdateJournalBindingRuntime({
           base: { getProfileName: () => "default", getBotToken: () => "fixture:restore", getBotId: () => 7,
-            withSourceSerialization: protectionConfig.withSourceSerialization },
+            withSourceSerialization: protectionSerialization },
           getLeaderJournalPath: () => journalOptions.path, getRuntimeDir: () => Paths.resolveTelegramTempDir(dirname(path)),
           getFollowerJournalPath: (key, profile, sessionId) => sessionId
             ? Paths.resolveTelegramSessionJournalPath(sessionId, key, dirname(path), profile)
@@ -13467,7 +13466,7 @@ for (const name of ["abort", "stop", "next", "continue", "selected_template"] as
       const queuedBinding = queueCommand ? Journal.createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined,
         getBotToken: () => "abort-recipient", getBotId: () => undefined, getJournalPath: () => targetOptions.path,
         getQueueRuntimeIdentity: () => ({ instanceId: "old", processId: process.pid, processBirthId: `${process.pid}:abort`, sessionGeneration: 1 }),
-        withSourceSerialization: createTelegramConfigStore({ agentDir: dirname(f.path) }).withSourceSerialization })() : undefined;
+        withSourceSerialization: Journal.createTelegramJournalSourceSerialization(() => join(dirname(f.path), "journals.transaction")) })() : undefined;
       const targetJournal = queuedBinding?.journal ?? Journal.createTelegramUpdateJournalStore(targetOptions), recipientKey = Journal.createTelegramUpdateJournalBindingKey(targetOptions);
       const ctx = { cwd: "/repo" }, generation = "registration", epoch = "epoch", markups: string[] = [], apiRequests: Record<string, unknown>[] = [];
       let current = true, aborts = 0, clears = 0, nextNotices = 0, activeNotices = 0, donorRemovals = 0, recipientRemovals = 0, prepares = 0, getters = 0, defaults = 0, nonce = 0;

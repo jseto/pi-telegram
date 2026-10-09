@@ -860,6 +860,14 @@ export declare function createTelegramUpdateJournalBindingRuntime(deps: {
     getActiveFollowerSessionId?: () => string | undefined;
     isFollowerRegistered: () => boolean;
 }): TelegramUpdateJournalBindingRuntime;
+/**
+ * Journal-owned cross-family source serializer, lock-only and never authorization. Its guard lives
+ * in the runtime service directory, so journal work never touches `telegram.json` or its
+ * transaction. Acquire Workspace admission and any sender (config) admission first; never acquire
+ * owners inside it. Callbacks must be synchronous: a returned promise is unprotected after its
+ * synchronous prefix.
+ */
+export declare function createTelegramJournalSourceSerialization(getTransactionPath?: () => string): <T>(operation: () => T) => T;
 export declare function createTelegramUpdateJournalStore(options: TelegramUpdateJournalStoreOptions): TelegramUpdateJournalStore;
 /** Opt-in v3 only; does not migrate old files or expose legacy unowned mutation ports. */
 export declare function createTelegramInputJournalStore(options: TelegramInputJournalStoreOptions): TelegramInputJournalStore;
