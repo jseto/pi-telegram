@@ -10,7 +10,7 @@ import { chmodSync, closeSync, fstatSync, lstatSync, mkdirSync, opendirSync, ope
 import { basename, dirname, isAbsolute, join, relative, resolve, sep, } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { TELEGRAM_STRICT_READ_FLAGS, renameTelegramPathWithRetry, withTelegramFileTransaction, } from "./locks.js";
-import { decodeTelegramSessionDirectoryName, getTelegramProfilePathSuffix, TELEGRAM_DEFAULT_PROFILE_NAME, } from "./paths.js";
+import { decodeTelegramSessionDirectoryName, getTelegramProfilePathSuffix, resolveTelegramRuntimeDir, TELEGRAM_DEFAULT_PROFILE_NAME, } from "./paths.js";
 import { getTelegramProcessLiveness, } from "./process-identity.js";
 import { hasOnlyWireKeys as hasOnlyKeys, isNonEmptyWireString as isNonEmptyString, isWireRecord as isRecord, isNonNegativeWireInteger as isSafeNonNegativeInteger, } from "./wire.js";
 import { getTelegramWorkspaceAdmissionScopeKey, runWithTelegramWorkspaceAdmissions, } from "./workspace-admission.js";
@@ -2735,6 +2735,16 @@ export function createTelegramUpdateJournalBindingRuntime(deps) {
     };
     return runtime;
 }
+/**
+ * Journal-owned cross-family source serializer, lock-only and never authorization. Its guard lives
+ * in the runtime service directory, so journal work never touches `telegram.json` or its
+ * transaction. Acquire Workspace admission and any sender (config) admission first; never acquire
+ * owners inside it. Callbacks must be synchronous: a returned promise is unprotected after its
+ * synchronous prefix.
+ */
+export function createTelegramJournalSourceSerialization(getTransactionPath = () => join(resolveTelegramRuntimeDir(), "journals.transaction")) {
+    return (operation) => withTelegramFileTransaction(getTransactionPath(), operation);
+}
 export function createTelegramUpdateJournalStore(options) {
     return createJournalStoreCore(options).journal;
 }
@@ -4219,18 +4229,20 @@ function createJournalStoreCore(options, getInputContext) {
                     serializedBytes: published.serializedBytes,
                 };
             });
+            // Sender admission is the outer config authority; journal serialization nests inside it.
+            const serializedAppend = (preApprovalExcluded) => withSourceSerialization
+                ? withSourceSerialization(() => appendWithEvidence(preApprovalExcluded))
+                : appendWithEvidence(preApprovalExcluded);
             const append = () => {
                 if (withPairedAdmission) {
-                    const result = withPairedAdmission(normalizedUpdates, () => appendWithEvidence());
+                    const result = withPairedAdmission(normalizedUpdates, () => serializedAppend());
                     if (!result.admitted)
                         throw createJournalError("sender-denied", path, "refused paired-only sender admission");
                     return result.value;
                 }
                 if (withPairingAdmission)
-                    return withPairingAdmission(appendWithEvidence);
-                return withSourceSerialization
-                    ? withSourceSerialization(() => appendWithEvidence())
-                    : appendWithEvidence();
+                    return withPairingAdmission(serializedAppend);
+                return serializedAppend();
             };
             const admittedAppend = () => {
                 if (!workspaceAdmission)

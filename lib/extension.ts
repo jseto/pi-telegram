@@ -181,13 +181,15 @@ export default function (pi: Pi.ExtensionAPI) {
       },
       getProfileName: configStore.getActiveProfileName,
     });
+  const withTelegramJournalSourceSerialization =
+    Journal.createTelegramJournalSourceSerialization();
   const telegramJournalBindingRuntime =
     Journal.createTelegramUpdateJournalBindingRuntime({
       base: {
         getProfileName: configStore.getActiveProfileName,
         getBotToken: configStore.getBotToken,
         getBotId: getTelegramBotId,
-        withSourceSerialization: configStore.withSourceSerialization,
+        withSourceSerialization: withTelegramJournalSourceSerialization,
         onRecovery(event) {
           recordRuntimeEvent(
             "recovery",
@@ -259,6 +261,11 @@ export default function (pi: Pi.ExtensionAPI) {
       return telegramLeaderJournalPath.createJournalPath();
     },
   });
+  const proveTelegramLeaderUnresponsive =
+    Bus.createTelegramBusLeaderUnresponsivenessProof({
+      getLeaderState: lockRuntime.getState,
+      getLeaderSocketPath: getTelegramBusSocketPath,
+    });
   const telegramSessionContextStore =
     Lifecycle.createTelegramSessionContextStore<Pi.ExtensionContext>({
       getIdentity(ctx) {
@@ -1368,7 +1375,7 @@ export default function (pi: Pi.ExtensionAPI) {
         botToken,
         botId: getTelegramBotId(),
       });
-      return configStore.withSourceSerialization(function () {
+      return withTelegramJournalSourceSerialization(function () {
         return Journal.isTelegramThreadCleanupJournalNamespaceClear({
           directory: Paths.resolveTelegramTempDir(),
           profile,
@@ -1988,6 +1995,7 @@ export default function (pi: Pi.ExtensionAPI) {
       },
       recovery: {
         getLeaderState: lockRuntime.getState,
+        proveLeaderUnresponsive: proveTelegramLeaderUnresponsive,
         setLifecyclePhase: telegramBusFollowerControlState.setLifecyclePhase,
         updateStatus,
         promoteToLeader: promoteTelegramBusFollowerToLeader,
@@ -2347,6 +2355,7 @@ export default function (pi: Pi.ExtensionAPI) {
   const threadAwarePollingPorts = telegramThreadCapabilityRuntime.pollingPorts;
   const lockedPollingRuntime = Locks.createTelegramLockedPollingRuntime({
     lock: lockRuntime,
+    proveOwnerUnresponsive: proveTelegramLeaderUnresponsive,
     resetDamagedState() {
       return Locks.resetDamagedTelegramRuntimeState(
         Paths.resolveTelegramStatePath(),

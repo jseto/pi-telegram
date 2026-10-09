@@ -45,7 +45,12 @@ import {
   type TelegramBusTransportRetryPolicy,
 } from "./bus-transport.ts";
 import type { TelegramThreadDisplayMode } from "./config.ts";
-import { TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS } from "./locks.ts";
+import {
+  isSameTelegramLockOwner,
+  TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS,
+  type TelegramLockEntry,
+  type TelegramLockState,
+} from "./locks.ts";
 import { resolveAgentDir } from "./paths.ts";
 import { getTelegramProcessBirthIdentity } from "./process-identity.ts";
 import {
@@ -131,7 +136,8 @@ export function createTelegramBusAuthSecret(): string {
   return randomBytes(32).toString("base64url");
 }
 
-const TELEGRAM_BUS_PROTOCOL_VERSION = 2 as const;
+// v3: journal source serialization left the config transaction; mixed v2/v3 peers would not exclude each other.
+const TELEGRAM_BUS_PROTOCOL_VERSION = 3 as const;
 export const TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION =
   "durable-follower-admission-v1" as const;
 export const TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF =
@@ -1223,6 +1229,11 @@ export type TelegramBusEnvelope = (
       sentAtMs: number;
     }
   | {
+      /** Side-effect-free leader liveness probe; any acknowledgement proves a responsive event loop. */
+      kind: "bus.probe";
+      requestId: string;
+    }
+  | {
       kind: "bus.ack";
       requestId: string;
       ok: boolean;
@@ -1269,7 +1280,8 @@ export function getTelegramBusEnvelopeTrafficClass(
 ): TelegramBusEnvelopeTrafficClass {
   if (
     envelope.kind === "follower.register" ||
-    envelope.kind === "follower.restoreWorkspace"
+    envelope.kind === "follower.restoreWorkspace" ||
+    envelope.kind === "bus.probe"
   )
     return "bootstrap";
   if (envelope.kind === "bus.ack") return "response";
@@ -1579,6 +1591,9 @@ export function parseTelegramBusEnvelope(
     case "follower.callApi":
       envelope = parseCallApiEnvelope(value, requestId);
       break;
+    case "bus.probe":
+      envelope = { kind, requestId };
+      break;
     case "bus.ack":
       envelope = parseAckEnvelope(value, requestId);
       break;
@@ -1588,6 +1603,112 @@ export function parseTelegramBusEnvelope(
   const auth = value.auth;
   if (envelope && typeof auth === "string") envelope.auth = auth;
   return envelope;
+}
+
+/**
+ * One leader liveness observation. `silent` (connected or connecting, no answer within the window) and
+ * `unreachable` (an endpoint that refuses connections: nobody listens) can support a takeover. A missing endpoint is
+ * `unknown`: a live classic-mode leader has no socket at all. Any bytes or an orderly close prove the peer's event
+ * loop handled the connection, so even an older leader rejecting the unknown kind is `responsive`.
+ */
+export type TelegramBusLeaderProbeResult =
+  | "responsive"
+  | "silent"
+  | "unreachable"
+  | "unknown";
+
+export function probeTelegramBusLeader(input: {
+  socketPath: TelegramBusSocketPathSource;
+  secret?: string;
+  timeoutMs?: number;
+}): Promise<TelegramBusLeaderProbeResult> {
+  const timeoutMs = input.timeoutMs ?? TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS;
+  return new Promise((resolve) => {
+    let settled = false;
+    let socket: Socket | undefined;
+    const finish = (result: TelegramBusLeaderProbeResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket?.destroy();
+      resolve(result);
+    };
+    const timer = setTimeout(() => finish("silent"), timeoutMs);
+    let connected = false;
+    try {
+      socket = createConnection(resolveTelegramBusSocketPath(input.socketPath));
+    } catch {
+      finish("unknown");
+      return;
+    }
+    socket.once("connect", () => {
+      connected = true;
+      socket!.write(
+        encodeTelegramBusEnvelope({
+          kind: "bus.probe",
+          requestId: `probe:${randomBytes(8).toString("hex")}`,
+          ...(input.secret ? { auth: input.secret } : {}),
+        }),
+      );
+    });
+    socket.once("data", () => finish("responsive"));
+    socket.once("end", () => finish("responsive"));
+    socket.once("error", (error) => {
+      const code = (error as NodeJS.ErrnoException).code;
+      finish(
+        !connected && code === "ECONNREFUSED" ? "unreachable" : "unknown",
+      );
+    });
+  });
+}
+
+/**
+ * Takeover evidence replacing the retired file heartbeat: a full silent window, or an unreachable endpoint
+ * confirmed again after one more window (a just-started leader binds its socket well within it). The owner must
+ * stay the same throughout; the lock acquisition then CAS-checks that exact owner.
+ */
+export async function proveTelegramBusLeaderUnresponsive(input: {
+  probe: () => Promise<TelegramBusLeaderProbeResult>;
+  isSameOwner: () => boolean;
+  sleep: (ms: number) => Promise<void>;
+  windowMs?: number;
+}): Promise<boolean> {
+  const first = await input.probe();
+  if (first === "silent") return input.isSameOwner();
+  if (first !== "unreachable") return false;
+  await input.sleep(input.windowMs ?? TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS);
+  if (!input.isSameOwner()) return false;
+  const second = await input.probe();
+  return (second === "silent" || second === "unreachable") && input.isSameOwner();
+}
+
+/** Composition-ready takeover proof for one profile's leader lock and endpoint. */
+export function createTelegramBusLeaderUnresponsivenessProof(deps: {
+  getLeaderState: () => TelegramLockState;
+  getLeaderSocketPath: () => string;
+  probe?: typeof probeTelegramBusLeader;
+  sleep?: (ms: number) => Promise<void>;
+}): (owner: TelegramLockEntry) => Promise<boolean> {
+  const probe = deps.probe ?? probeTelegramBusLeader;
+  const sleep =
+    deps.sleep ??
+    ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  return (owner) =>
+    proveTelegramBusLeaderUnresponsive({
+      probe: () =>
+        probe({
+          socketPath: owner.busSocketPath ?? deps.getLeaderSocketPath(),
+          secret: owner.busSecret,
+        }),
+      isSameOwner: () => {
+        const state = deps.getLeaderState();
+        return (
+          state.kind === "active-elsewhere" &&
+          isSameTelegramLockOwner(state.lock, owner)
+        );
+      },
+      sleep,
+    });
 }
 
 interface TelegramBusLocalServer {

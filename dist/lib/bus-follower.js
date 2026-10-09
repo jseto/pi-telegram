@@ -1357,6 +1357,13 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler(deps) {
                     if (await tryRegisterWithLeader(ctx, graceState.lock, "follower-register-restore-grace", initialBinding)) {
                         return;
                     }
+                    if (await deps.proveLeaderUnresponsive?.(graceState.lock)) {
+                        await promoteToLeader(error, ctx, initialBinding, {
+                            expectedOwner: graceState.lock,
+                            unresponsive: true,
+                        });
+                        return;
+                    }
                     deps.setLifecyclePhase(undefined);
                     safeUpdateStatus(ctx);
                     deps.recordRuntimeEvent("bus", "Telegram follower promotion blocked by live leader lease", {

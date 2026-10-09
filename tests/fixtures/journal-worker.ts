@@ -7,7 +7,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createTelegramConfigStore } from "../../lib/config.ts";
-import {
+import { createTelegramJournalSourceSerialization,
   createTelegramInputJournalStore,
   TelegramUpdateJournalError,
   createTelegramUpdateJournalBotIdentity,
@@ -34,6 +34,7 @@ if (mode === "input-handoff-accept" || mode === "input-handoff-recover") {
     recoveryOwner: TelegramUpdateJournalQueueOwnerIdentity;
   };
   const config = createTelegramConfigStore({ agentDir: dir, configPath: join(dir, "telegram.json") });
+  const journalSerialization = createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction"));
   await config.load(); config.activateProfile("work");
   const accepting = mode === "input-handoff-accept";
   const runtime = accepting ? request.recipientOwner : request.recoveryOwner;
@@ -41,7 +42,7 @@ if (mode === "input-handoff-accept" || mode === "input-handoff-recover") {
   const store = createTelegramInputJournalStore({ path, profileName: "work", botIdentity,
     queueRuntimeIdentity: runtime,
     sourceAccess: { directory: dir, limits: { maxFiles: 100, maxBytes: 1_000_000, maxEntries: 100, maxWork: 1000 } },
-    withSourceSerialization: config.withSourceSerialization,
+    withSourceSerialization: journalSerialization,
     withPairingAdmission: publish => config.withPairingAdmission("work", botIdentity.tokenSha256, publish),
     getInputContext: () => ({ owner: accepting ? request.recipientOwner : request.recoveryOwner,
       recipientBindingKey: request.recipientBindingKey }),
@@ -60,13 +61,14 @@ if (mode === "input-handoff-accept" || mode === "input-handoff-recover") {
 } else if (mode === "input-custody") {
   const dir = dirname(path);
   const config = createTelegramConfigStore({ agentDir: dir, configPath: join(dir, "telegram.json") });
+  const journalSerialization = createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction"));
   await config.load(); config.activateProfile("work");
   const runtime = { instanceId: `worker-${worker}`, processId: process.pid, processBirthId: `${process.pid}:fixture` };
   const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "123:synthetic-input-custody" });
   const store = createTelegramInputJournalStore({ path, profileName: "work", botIdentity,
     queueRuntimeIdentity: runtime,
     sourceAccess: { directory: dir, limits: { maxFiles: 100, maxBytes: 1_000_000, maxEntries: 100, maxWork: 1000 } },
-    withSourceSerialization: config.withSourceSerialization,
+    withSourceSerialization: journalSerialization,
     withPairingAdmission: publish => config.withPairingAdmission("work", botIdentity.tokenSha256, publish),
     getInputContext: () => ({ owner: { ...runtime, sessionGeneration: 1 }, recipientBindingKey: "workspace:owner" }),
   });

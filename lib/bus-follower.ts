@@ -385,6 +385,8 @@ export function createTelegramManualFollowerProfileKeyResolver(input: {
 
 export interface TelegramBusFollowerElection {
   expectedOwner?: TelegramLockEntry;
+  /** The expected owner is bus-proven unresponsive; the lock CAS still requires it to be the current owner. */
+  unresponsive?: boolean;
 }
 
 export type TelegramBusFollowerPromotionHandler<TContext> = (
@@ -568,6 +570,8 @@ export interface TelegramBusFollowerHeartbeatRecoveryHandlerDeps<TContext> {
   scheduleRetry?: (retry: () => void, delayMs: number) => void;
   getActiveContext?: () => TContext | undefined;
   promotionGraceMs?: number;
+  /** Bus liveness proof for a live-PID leader that no longer answers; replaces the retired file heartbeat. */
+  proveLeaderUnresponsive?: (owner: TelegramLockEntry) => Promise<boolean>;
   recordRuntimeEvent: (
     category: string,
     error: unknown,
@@ -2408,6 +2412,13 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
               initialBinding,
             )
           ) {
+            return;
+          }
+          if (await deps.proveLeaderUnresponsive?.(graceState.lock)) {
+            await promoteToLeader(error, ctx, initialBinding, {
+              expectedOwner: graceState.lock,
+              unresponsive: true,
+            });
             return;
           }
           deps.setLifecyclePhase(undefined);

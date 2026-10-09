@@ -130,6 +130,24 @@ test("Consolidated runtime projection skips the transaction when published conte
   } finally { rmSync(f.dir, { recursive: true, force: true }); }
 });
 
+test("Consolidated runtime projection never persists poll-cycle timestamps", async () => {
+  const f = createProjectionFixture();
+  try {
+    f.owner.acquire({ cwd: "/repo" });
+    let publications = 0;
+    const store = f.createStore({ storage: { read: f.storage.read, publish(...args) {
+      publications += 1;
+      return f.storage.publish(...args);
+    } } });
+    const polled = (atMs: number): TelegramStatusSnapshot => ({ ...f.snapshot, runtime: { ...f.snapshot.runtime,
+      polling: { phase: "long-poll", phaseStartedAtMs: atMs, lastSuccessfulResponseAtMs: atMs, lastSuccessfulResponseUpdateCount: 0, startedAtMs: 1 } } });
+    assert.equal(await store.persist(polled(100)), true);
+    assert.deepEqual(store.read()?.runtime.polling, { phase: "long-poll", startedAtMs: 1 });
+    assert.equal(await store.persist(polled(30_100)), false);
+    assert.equal(publications, 1, "Another idle poll response writes nothing");
+  } finally { rmSync(f.dir, { recursive: true, force: true }); }
+});
+
 for (const drift of ["generation", "profile", "path", "owner"] as const) {
   test(`Consolidated runtime projection refuses queued source drift (${drift})`, async () => {
     const f = createProjectionFixture();

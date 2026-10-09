@@ -6,6 +6,7 @@
  */
 import { type TelegramBusEndpointLayout, type TelegramBusTransportEventRecorder, type TelegramBusTransportRetryPolicy } from "./bus-transport.ts";
 import type { TelegramThreadDisplayMode } from "./config.ts";
+import { type TelegramLockEntry, type TelegramLockState } from "./locks.ts";
 import { type TelegramQueueHandoffPayload } from "./queue.ts";
 import { type TelegramTarget } from "./target.ts";
 import { type TelegramSessionReplacementIntent } from "./threads.ts";
@@ -526,6 +527,10 @@ export type TelegramBusEnvelope = ({
     args: unknown[];
     sentAtMs: number;
 } | {
+    /** Side-effect-free leader liveness probe; any acknowledgement proves a responsive event loop. */
+    kind: "bus.probe";
+    requestId: string;
+} | {
     kind: "bus.ack";
     requestId: string;
     ok: boolean;
@@ -558,6 +563,36 @@ export declare function createTelegramBusRequestId(input: {
 export declare function createTelegramBusRequestIdFactory(instanceId: string): () => string;
 export declare function encodeTelegramBusEnvelope(envelope: TelegramBusEnvelope): string;
 export declare function parseTelegramBusEnvelope(line: string): TelegramBusEnvelope | undefined;
+/**
+ * One leader liveness observation. `silent` (connected or connecting, no answer within the window) and
+ * `unreachable` (an endpoint that refuses connections: nobody listens) can support a takeover. A missing endpoint is
+ * `unknown`: a live classic-mode leader has no socket at all. Any bytes or an orderly close prove the peer's event
+ * loop handled the connection, so even an older leader rejecting the unknown kind is `responsive`.
+ */
+export type TelegramBusLeaderProbeResult = "responsive" | "silent" | "unreachable" | "unknown";
+export declare function probeTelegramBusLeader(input: {
+    socketPath: TelegramBusSocketPathSource;
+    secret?: string;
+    timeoutMs?: number;
+}): Promise<TelegramBusLeaderProbeResult>;
+/**
+ * Takeover evidence replacing the retired file heartbeat: a full silent window, or an unreachable endpoint
+ * confirmed again after one more window (a just-started leader binds its socket well within it). The owner must
+ * stay the same throughout; the lock acquisition then CAS-checks that exact owner.
+ */
+export declare function proveTelegramBusLeaderUnresponsive(input: {
+    probe: () => Promise<TelegramBusLeaderProbeResult>;
+    isSameOwner: () => boolean;
+    sleep: (ms: number) => Promise<void>;
+    windowMs?: number;
+}): Promise<boolean>;
+/** Composition-ready takeover proof for one profile's leader lock and endpoint. */
+export declare function createTelegramBusLeaderUnresponsivenessProof(deps: {
+    getLeaderState: () => TelegramLockState;
+    getLeaderSocketPath: () => string;
+    probe?: typeof probeTelegramBusLeader;
+    sleep?: (ms: number) => Promise<void>;
+}): (owner: TelegramLockEntry) => Promise<boolean>;
 interface TelegramBusLocalServer {
     start: () => Promise<void>;
     stop: () => Promise<void>;

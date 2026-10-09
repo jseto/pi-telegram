@@ -1008,6 +1008,15 @@ export function createTelegramRuntimeProjectionStore(
       if (!isRuntimeProjection({ ...semantic, writtenAtMs: 0 }))
         throw new Error("Telegram runtime projection is malformed.");
       delete semantic.diagnostics.recentRuntimeEvents;
+      // Poll-cycle timestamps change on every response; live status renders them from memory,
+      // so persisting them would rewrite state.json each poll for no reader.
+      const polling = semantic.runtime.polling;
+      if (polling && typeof polling === "object" && !Array.isArray(polling)) {
+        const volatile = polling as Record<string, unknown>;
+        delete volatile.phaseStartedAtMs;
+        delete volatile.lastSuccessfulResponseAtMs;
+        delete volatile.lastSuccessfulResponseUpdateCount;
+      }
       const isCurrent = (): boolean =>
         getPath() === path && getProfile() === profile && authority() === true;
       const isUnchanged = (

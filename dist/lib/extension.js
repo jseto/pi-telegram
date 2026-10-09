@@ -142,12 +142,13 @@ export default function (pi) {
         },
         getProfileName: configStore.getActiveProfileName,
     });
+    const withTelegramJournalSourceSerialization = Journal.createTelegramJournalSourceSerialization();
     const telegramJournalBindingRuntime = Journal.createTelegramUpdateJournalBindingRuntime({
         base: {
             getProfileName: configStore.getActiveProfileName,
             getBotToken: configStore.getBotToken,
             getBotId: getTelegramBotId,
-            withSourceSerialization: configStore.withSourceSerialization,
+            withSourceSerialization: withTelegramJournalSourceSerialization,
             onRecovery(event) {
                 recordRuntimeEvent("recovery", event.kind === "repaired"
                     ? "Telegram update journal was repaired automatically."
@@ -198,6 +199,10 @@ export default function (pi) {
         createJournalPath() {
             return telegramLeaderJournalPath.createJournalPath();
         },
+    });
+    const proveTelegramLeaderUnresponsive = Bus.createTelegramBusLeaderUnresponsivenessProof({
+        getLeaderState: lockRuntime.getState,
+        getLeaderSocketPath: getTelegramBusSocketPath,
     });
     const telegramSessionContextStore = Lifecycle.createTelegramSessionContextStore({
         getIdentity(ctx) {
@@ -1069,7 +1074,7 @@ export default function (pi) {
                 botToken,
                 botId: getTelegramBotId(),
             });
-            return configStore.withSourceSerialization(function () {
+            return withTelegramJournalSourceSerialization(function () {
                 return Journal.isTelegramThreadCleanupJournalNamespaceClear({
                     directory: Paths.resolveTelegramTempDir(),
                     profile,
@@ -1554,6 +1559,7 @@ export default function (pi) {
         },
         recovery: {
             getLeaderState: lockRuntime.getState,
+            proveLeaderUnresponsive: proveTelegramLeaderUnresponsive,
             setLifecyclePhase: telegramBusFollowerControlState.setLifecyclePhase,
             updateStatus,
             promoteToLeader: promoteTelegramBusFollowerToLeader,
@@ -1860,6 +1866,7 @@ export default function (pi) {
     const threadAwarePollingPorts = telegramThreadCapabilityRuntime.pollingPorts;
     const lockedPollingRuntime = Locks.createTelegramLockedPollingRuntime({
         lock: lockRuntime,
+        proveOwnerUnresponsive: proveTelegramLeaderUnresponsive,
         resetDamagedState() {
             return Locks.resetDamagedTelegramRuntimeState(Paths.resolveTelegramStatePath(), function (profile, sections) {
                 Threads.parseTelegramWorkspaceStateSection(sections.workspace, profile);

@@ -69,7 +69,6 @@ import { runTelegramPollLoop } from "../lib/polling.ts";
 import * as Queue from "../lib/queue.ts";
 import * as Turns from "../lib/turns.ts";
 import { expandTelegramPromptTemplateCommand } from "../lib/prompt-templates.ts";
-import { createTelegramConfigStore } from "../lib/config.ts";
 import { createTelegramQueueBindingRuntime, createTelegramFollowerSelectedCommandBinding } from "../lib/bindings.ts";
 import { createTelegramMenuActionRuntime, type TelegramModelMenuState } from "../lib/menu.ts";
 import { createTelegramQueueMenuRuntime } from "../lib/menu-queue.ts";
@@ -86,7 +85,7 @@ import { createTelegramBusMessageOwnershipRuntime } from "../lib/ownership.ts";
 import { createTelegramFollowerApiCallAuthorizer, createTelegramBusFollowerRegistry, createTelegramBusProtocolIdentity, createTelegramBusLocalServer, TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY, type TelegramBusPreparedCommandSource, createTelegramBusLiveRebindController, getTelegramBusFollowerSocketPath, type TelegramBusEnvelope } from "../lib/bus.ts";
 import { createTelegramWorkspaceAdmissionLedger } from "../lib/workspace-admission.ts";
 import { createTelegramWorkspaceOperationRuntime } from "../lib/workspace-retirement.ts";
-import { createTelegramUpdateJournalStore, createTelegramUpdateJournalBotIdentity, createTelegramUpdateJournalBindingKey, createTelegramUpdateJournalRuntimeBindingResolver, type TelegramJournaledUpdate } from "../lib/journal.ts";
+import { createTelegramJournalSourceSerialization, createTelegramUpdateJournalStore, createTelegramUpdateJournalBotIdentity, createTelegramUpdateJournalBindingKey, createTelegramUpdateJournalRuntimeBindingResolver, type TelegramJournaledUpdate } from "../lib/journal.ts";
 import {
   bindTelegramUpdateAdmissionSource,
   reportTelegramUpdateCompleted,
@@ -2292,7 +2291,7 @@ for (const surface of ["held", "selected"] as const) for (const name of ["contin
     const f = createFencedCommandTargetFixture(), dir = mkdtempSync(join(tmpdir(), "pi-held-continue-")), path = join(dir, "journal.json");
     const identity = { instanceId: "recipient", processId: process.pid, processBirthId: `${process.pid}:held-continue`, sessionGeneration: 1 };
     const binding = createTelegramUpdateJournalRuntimeBindingResolver({ getProfileName: () => undefined, getBotToken: () => "fixture", getBotId: () => undefined,
-      getJournalPath: () => path, getQueueRuntimeIdentity: () => identity, withSourceSerialization: createTelegramConfigStore({ agentDir: dir }).withSourceSerialization })()!;
+      getJournalPath: () => path, getQueueRuntimeIdentity: () => identity, withSourceSerialization: createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction")) })()!;
     const journal = binding.journal, store = Queue.createTelegramQueueStore<typeof f.ctx>();
     const neighbor: Queue.PendingTelegramTurn = { kind: "prompt", chatId: 7, queueOrder: 1, replyToMessageId: 1, target: { chatId: 7, threadId: 10 },
       queueLane: "default", laneOrder: 1, statusSummary: "old work", historyText: "old work", sourceMessageIds: [1], content: [], queuedAttachments: [] };

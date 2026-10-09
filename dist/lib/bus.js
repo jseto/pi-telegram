@@ -12,7 +12,7 @@ import { platform as getPlatform, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { classifyTelegramBusTransportError, createTelegramBusTransportTimeoutError, delayTelegramBusTransportRetry, getTelegramBusEndpointDiagnostics, getTelegramBusFollowerEndpoint, getTelegramBusLeaderEndpoint, getTelegramBusPipePath, getTelegramBusTransportRetryPolicy, isRetryableTelegramBusTransportError, isTelegramBusPipePath, probeTelegramBusEndpoint, TELEGRAM_BUS_MAX_DIRECT_UNIX_ENDPOINT_BYTES, } from "./bus-transport.js";
-import { TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS } from "./locks.js";
+import { isSameTelegramLockOwner, TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS, } from "./locks.js";
 import { resolveAgentDir } from "./paths.js";
 import { getTelegramProcessBirthIdentity } from "./process-identity.js";
 import { parseTelegramQueueHandoffPayload, TELEGRAM_QUEUE_HANDOFF_PAYLOAD_MAX_BYTES, } from "./queue.js";
@@ -46,7 +46,8 @@ export function createTelegramBusProcessRuntime(input) {
 export function createTelegramBusAuthSecret() {
     return randomBytes(32).toString("base64url");
 }
-const TELEGRAM_BUS_PROTOCOL_VERSION = 2;
+// v3: journal source serialization left the config transaction; mixed v2/v3 peers would not exclude each other.
+const TELEGRAM_BUS_PROTOCOL_VERSION = 3;
 export const TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION = "durable-follower-admission-v1";
 export const TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF = "queue-handoff-v1";
 export const TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE = "input-custody-reference-v1";
@@ -466,7 +467,8 @@ export function createTelegramBusFollowerSourceReferenceDeliveryIdentity(input) 
 }
 export function getTelegramBusEnvelopeTrafficClass(envelope) {
     if (envelope.kind === "follower.register" ||
-        envelope.kind === "follower.restoreWorkspace")
+        envelope.kind === "follower.restoreWorkspace" ||
+        envelope.kind === "bus.probe")
         return "bootstrap";
     if (envelope.kind === "bus.ack")
         return "response";
@@ -718,6 +720,9 @@ export function parseTelegramBusEnvelope(line) {
         case "follower.callApi":
             envelope = parseCallApiEnvelope(value, requestId);
             break;
+        case "bus.probe":
+            envelope = { kind, requestId };
+            break;
         case "bus.ack":
             envelope = parseAckEnvelope(value, requestId);
             break;
@@ -728,6 +733,79 @@ export function parseTelegramBusEnvelope(line) {
     if (envelope && typeof auth === "string")
         envelope.auth = auth;
     return envelope;
+}
+export function probeTelegramBusLeader(input) {
+    const timeoutMs = input.timeoutMs ?? TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS;
+    return new Promise((resolve) => {
+        let settled = false;
+        let socket;
+        const finish = (result) => {
+            if (settled)
+                return;
+            settled = true;
+            clearTimeout(timer);
+            socket?.destroy();
+            resolve(result);
+        };
+        const timer = setTimeout(() => finish("silent"), timeoutMs);
+        let connected = false;
+        try {
+            socket = createConnection(resolveTelegramBusSocketPath(input.socketPath));
+        }
+        catch {
+            finish("unknown");
+            return;
+        }
+        socket.once("connect", () => {
+            connected = true;
+            socket.write(encodeTelegramBusEnvelope({
+                kind: "bus.probe",
+                requestId: `probe:${randomBytes(8).toString("hex")}`,
+                ...(input.secret ? { auth: input.secret } : {}),
+            }));
+        });
+        socket.once("data", () => finish("responsive"));
+        socket.once("end", () => finish("responsive"));
+        socket.once("error", (error) => {
+            const code = error.code;
+            finish(!connected && code === "ECONNREFUSED" ? "unreachable" : "unknown");
+        });
+    });
+}
+/**
+ * Takeover evidence replacing the retired file heartbeat: a full silent window, or an unreachable endpoint
+ * confirmed again after one more window (a just-started leader binds its socket well within it). The owner must
+ * stay the same throughout; the lock acquisition then CAS-checks that exact owner.
+ */
+export async function proveTelegramBusLeaderUnresponsive(input) {
+    const first = await input.probe();
+    if (first === "silent")
+        return input.isSameOwner();
+    if (first !== "unreachable")
+        return false;
+    await input.sleep(input.windowMs ?? TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS);
+    if (!input.isSameOwner())
+        return false;
+    const second = await input.probe();
+    return (second === "silent" || second === "unreachable") && input.isSameOwner();
+}
+/** Composition-ready takeover proof for one profile's leader lock and endpoint. */
+export function createTelegramBusLeaderUnresponsivenessProof(deps) {
+    const probe = deps.probe ?? probeTelegramBusLeader;
+    const sleep = deps.sleep ??
+        ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    return (owner) => proveTelegramBusLeaderUnresponsive({
+        probe: () => probe({
+            socketPath: owner.busSocketPath ?? deps.getLeaderSocketPath(),
+            secret: owner.busSecret,
+        }),
+        isSameOwner: () => {
+            const state = deps.getLeaderState();
+            return (state.kind === "active-elsewhere" &&
+                isSameTelegramLockOwner(state.lock, owner));
+        },
+        sleep,
+    });
 }
 const TELEGRAM_ACTIVE_LOCAL_SERVERS = Symbol.for("@llblab/pi-telegram/active-local-servers");
 function getActiveTelegramBusLocalServers() {

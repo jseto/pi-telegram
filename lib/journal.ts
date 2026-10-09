@@ -46,6 +46,7 @@ import {
 import {
   decodeTelegramSessionDirectoryName,
   getTelegramProfilePathSuffix,
+  resolveTelegramRuntimeDir,
   TELEGRAM_DEFAULT_PROFILE_NAME,
 } from "./paths.ts";
 import {
@@ -4889,6 +4890,21 @@ export function createTelegramUpdateJournalBindingRuntime(deps: {
   return runtime;
 }
 
+/**
+ * Journal-owned cross-family source serializer, lock-only and never authorization. Its guard lives
+ * in the runtime service directory, so journal work never touches `telegram.json` or its
+ * transaction. Acquire Workspace admission and any sender (config) admission first; never acquire
+ * owners inside it. Callbacks must be synchronous: a returned promise is unprotected after its
+ * synchronous prefix.
+ */
+export function createTelegramJournalSourceSerialization(
+  getTransactionPath: () => string = () =>
+    join(resolveTelegramRuntimeDir(), "journals.transaction"),
+): <T>(operation: () => T) => T {
+  return (operation) =>
+    withTelegramFileTransaction(getTransactionPath(), operation);
+}
+
 export function createTelegramUpdateJournalStore(
   options: TelegramUpdateJournalStoreOptions,
 ): TelegramUpdateJournalStore {
@@ -7217,10 +7233,17 @@ function createJournalStoreCore(
             serializedBytes: published.serializedBytes,
           };
         });
+      // Sender admission is the outer config authority; journal serialization nests inside it.
+      const serializedAppend = (preApprovalExcluded?: boolean) =>
+        withSourceSerialization
+          ? withSourceSerialization(() =>
+              appendWithEvidence(preApprovalExcluded),
+            )
+          : appendWithEvidence(preApprovalExcluded);
       const append = () => {
         if (withPairedAdmission) {
           const result = withPairedAdmission(normalizedUpdates, () =>
-            appendWithEvidence(),
+            serializedAppend(),
           );
           if (!result.admitted)
             throw createJournalError(
@@ -7231,10 +7254,8 @@ function createJournalStoreCore(
           return result.value;
         }
         if (withPairingAdmission)
-          return withPairingAdmission(appendWithEvidence);
-        return withSourceSerialization
-          ? withSourceSerialization(() => appendWithEvidence())
-          : appendWithEvidence();
+          return withPairingAdmission(serializedAppend);
+        return serializedAppend();
       };
       const admittedAppend = () => {
         if (!workspaceAdmission) return append();

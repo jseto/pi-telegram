@@ -449,7 +449,6 @@ export function createTelegramConfigStore(options = {}) {
             nextConfig.allowedUserId = userId;
             setEffectiveConfig(nextConfig);
         },
-        withSourceSerialization: (operation) => withTelegramFileTransaction(`${configPath}.transaction`, operation),
         withPairingAdmission: (profileName, tokenSha256, publish) => withPersistedPairingProfile(profileName, tokenSha256, (_latest, profile) => publish(profile.allowedUserId === undefined)),
         withPairedUserAdmission: (profileName, tokenSha256, userId, publish, assertExecutionCurrent) => {
             if (!Number.isSafeInteger(userId) || userId <= 0)

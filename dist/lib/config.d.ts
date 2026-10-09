@@ -116,12 +116,6 @@ export interface TelegramConfigStore {
     setAllowedUserId: (userId: number) => void;
     /** Publish an unpaired profile owner atomically; true only for the resulting exact owner. */
     persistAllowedUserId: (userId: number, assertExecutionCurrent?: () => void, commitIfOwned?: (commit: () => void) => boolean) => Promise<boolean>;
-    /** Lock-only serialization for trusted synchronous source operations, not authorization.
-     * Does not read/adopt config. Acquire required Workspace admission first; never
-     * acquire owners or nest config admission here. Do not pass async callbacks:
-     * returned promises are not protected after their synchronous prefix.
-     */
-    withSourceSerialization: <T>(operation: () => T) => T;
     /** Trusted synchronous publication only; caller acquires Workspace admission before this config transaction. */
     withPairingAdmission: <T>(profileName: string, tokenSha256: string, publish: (preApprovalExcluded: boolean) => T) => T;
     /** Observe an existing exact owner and refresh an unpaired cache; never create an owner. Callback must be synchronous. */

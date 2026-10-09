@@ -60,6 +60,8 @@ interface TelegramLockAcquireOptions {
     force?: boolean;
     expectedOwner?: TelegramLockEntry;
     election?: boolean;
+    /** Bus-proven unresponsive owner: treated as stale only while it is still exactly the current owner. */
+    unresponsiveOwner?: TelegramLockEntry;
 }
 type TelegramLockAcquireResult = {
     ok: true;
@@ -213,6 +215,8 @@ export interface TelegramOwnedStatePublicationOptions extends TelegramRuntimeSta
 export declare function mutateTelegramRuntimeStateSection<T>(path: string, profile: string, section: TelegramRuntimeStateSection, mutate: TelegramRuntimeStateSectionReducer<T>, options: TelegramRuntimeStatePublicationOptions): T;
 export declare function writeLocks(path: string, locks: Record<string, unknown>): void;
 export declare function parseTelegramLockEntry(value: unknown): TelegramLockEntry | undefined;
+/** Exact owner identity (pid, cwd, instance, leader epoch, runtime generation); absent entries never match. */
+export declare function isSameTelegramLockOwner(current: TelegramLockEntry | undefined, expected: TelegramLockEntry | undefined): boolean;
 export declare function createTelegramLockRuntime<TContext extends TelegramLockContext>(options?: TelegramLockRuntimeOptions): TelegramLockRuntime<TContext>;
 export declare function createTelegramLockOwnershipGuard<TContext extends TelegramLockContext>(lock: TelegramLockRuntime<TContext>): TelegramLockOwnershipGuard<TContext>;
 export declare function createTelegramDirectDeliveryOwnershipChecker<TContext extends TelegramLockContext>(deps: {
@@ -225,6 +229,7 @@ interface TelegramLockedPollingStartOptions {
     requestedThreadName?: string;
     election?: {
         expectedOwner?: TelegramLockEntry;
+        unresponsive?: boolean;
     };
     onAcquired?: () => Promise<void> | void;
 }
@@ -270,6 +275,8 @@ interface TelegramLockedPollingRuntimeDeps<TContext extends TelegramLockContext>
     registerFollowerWithOwner?: (ctx: TContext, owner: TelegramLockEntry) => boolean | undefined | Promise<boolean | undefined>;
     restoreFollowerWithOwner?: (ctx: TContext, owner: TelegramLockEntry) => boolean | undefined | Promise<boolean | undefined>;
     stopFollowerRegistration?: () => void;
+    /** Threaded Mode takeover evidence after failed follower registration; replaces the retired file heartbeat. */
+    proveOwnerUnresponsive?: (owner: TelegramLockEntry) => Promise<boolean>;
     onTransportAvailabilityChanged?: () => void;
     transportMonitor?: {
         start: (ctx: TContext) => void;
