@@ -11504,7 +11504,9 @@ for (const role of ["leader", "follower"] as const) {
         const socketPath = Bus.getTelegramBusFollowerSocketPath(instanceId, dirname(path));
         const followerRegistry = Bus.createTelegramBusFollowerRegistry();
         followerRegistry.register({ instanceId, registrationGeneration: "registered", profileKey: `manual:${instanceId}`,
-          cwd: delivery === "recipient-cwd" ? "/repo/" : "/repo", sessionId: "session", slot: "A", target: oldTarget, busSocketPath: socketPath, protocol, connectedAtMs: 1 });
+          cwd: delivery === "recipient-cwd" ? "/repo/" : "/repo", sessionId: "session", slot: "A", target: oldTarget, busSocketPath: socketPath, protocol,
+          // A real connection time: wake cases start the leader prune loop, which drops an epoch-1 heartbeat after its first tick.
+          connectedAtMs: Date.now() });
         const followerState = createTelegramBusFollowerRegistrationState();
         followerState.setRegistered(true, oldTarget, { slot: "A", threadName: "Coral", generation: "registered", leaderProtocol: protocol });
         const followerStore = Threads.createTelegramTopicTargetStore({ path });
