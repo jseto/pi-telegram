@@ -1384,7 +1384,9 @@ export async function handleTelegramAgentEndRuntime(deps) {
         }
         if (!isDeliveryActive())
             return;
-        if (outboundReply && deps.sendOutboundReplyArtifacts) {
+        if (outboundReply &&
+            hasOutboundArtifacts &&
+            deps.sendOutboundReplyArtifacts) {
             try {
                 await deps.sendOutboundReplyArtifacts(turn, outboundReply, {
                     replyToPrompt: !finalText,

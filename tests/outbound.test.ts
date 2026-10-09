@@ -979,6 +979,41 @@ test("Outbound artifact sender sends multiple voice replies independently", asyn
   dispose();
 });
 
+test("Outbound artifact sender treats a plan without voice content as a no-op", async () => {
+  const events: unknown[] = [];
+  const sendOutboundReplyArtifacts = createTelegramOutboundReplyArtifactSender({
+    execCommand: async () => {
+      events.push("exec");
+      return { stdout: "", stderr: "", code: 0, killed: false };
+    },
+    sendMultipart: async (method, fields, fileField, filePath, fileName) => {
+      events.push({ method, fields, fileField, filePath, fileName });
+    },
+  });
+  await sendOutboundReplyArtifacts({ chatId: 10, replyToMessageId: 20 }, {});
+  await sendOutboundReplyArtifacts(
+    { chatId: 10, replyToMessageId: 20 },
+    { voiceReplies: [] },
+  );
+  assert.deepEqual(events, []);
+});
+
+test("Outbound artifact sender still fails when voice content cannot be delivered", async () => {
+  const sendOutboundReplyArtifacts = createTelegramOutboundReplyArtifactSender({
+    execCommand: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+    sendMultipart: async () => {
+      throw new Error("unexpected upload");
+    },
+  });
+  await assert.rejects(
+    sendOutboundReplyArtifacts(
+      { chatId: 10, replyToMessageId: 20 },
+      { voiceText: "hello" },
+    ),
+    /every voice synthesis provider failed/,
+  );
+});
+
 test("Voice reply sender prefers configured outbound voice handlers over registered synthesis providers", async () => {
   const events: unknown[] = [];
   const voiceTempDir = join(tmpdir(), "pi-telegram-voice-handler-test");

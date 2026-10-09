@@ -900,6 +900,9 @@ export function createTelegramOutboundReplyArtifactSender(
       : plan.voiceText
         ? [{ text: plan.voiceText, lang: plan.lang, rate: plan.rate }]
         : [];
+    // A plan without voice content has nothing to deliver; absence of
+    // content is not a synthesis failure.
+    if (voiceReplies.length === 0) return;
 
     let anyDelivered = false;
 
